@@ -12,10 +12,11 @@ name = "atlas"
 path = "src/main.rs"
 
 [dependencies]
-atlas-core   = { path = "../atlas-core" }
-atlas-model  = { path = "../atlas-model" }
-atlas-astra  = { path = "../atlas-astra" }
-atlas-corpus = { path = "../atlas-corpus" }
-atlas-palace = { path = "../atlas-palace" }
-atlas-zk     = { path = "../atlas-zk" }
-atlas-mcp    = { path = "../atlas-mcp" }
+atlas-core     = { path = "../atlas-core" }
+atlas-model    = { path = "../atlas-model" }
+atlas-tokenize = { path = "../atlas-tokenize" }
+atlas-astra    = { path = "../atlas-astra" }
+atlas-corpus   = { path = "../atlas-corpus" }
+atlas-palace   = { path = "../atlas-palace" }
+atlas-zk       = { path = "../atlas-zk" }
+atlas-mcp      = { path = "../atlas-mcp" }

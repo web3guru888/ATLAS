@@ -13,6 +13,7 @@
 //! - `atlas status`    — System-wide health check
 //! - `atlas bench`     — End-to-end benchmark suite (palace/training/gates throughput)
 //! - `atlas mcp`       — Model Context Protocol server (JSON-RPC 2.0 over stdin/stdout)
+//! - `atlas infer`     — Real LLM inference (SmolLM2-1.7B / OLMo / Llama)
 //!
 //! # Zero-dependency arg parsing: no clap, no structopt.
 
@@ -41,6 +42,7 @@ fn main() {
         "status"    => cmd_status(&args[2..]),
         "bench"     => cmd_bench(&args[2..]),
         "mcp"       => cmd_mcp(&args[2..]),
+        "infer"     => cmd_infer(&args[2..]),
         "--version" | "-V" => { println!("atlas {}", env!("CARGO_PKG_VERSION")); 0 }
         "--help" | "-h" => { print_usage(); 0 }
         cmd => {
@@ -110,7 +112,15 @@ COMMANDS:
                   serve              Start MCP server (28 palace tools)
                   ATLAS_PALACE_PATH  env var for palace storage (default: ./atlas-palace)
 
+    infer       Run LLM inference with a real model
+                  --weights <DIR>    Directory containing model.safetensors + tokenizer.json
+                  --model <NAME>     Model config: smollm2-1.7b | smollm2-135m | olmo3-1b | llama32-1b
+                  --prompt <TEXT>    Input prompt (default: "The capital of France is")
+                  --max-tokens <N>   Max new tokens to generate (default: 50)
+                  --temperature <F>  Sampling temperature: 0.0 = greedy (default: 0.0)
+
 OPTIONS:
+
     -h, --help     Print help
     -V, --version  Print version
 
@@ -757,6 +767,154 @@ fn cmd_bench(_args: &[String]) -> i32 {
 // ────────────────────────────────────────────────────────────────────────────
 //  mcp
 // ────────────────────────────────────────────────────────────────────────────
+
+// ────────────────────────────────────────────────────────────────────────────
+//  infer — Real LLM inference (SmolLM2 / OLMo / Llama)
+// ────────────────────────────────────────────────────────────────────────────
+
+fn cmd_infer(args: &[String]) -> i32 {
+    use atlas_model::{ModelConfig, load_model_from_safetensors};
+    use atlas_tokenize::Tokenizer;
+
+    // ── Args ──────────────────────────────────────────────────────────────
+    let weights_dir = match opt(args, "--weights") {
+        Some(p) => p.to_string(),
+        None => {
+            eprintln!("atlas infer: --weights <DIR> required");
+            eprintln!("  Example: atlas infer --weights /tmp/smollm2-1.7b --model smollm2-1.7b");
+            return 1;
+        }
+    };
+    let prompt_str = opt(args, "--prompt").unwrap_or("The capital of France is");
+    let max_new    = opt_usize(args, "--max-tokens", 50);
+    let temperature = opt_f64(args, "--temperature", 0.0) as f32;
+    let model_name  = opt(args, "--model").unwrap_or("smollm2-1.7b");
+
+    println!("┌─ ATLAS infer ──────────────────────────────────────────────────────");
+    println!("│  weights     = {weights_dir}");
+    println!("│  model       = {model_name}");
+    println!("│  prompt      = {prompt_str:?}");
+    println!("│  max_tokens  = {max_new}   temperature = {temperature}");
+    println!("└────────────────────────────────────────────────────────────────────");
+
+    // ── Select model config ────────────────────────────────────────────────
+    let cfg = match model_name {
+        "smollm2-1.7b"  => ModelConfig::smollm2_1b7(),
+        "smollm2-135m"  => ModelConfig::smollm2_135m(),
+        "olmo3-1b"      => ModelConfig::olmo3_1b(),
+        "olmo3-7b"      => ModelConfig::olmo3_7b(),
+        "llama32-1b"    => ModelConfig::llama32_1b(),
+        other => {
+            eprintln!("atlas infer: unknown model '{other}'.");
+            eprintln!("  Available: smollm2-1.7b, smollm2-135m, olmo3-1b, olmo3-7b, llama32-1b");
+            return 1;
+        }
+    };
+
+    println!("\n  Model config : {} layers, d={}, {} heads, vocab={}",
+        cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.vocab_size);
+
+    // ── Load tokenizer ─────────────────────────────────────────────────────
+    let tok_path = format!("{}/tokenizer.json", weights_dir.trim_end_matches('/'));
+    let tokenizer = match Tokenizer::from_file(&tok_path) {
+        Ok(t) => {
+            println!("  Tokenizer    : ✓ loaded ({} vocab) from {tok_path}", t.vocab_size());
+            Some(t)
+        }
+        Err(e) => {
+            println!("  Tokenizer    : ⚠ {e} — falling back to byte-level encoding");
+            None
+        }
+    };
+
+    // Encode prompt
+    let prompt_tokens: Vec<u32> = if let Some(ref tok) = tokenizer {
+        let ids = tok.encode(prompt_str);
+        println!("  Prompt tokens: {} → {:?}", ids.len(), &ids[..ids.len().min(20)]);
+        ids
+    } else {
+        let ids: Vec<u32> = prompt_str.bytes().map(|b| b as u32).collect();
+        println!("  Prompt tokens (byte): {} → {:?}", ids.len(), &ids[..ids.len().min(20)]);
+        ids
+    };
+
+    // ── Load weights ───────────────────────────────────────────────────────
+    let weights_file = format!("{}/model.safetensors", weights_dir.trim_end_matches('/'));
+    println!("\n  Loading weights from {weights_file} …");
+    let load_start = std::time::Instant::now();
+    let mut model = match load_model_from_safetensors(&weights_file, cfg.clone()) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("  ✗ Failed to load weights: {e}");
+            return 1;
+        }
+    };
+    let load_ms = load_start.elapsed().as_millis();
+    println!("  ✓ Weights loaded in {load_ms}ms  (~{} M params)", model.param_count() / 1_000_000);
+
+    // ── Quick logits sanity check (greedy token from prompt position 0) ────
+    println!("\n  Computing logits at last prompt position …");
+    let logit_start = std::time::Instant::now();
+    let last_tok = *prompt_tokens.last().unwrap_or(&0);
+    model.reset();
+    // feed all but last token to prime KV cache
+    for &t in &prompt_tokens[..prompt_tokens.len().saturating_sub(1)] {
+        model.forward_one(t);
+    }
+    let last_logits = model.forward_one(last_tok);
+    let logit_ms = logit_start.elapsed().as_millis();
+
+    let mut top_pairs: Vec<(usize, f32)> = last_logits.iter().enumerate()
+        .map(|(i, &v)| (i, v))
+        .collect();
+    top_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    println!("  Top-10 logits (last prompt position, {logit_ms}ms):");
+    for (tok_id, logit) in &top_pairs[..10] {
+        let decoded = tokenizer.as_ref()
+            .map(|t| format!(" = {:?}", t.decode(&[*tok_id as u32])))
+            .unwrap_or_default();
+        println!("    token {:6}: {:8.4}{decoded}", tok_id, logit);
+    }
+
+    // Check logit spread (healthy = > 5.0 difference between top and 100th)
+    let top_val    = top_pairs[0].1;
+    let p100_val   = top_pairs.get(99).map(|p| p.1).unwrap_or(top_val);
+    let spread     = top_val - p100_val;
+    if spread < 1.0 {
+        println!("\n  ⚠  WARNING: logit spread = {spread:.2} (< 1.0) — forward pass may be incorrect");
+    } else {
+        println!("\n  ✓  Logit spread = {spread:.2} (healthy)");
+    }
+
+    // ── Generate ──────────────────────────────────────────────────────────
+    println!("\n  Generating {max_new} tokens (temperature={temperature}) …");
+    let gen_start = std::time::Instant::now();
+    let new_tokens = model.generate(&prompt_tokens, max_new, temperature);
+    let gen_ms     = gen_start.elapsed().as_millis();
+    let tps        = new_tokens.len() as f64 / (gen_ms as f64 / 1000.0).max(0.001);
+
+    println!("\n  ─── Output ────────────────────────────────────────────────────────");
+    println!("  Prompt : {prompt_str:?}");
+
+    let output_text = if let Some(ref tok) = tokenizer {
+        tok.decode(&new_tokens)
+    } else {
+        let bytes: Vec<u8> = new_tokens.iter().map(|&t| (t % 256) as u8).collect();
+        String::from_utf8_lossy(&bytes).to_string()
+    };
+    println!("  Output : {output_text:?}");
+    println!("  Full   : {:?}", format!("{prompt_str}{output_text}"));
+
+    println!("\n  ─── Stats ─────────────────────────────────────────────────────────");
+    println!("  Tokens generated : {}", new_tokens.len());
+    println!("  Generation time  : {gen_ms}ms");
+    println!("  Throughput       : {tps:.1} tok/s");
+    println!("  Token IDs        : {:?}", &new_tokens[..new_tokens.len().min(20)]);
+
+    println!("\n  ✓ atlas infer complete");
+    0
+}
 
 fn cmd_mcp(args: &[String]) -> i32 {
     let subcmd = args.first().map(|s| s.as_str()).unwrap_or("serve");

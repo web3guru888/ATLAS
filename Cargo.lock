@@ -48,6 +48,7 @@ dependencies = [
  "atlas-mcp",
  "atlas-model",
  "atlas-palace",
+ "atlas-tokenize",
  "atlas-zk",
 ]
 

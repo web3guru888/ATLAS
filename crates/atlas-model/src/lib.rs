@@ -91,6 +91,38 @@ impl ModelConfig {
         }
     }
 
+    /// SmolLM2-1.7B (HuggingFaceTB) — LlamaForCausalLM, Apache 2.0
+    /// hidden=2048, layers=24, heads=32, kv_heads=32, ffn=8192, vocab=49152
+    pub fn smollm2_1b7() -> Self {
+        Self {
+            vocab_size:   49152,
+            d_model:      2048,
+            n_layers:     24,
+            n_heads:      32,
+            n_kv_heads:   32,
+            ffn_hidden:   8192,
+            max_seq_len:  8192,
+            rope_theta:   130_000.0,
+            rms_norm_eps: 1e-5,
+        }
+    }
+
+    /// SmolLM2-135M (HuggingFaceTB) — LlamaForCausalLM, Apache 2.0
+    /// hidden=576, layers=30, heads=9, kv_heads=3, ffn=1536, vocab=49152
+    pub fn smollm2_135m() -> Self {
+        Self {
+            vocab_size:   49152,
+            d_model:      576,
+            n_layers:     30,
+            n_heads:      9,
+            n_kv_heads:   3,
+            ffn_hidden:   1536,
+            max_seq_len:  8192,
+            rope_theta:   10_000.0,
+            rms_norm_eps: 1e-5,
+        }
+    }
+
     /// Head dimension (d_model / n_heads).
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_heads
