@@ -10,9 +10,10 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v0.1.0-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-186%2F186%20passing-brightgreen.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v0.2.0-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-236%2F236%20passing-brightgreen.svg)](#status)
 [![Stages](https://img.shields.io/badge/stages-7%2F7%20complete-success.svg)](#status)
+[![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__75%20T4-76b900.svg)](#status)
 
 ---
@@ -72,7 +73,8 @@ atlas/
     ├── atlas-quant/    # INT4/INT8 quantization, QLoRA
     ├── atlas-model/    # transformer: MultiHeadAttn, FFN, RMSNorm, RoPE
     ├── atlas-tokenize/ # BPE tokenizer (sentencepiece port)
-    ├── atlas-palace/   # GraphPalace stigmergic memory (PyO3 stripped)
+    ├── atlas-palace/   # GraphPalace stigmergic memory: A* search, 5-type pheromones, Active Inference
+    ├── atlas-mcp/      # MCP server: 28 palace tools via JSON-RPC 2.0 stdio
     ├── atlas-trm/      # TRM-CausalValidator (7M params, arXiv:2510.04871)
     ├── atlas-causal/   # PC/FCI causal inference (py-causal port)
     ├── atlas-bayes/    # Bayesian confidence scoring
@@ -84,7 +86,7 @@ atlas/
     └── atlas-cli/      # CLI: train / discover / eval / prove
 ```
 
-**16 crates. One coherent system. Zero external Rust dependencies.**
+**18 crates. One coherent system. Zero external Rust dependencies.**
 
 CUDA is called via raw `extern "C"` FFI from `build.rs` + `.cu` kernel files — no `cudarc`, no `tch`, no `candle`. The same approach that makes SQLite trustworthy, applied to GPU compute.
 
@@ -190,9 +192,18 @@ cargo build --release -p atlas-cli
 
 ---
 
-## Status — v0.1.0 (All 7 Stages Complete)
+## Status — v0.2.0 (Real Memory Palace + MCP Server)
 
-**186/186 tests passing** · **Zero external crate dependencies** · **CUDA sm_75 on Tesla T4**
+**236/236 tests passing** · **18 crates** · **Zero external crate dependencies** · **CUDA sm_75 on Tesla T4**
+
+### What's New in v0.2.0
+
+- **Semantic A\* Search** — pheromone-weighted composite edge cost + path provenance tracking
+- **5-Type Pheromone System** — exploitation, exploration, success, traversal, recency (ported from GraphPalace)
+- **3 Decay Strategies** — exponential + linear + sigmoid with configurable steepness
+- **Active Inference Engine** — beliefs, generative model, free energy minimization, 5 agent archetypes
+- **MCP Server** — 28 palace tools via JSON-RPC 2.0 stdio transport (Model Context Protocol)
+- **Module split** — atlas-palace refactored into 9 focused modules (3,458 LOC)
 
 | Crate | Stage | Tests | Status |
 |-------|-------|-------|--------|
@@ -205,16 +216,17 @@ cargo build --release -p atlas-cli
 | atlas-json | 2 | 12 | ✅ Recursive descent parser, surrogate pairs |
 | atlas-tokenize | 2 | 6 | ✅ GPT-2 byte-level BPE, tokenizer.json |
 | atlas-model | 2 | 12 | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, safetensors |
-| atlas-palace | 3 | 15 | ✅ Stigmergic memory, pheromone A*, KG, semantic search |
+| atlas-palace | 3 | **73** | ✅ **v0.2.0**: A\* search, 5-type pheromones, Active Inference, 9 modules |
+| atlas-mcp | 3 | **27** | ✅ **v0.2.0**: 28 MCP tools, JSON-RPC 2.0, live palace dispatch |
 | atlas-trm | 4 | 12 | ✅ TRM-CausalValidator depth-6 RNN, Bayesian combining |
 | atlas-http | 5 | 11 | ✅ HTTP/1.1 TcpStream, chunked decoding, curl HTTPS |
 | atlas-bayes | 5 | 13 | ✅ BetaPrior, BayesNetwork, QualityGate, Jaccard novelty |
 | atlas-causal | 5 | 10 | ✅ PC algorithm, Fisher-Z, standard normal CDF, Meek rules |
-| atlas-zk | 5 | 10 | ✅ Schnorr proofs over Z_p (64-bit limbs), Fiat-Shamir |
+| atlas-zk | 5 | 9 | ✅ Schnorr proofs over Z_p (64-bit limbs), Fiat-Shamir |
 | atlas-astra | 5 | 15 | ✅ OODA: NASA POWER / WHO GHO / World Bank / ArXiv |
 | atlas-corpus | 6 | 20 | ✅ LiveDiscoveryCorpus, 5 quality gates, pheromone sampler |
 | atlas-cli | 7 | 19 | ✅ discover / corpus / train / eval / prove / palace / status |
-| **TOTAL** | | **186** | **✅ All passing** |
+| **TOTAL** | | **236** | **✅ All passing** |
 
 ### Quick Start (v0.1.0)
 
@@ -227,6 +239,35 @@ cargo build --release -p atlas-cli
 ./target/release/atlas train --corpus my-corpus.json --epochs 2
 ./target/release/atlas prove --claim "CO2 drives warming" --secret deadbeef01020304
 ```
+
+---
+
+## atlas-mcp — Model Context Protocol Server
+
+ATLAS exposes its memory palace as **28 MCP tools** via stdio JSON-RPC 2.0, ready for Claude Desktop, Cursor, or any MCP client.
+
+```bash
+# Add to your Claude Desktop config (~/.config/claude/claude_desktop_config.json)
+{
+  "mcpServers": {
+    "atlas-palace": {
+      "command": "./target/release/atlas",
+      "args": ["mcp", "--palace", "my-palace.json"]
+    }
+  }
+}
+```
+
+**Tool categories:**
+| Category | Tools | Examples |
+|----------|-------|---------|
+| Navigation | 8 | `palace_search`, `palace_navigate`, `palace_find_similar` |
+| Operations | 5 | `palace_add_wing`, `palace_add_room`, `palace_add_drawer` |
+| Knowledge Graph | 7 | `palace_kg_add`, `palace_kg_query`, `palace_kg_contradictions` |
+| Stigmergy | 5 | `palace_deposit_pheromones`, `palace_hot_paths`, `palace_cold_spots` |
+| Agent Diary | 3 | `palace_create_agent`, `palace_diary_write`, `palace_diary_read` |
+
+Every tool call modifies live palace state. Pheromone trails compound across sessions. Knowledge graphs grow with every interaction.
 
 ---
 
