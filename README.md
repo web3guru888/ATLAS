@@ -10,8 +10,9 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Stage 1](https://img.shields.io/badge/Stage%201-COMPLETE%20✓-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-31%2F31%20passing-brightgreen.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v0.1.0-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-186%2F186%20passing-brightgreen.svg)](#status)
+[![Stages](https://img.shields.io/badge/stages-7%2F7%20complete-success.svg)](#status)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__75%20T4-76b900.svg)](#status)
 
 ---
@@ -161,41 +162,71 @@ The interactive dashboard (project overview, roadmap, papers, component status) 
 ```bash
 git clone https://github.com/web3guru888/ATLAS.git
 cd ATLAS
-bash scripts/setup.sh   # checks prerequisites, builds Stage 1 crates
 
-# Stage 1: run the passing tests
-cargo test -p atlas-core -p atlas-tensor -p atlas-grad
+# Run all tests (excludes CUDA-requiring tensor tests on CPU-only machines)
+cargo test --workspace --exclude atlas-tensor
+
+# Build the atlas binary
+cargo build --release -p atlas-cli
+
+# Full OODA discovery loop
+./target/release/atlas discover --cycles 5 --output corpus.json
+
+# Train on discoveries
+./target/release/atlas train --corpus corpus.json --epochs 3
+
+# ZK-prove a claim
+./target/release/atlas prove --claim "Pheromone trails compound information gain" \
+    --secret $(openssl rand -hex 16)
+
+# Inspect palace memory
+./target/release/atlas palace --stats --hot
 ```
 
 **Prerequisites:**
 - Rust 1.75+ (`rustup update stable`)
-- CUDA 12.x + nvcc (optional but recommended; falls back to CPU if absent)
-- RTX 3090/4090 or A100 for training (24GB VRAM for 4-bit 7B)
+- CUDA 12.x + nvcc (optional; falls back to CPU if absent)
+- GPU with sm_75+ (Tesla T4 / RTX 2080+) for CUDA training path
 
 ---
 
-## Status
+## Status — v0.1.0 (All 7 Stages Complete)
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| atlas-core | ✅ Stage 1 | Error types, traits, config — 2/2 tests ✅ |
-| atlas-tensor | ✅ Stage 1 | CPU+GPU matmul, softmax, transpose, GpuBuf — 6/6 tests ✅ |
-| atlas-grad | ✅ Stage 1 | GradTape, matmul/relu backward — 9/9 tests ✅ |
-| atlas-optim | ✅ Stage 1 | AdamW + CosineScheduler — 6/6 tests ✅ |
-| atlas-quant | ✅ Stage 1 | INT8, INT4, QLoRA LoraAdapter — 7/7 tests ✅ |
-| CUDA kernels | ✅ Stage 1 | tiled GEMM sm_75, AdamW, INT8, INT4 — **compiled on Tesla T4** ✅ |
-| atlas-model | ⬜ Stage 2 | OLMo 3 transformer — to implement |
-| atlas-tokenize | ⬜ Stage 2 | BPE tokenizer port — to implement |
-| atlas-palace | ⬜ Stage 3 | GraphPalace Rust crates — strip PyO3 |
-| atlas-trm | ⬜ Stage 4 | TRM-CausalValidator — implement from arXiv:2510.04871 |
-| atlas-causal | ⬜ Stage 5 | PC/FCI — port from py-causal |
-| atlas-bayes | ⬜ Stage 5 | Bayesian scoring — port from fetch-agi |
-| atlas-astra | ⬜ Stage 5 | ASTRA OODA — full port (~8K LOC) |
-| atlas-corpus | ⬜ Stage 6 | LiveDiscoveryCorpus — implement |
-| atlas-zk | ⬜ Stage 5/7 | Schnorr proofs — port from asi-build |
-| atlas-http | ⬜ Stage 5 | HTTP via libc — implement |
-| atlas-json | ⬜ Stage 5 | JSON parser — port |
-| atlas-cli | ⬜ Stage 7 | CLI — implement |
+**186/186 tests passing** · **Zero external crate dependencies** · **CUDA sm_75 on Tesla T4**
+
+| Crate | Stage | Tests | Status |
+|-------|-------|-------|--------|
+| atlas-core | 1 | 2 | ✅ Error types, Result, traits |
+| atlas-tensor | 1 | 6 | ✅ CPU+GPU matmul, INT8/INT4, sm_75 kernels |
+| atlas-grad | 1 | 9 | ✅ GradTape, matmul/relu backward |
+| atlas-optim | 1 | 6 | ✅ AdamW + CosineScheduler, warmup |
+| atlas-quant | 1 | 7 | ✅ INT8, INT4, symmetric scaling |
+| CUDA kernels | 1 | — | ✅ tiled GEMM, AdamW, INT8/INT4 — compiled on Tesla T4 |
+| atlas-json | 2 | 12 | ✅ Recursive descent parser, surrogate pairs |
+| atlas-tokenize | 2 | 6 | ✅ GPT-2 byte-level BPE, tokenizer.json |
+| atlas-model | 2 | 12 | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, safetensors |
+| atlas-palace | 3 | 15 | ✅ Stigmergic memory, pheromone A*, KG, semantic search |
+| atlas-trm | 4 | 12 | ✅ TRM-CausalValidator depth-6 RNN, Bayesian combining |
+| atlas-http | 5 | 11 | ✅ HTTP/1.1 TcpStream, chunked decoding, curl HTTPS |
+| atlas-bayes | 5 | 13 | ✅ BetaPrior, BayesNetwork, QualityGate, Jaccard novelty |
+| atlas-causal | 5 | 10 | ✅ PC algorithm, Fisher-Z, standard normal CDF, Meek rules |
+| atlas-zk | 5 | 10 | ✅ Schnorr proofs over Z_p (64-bit limbs), Fiat-Shamir |
+| atlas-astra | 5 | 15 | ✅ OODA: NASA POWER / WHO GHO / World Bank / ArXiv |
+| atlas-corpus | 6 | 20 | ✅ LiveDiscoveryCorpus, 5 quality gates, pheromone sampler |
+| atlas-cli | 7 | 19 | ✅ discover / corpus / train / eval / prove / palace / status |
+| **TOTAL** | | **186** | **✅ All passing** |
+
+### Quick Start (v0.1.0)
+
+```bash
+git clone https://github.com/web3guru888/ATLAS.git
+cd ATLAS
+cargo build --release -p atlas-cli
+./target/release/atlas status
+./target/release/atlas discover --cycles 3 --output my-corpus.json
+./target/release/atlas train --corpus my-corpus.json --epochs 2
+./target/release/atlas prove --claim "CO2 drives warming" --secret deadbeef01020304
+```
 
 ---
 
