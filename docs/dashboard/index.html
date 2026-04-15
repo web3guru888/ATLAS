@@ -3,1156 +3,1660 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ATLAS v4.0 — Active-inference Training with Learned Adaptive Stigmergy</title>
+  <title>ATLAS — King of Atlantis · Active-inference Training with Learned Adaptive Stigmergy</title>
+  <meta name="description" content="ATLAS: The AI that trains on what it discovers. 383 tests · 20 crates · Zero external dependencies · Tesla T4 GPU validated · Pure Rust.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
   <style>
-    :root {
-      --bg: #060b13;
-      --bg2: #0b1520;
-      --bg3: #101e30;
-      --border: #1a3352;
-      --c1: #00d4ff;   /* cyan — OLMo */
-      --c2: #7c3aed;   /* purple — GraphPalace */
-      --c3: #10b981;   /* green — pheromones */
-      --c4: #f59e0b;   /* amber — morphic */
-      --c5: #ef4444;   /* red — ASTRA */
-      --c6: #e879f9;   /* pink — ZK */
-    --c7: #e8520a;   /* rust-orange — Pure Rust */
-      --text: #e2e8f0;
-      --text2: #94a3b8;
-      --text3: #475569;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; overflow-x: hidden; }
-    canvas#bg { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
-    .z1 { position: relative; z-index: 1; }
-    .wrap { max-width: 1360px; margin: 0 auto; padding: 0 24px; }
+/* ═══════════════════════════════════════════════════
+   ATLAS DESIGN SYSTEM — Truth Palace × Atlantis
+   ═══════════════════════════════════════════════════ */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
-    /* HERO */
-    .hero { text-align: center; padding: 80px 20px 56px; }
-    .v-badge {
-      display: inline-block;
-      background: linear-gradient(135deg, rgba(239,68,68,0.2), rgba(124,58,237,0.2));
-      border: 1px solid var(--c5);
-      border-radius: 20px;
-      padding: 5px 16px;
-      font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
-      color: var(--c5); margin-bottom: 24px;
-    }
-    h1.atlas {
-      font-size: clamp(64px, 10vw, 112px);
-      font-weight: 900; letter-spacing: -3px; line-height: 1;
-      background: linear-gradient(135deg, var(--c1) 0%, var(--c2) 40%, var(--c5) 80%);
-      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-      background-clip: text; margin-bottom: 10px;
-    }
-    .acronym { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
-    .ap { padding: 5px 14px; border-radius: 8px; font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }
-    .ap1{background:rgba(0,212,255,.12);color:var(--c1);border:1px solid rgba(0,212,255,.3);}
-    .ap2{background:rgba(16,185,129,.12);color:var(--c3);border:1px solid rgba(16,185,129,.3);}
-    .ap3{background:rgba(245,158,11,.12);color:var(--c4);border:1px solid rgba(245,158,11,.3);}
-    .ap4{background:rgba(124,58,237,.12);color:var(--c2);border:1px solid rgba(124,58,237,.3);}
-    .ap5{background:rgba(239,68,68,.12);color:var(--c5);border:1px solid rgba(239,68,68,.3);}
-    .tagline { font-size: clamp(15px, 2.2vw, 19px); color: var(--text2); max-width: 720px; margin: 0 auto 12px; line-height: 1.55; }
-    .sub { font-size: 13px; color: var(--text3); font-style: italic; }
+:root {
+  --obsidian:       #0a0a0f;
+  --basalt:         #12121a;
+  --slate:          #1a1a2e;
+  --ash:            #2a2a3d;
+  --smoke:          #6b7280;
+  --bone:           #d4d4e0;
+  --chalk:          #f0f0f5;
+  --orichalcum:     #f59e0b;   /* Atlantean gold — ATLAS primary */
+  --orichalcum-glow:#fbbf24;
+  --orichalcum-deep:#d97706;
+  --cyan:           #00e5ff;   /* palace navigation */
+  --cyan-dim:       #00a0b4;
+  --violet:         #a78bfa;   /* model/tokenize */
+  --violet-dim:     #7c5cbf;
+  --emerald:        #34d399;   /* validator/pheromones */
+  --emerald-dim:    #059669;
+  --coral:          #f87171;   /* discovery */
+  --coral-dim:      #dc2626;
+  --rust:           #e8520a;   /* Pure Rust */
+  --glass-bg:       rgba(18, 18, 26, 0.72);
+  --glass-bg-heavy: rgba(10, 10, 15, 0.92);
+  --glass-border:   rgba(245, 158, 11, 0.15);
+  --glass-border-dim:rgba(255,255,255,0.06);
+  --font-serif: 'Instrument Serif', Georgia, serif;
+  --font-sans:  'DM Sans', system-ui, -apple-system, sans-serif;
+  --font-mono:  'IBM Plex Mono', 'SF Mono', Consolas, monospace;
+}
 
-    /* BREAKTHROUGH BOX */
-    .breakthrough {
-      background: linear-gradient(135deg, rgba(239,68,68,.07), rgba(124,58,237,.07));
-      border: 1px solid rgba(239,68,68,.35);
-      border-left: 3px solid var(--c5);
-      border-radius: 14px; padding: 28px 32px;
-      max-width: 1000px; margin: 0 auto 56px;
-      font-size: 18px; line-height: 1.7; color: var(--text);
-    }
-    .breakthrough em { color: var(--c5); font-style: normal; font-weight: 700; }
-    .breakthrough strong { color: var(--c1); }
+html { scroll-behavior: smooth; scroll-padding-top: 72px; -webkit-font-smoothing: antialiased; }
+body { background: var(--obsidian); color: var(--bone); font-family: var(--font-sans); font-size: 16px; line-height: 1.6; overflow-x: hidden; }
+::selection { background: rgba(245,158,11,0.3); color: var(--chalk); }
+a { color: var(--orichalcum); text-decoration: none; transition: color 0.2s; }
+a:hover { color: var(--orichalcum-glow); }
 
-    /* SECTIONS */
-    .sec { margin-bottom: 64px; }
-    .sec-hdr { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
-    .sec-num {
-      width: 38px; height: 38px; border-radius: 10px; flex-shrink: 0;
-      background: linear-gradient(135deg, var(--c1), var(--c2));
-      display: flex; align-items: center; justify-content: center;
-      font-weight: 800; font-size: 15px; color: #000;
-    }
-    .sec-title { font-size: clamp(20px, 2.8vw, 26px); font-weight: 700; }
-    .sec-sub { font-size: 13px; color: var(--text3); margin-top: 3px; }
-    .div { height: 1px; background: linear-gradient(90deg,transparent,var(--border),transparent); margin: 56px 0; }
+/* ── NAVIGATION ─────────────────────────────────────── */
+.nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+  padding: 0 28px; height: 64px;
+  display: flex; align-items: center; justify-content: space-between;
+  background: rgba(10,10,15,0.55);
+  backdrop-filter: blur(20px) saturate(1.4);
+  -webkit-backdrop-filter: blur(20px) saturate(1.4);
+  border-bottom: 1px solid var(--glass-border);
+  transition: background 0.3s, box-shadow 0.3s;
+}
+.nav.scrolled { background: rgba(10,10,15,0.94); box-shadow: 0 4px 30px rgba(0,0,0,0.5); }
+.nav-brand {
+  display: flex; align-items: center; gap: 10px;
+  font-family: var(--font-serif); font-size: 1.15rem;
+  color: var(--orichalcum); letter-spacing: 0.02em;
+}
+.nav-icon {
+  width: 30px; height: 30px; border-radius: 7px;
+  background: linear-gradient(135deg, var(--orichalcum), var(--orichalcum-deep));
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-serif); font-size: 13px; font-weight: 700;
+  color: var(--obsidian); letter-spacing: -0.5px;
+}
+.nav-links { display: flex; gap: 4px; list-style: none; }
+.nav-links a {
+  display: block; padding: 6px 13px; border-radius: 8px;
+  font-size: 0.81rem; font-weight: 500; color: var(--smoke);
+  letter-spacing: 0.03em; transition: color 0.2s, background 0.2s;
+}
+.nav-links a:hover, .nav-links a.active { color: var(--orichalcum); background: rgba(245,158,11,0.08); }
+.nav-links .sanctum-link {
+  color: var(--cyan) !important; background: rgba(0,229,255,0.07) !important;
+  border: 1px solid rgba(0,229,255,0.18); position: relative;
+}
+.nav-links .sanctum-link::after {
+  content: ''; position: absolute; top: 3px; right: 5px;
+  width: 5px; height: 5px; background: var(--cyan); border-radius: 50%;
+  box-shadow: 0 0 6px var(--cyan), 0 0 14px rgba(0,229,255,0.4);
+  animation: sanctum-pulse 2.2s ease-in-out infinite;
+}
+@keyframes sanctum-pulse {
+  0%,100%{ opacity:1; transform:scale(1); }
+  50%{ opacity:0.45; transform:scale(0.65); }
+}
+.nav-links .sanctum-link:hover { color: var(--cyan) !important; background: rgba(0,229,255,0.13) !important; border-color: rgba(0,229,255,0.35); box-shadow: 0 0 20px rgba(0,229,255,0.15); }
 
-    /* CARDS */
-    .grid { display: grid; gap: 16px; }
-    .g2 { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
-    .g3 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
-    .g4 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
-    .card {
-      background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 22px;
-      transition: all .2s;
-    }
-    .card:hover { transform: translateY(-2px); box-shadow: 0 0 20px rgba(0,212,255,.15); border-color: var(--c1); }
-    .card-icon { font-size: 26px; margin-bottom: 12px; }
-    .card-title { font-size: 15px; font-weight: 700; margin-bottom: 8px; }
-    .card-body { font-size: 13px; color: var(--text2); line-height: 1.6; }
-    .ct { border-top: 2px solid; }
-    .ct1{border-top-color:var(--c1);} .ct2{border-top-color:var(--c2);} .ct3{border-top-color:var(--c3);}
-    .ct4{border-top-color:var(--c4);} .ct5{border-top-color:var(--c5);} .ct6{border-top-color:var(--c6);}
+/* ── HERO ───────────────────────────────────────────── */
+.hero {
+  position: relative; min-height: 100vh;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  text-align: center; padding: 100px 24px 80px; overflow: hidden;
+}
+.hero-bg {
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(ellipse 90% 55% at 50% 0%, rgba(245,158,11,0.07) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 50% 100%, rgba(0,229,255,0.04) 0%, transparent 55%),
+    radial-gradient(ellipse 40% 30% at 20% 50%, rgba(167,139,250,0.03) 0%, transparent 50%),
+    var(--obsidian);
+  z-index: 0;
+}
+.rings-container {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1; pointer-events: none;
+}
+.ring {
+  position: absolute; border-radius: 50%;
+  top: 50%; left: 50%;
+  transform: translate(-50%,-50%);
+  border: 1px solid rgba(245,158,11,0.08);
+}
+.ring:nth-child(1){ width:260px;height:260px; border-color:rgba(245,158,11,0.18); animation:ring-pulse 9s ease-in-out infinite; }
+.ring:nth-child(2){ width:460px;height:460px; border-color:rgba(245,158,11,0.10); animation:ring-pulse 9s ease-in-out 1.2s infinite; }
+.ring:nth-child(3){ width:660px;height:660px; border-color:rgba(0,229,255,0.07); animation:ring-pulse 9s ease-in-out 2.4s infinite; }
+.ring:nth-child(4){ width:860px;height:860px; border-color:rgba(0,229,255,0.04); animation:ring-pulse 9s ease-in-out 3.6s infinite; }
+.ring:nth-child(5){ width:1060px;height:1060px; border-color:rgba(167,139,250,0.03); animation:ring-pulse 9s ease-in-out 4.8s infinite; }
+@keyframes ring-pulse {
+  0%,100%{ opacity:0.35; transform:translate(-50%,-50%) scale(1); }
+  50%{ opacity:1; transform:translate(-50%,-50%) scale(1.025); }
+}
+.ring::after {
+  content:''; position:absolute; inset:-1px; border-radius:50%;
+  background: conic-gradient(from 0deg, transparent 0%, rgba(0,229,255,0.025) 25%, transparent 50%, rgba(245,158,11,0.025) 75%, transparent 100%);
+  animation: ring-rotate 35s linear infinite;
+}
+@keyframes ring-rotate { to { transform: rotate(360deg); } }
 
-    /* FLYWHEEL VISUAL */
-    .flywheel-wrap {
-      background: var(--bg2); border: 1px solid var(--border);
-      border-radius: 16px; padding: 40px; overflow-x: auto;
-    }
-    .fw-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
-    .fw-node {
-      background: var(--bg3); border-radius: 10px; padding: 12px 18px;
-      font-size: 13px; font-weight: 600; border: 1px solid var(--border);
-      white-space: nowrap;
-    }
-    .fw-n1{border-color:var(--c5);color:var(--c5);}
-    .fw-n2{border-color:var(--c2);color:var(--c2);}
-    .fw-n3{border-color:var(--c3);color:var(--c3);}
-    .fw-n4{border-color:var(--c1);color:var(--c1);}
-    .fw-n5{border-color:var(--c4);color:var(--c4);}
-    .fw-arr { color: var(--text3); font-size: 20px; }
-    .fw-label { font-size: 11px; color: var(--text3); margin-left: 4px; }
-    .fw-loop {
-      display: flex; align-items: center; justify-content: center;
-      gap: 8px; margin-top: 16px;
-      background: linear-gradient(135deg, rgba(239,68,68,.06), rgba(0,212,255,.06));
-      border: 1px dashed rgba(255,255,255,.1); border-radius: 10px;
-      padding: 12px 20px; font-size: 13px; color: var(--text2);
-    }
+.hero-content { position: relative; z-index: 2; }
+.live-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  background: rgba(245,158,11,0.08);
+  border: 1px solid rgba(245,158,11,0.25);
+  border-radius: 20px; padding: 6px 18px;
+  font-size: 0.7rem; letter-spacing: 2.5px; text-transform: uppercase;
+  color: var(--orichalcum); margin-bottom: 32px;
+  font-family: var(--font-mono);
+}
+.live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--emerald); box-shadow: 0 0 8px var(--emerald), 0 0 16px rgba(52,211,153,0.4); animation: live-blink 2.5s ease-in-out infinite; }
+@keyframes live-blink { 0%,100%{opacity:1;} 50%{opacity:0.3;} }
 
-    /* DATA COMPARISON TABLE */
-    table.cmp { width: 100%; border-collapse: collapse; background: var(--bg2); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
-    table.cmp th { background: var(--bg3); padding: 12px 18px; text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text3); border-bottom: 1px solid var(--border); }
-    table.cmp td { padding: 11px 18px; font-size: 13px; border-bottom: 1px solid rgba(26,51,82,.5); color: var(--text2); }
-    table.cmp tr:last-child td { border-bottom: none; }
-    table.cmp tr:hover td { background: rgba(255,255,255,.02); }
-    table.cmp td:first-child { font-weight: 600; color: var(--text); }
-    .yes { color: var(--c3); font-weight: 700; }
-    .no { color: var(--text3); }
-    .atlas-v { color: var(--c1) !important; font-weight: 700 !important; }
+h1.atlas-title {
+  font-family: var(--font-serif);
+  font-size: clamp(72px, 12vw, 128px);
+  font-weight: 400; line-height: 0.92;
+  color: var(--chalk); letter-spacing: -2px;
+  margin-bottom: 4px;
+}
+h1.atlas-title .of-atlantis {
+  display: block;
+  color: var(--orichalcum);
+  font-style: italic;
+  font-size: clamp(32px, 5.5vw, 60px);
+  letter-spacing: -1px; margin-top: 6px;
+}
+.atlas-lore {
+  font-family: var(--font-serif); font-style: italic;
+  color: var(--smoke); font-size: 1.05rem;
+  margin: 20px auto 32px; max-width: 580px; line-height: 1.65;
+}
+.acronym-row { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin-bottom: 40px; }
+.ap {
+  padding: 5px 14px; border-radius: 8px;
+  font-size: 0.72rem; font-weight: 700; letter-spacing: 0.5px;
+  font-family: var(--font-mono);
+}
+.ap-a { background: rgba(245,158,11,0.12); color: var(--orichalcum); border: 1px solid rgba(245,158,11,0.25); }
+.ap-t { background: rgba(0,229,255,0.10); color: var(--cyan); border: 1px solid rgba(0,229,255,0.22); }
+.ap-l { background: rgba(52,211,153,0.10); color: var(--emerald); border: 1px solid rgba(52,211,153,0.22); }
+.ap-a2 { background: rgba(167,139,250,0.10); color: var(--violet); border: 1px solid rgba(167,139,250,0.22); }
+.ap-s { background: rgba(248,113,113,0.10); color: var(--coral); border: 1px solid rgba(248,113,113,0.22); }
 
-    /* STATS BAND */
-    .stats-band {
-      display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px;
-    }
-    .stat {
-      background: var(--bg3); border: 1px solid var(--border);
-      border-radius: 10px; padding: 14px 20px; flex: 1; min-width: 140px;
-    }
-    .stat-val { font-size: 26px; font-weight: 800; line-height: 1; }
-    .stat-label { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 1px; margin-top: 5px; }
-    .sv1{color:var(--c5);} .sv2{color:var(--c3);} .sv3{color:var(--c1);} .sv4{color:var(--c4);} .sv5{color:var(--c2);}
+.stats-row {
+  display: flex; justify-content: center; gap: 40px; flex-wrap: wrap;
+  margin-bottom: 44px;
+}
+.stat-item { text-align: center; }
+.stat-num {
+  display: block; font-family: var(--font-serif); font-size: 2.6rem;
+  color: var(--orichalcum); line-height: 1;
+}
+.stat-num.cyan { color: var(--cyan); }
+.stat-num.emerald { color: var(--emerald); }
+.stat-num.violet { color: var(--violet); }
+.stat-label {
+  display: block; font-size: 0.67rem; letter-spacing: 2px; text-transform: uppercase;
+  color: var(--smoke); margin-top: 4px; font-weight: 600;
+}
+.hero-cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 11px 24px; border-radius: 10px; font-weight: 600;
+  font-size: 0.85rem; transition: all 0.25s; cursor: pointer;
+  border: none; text-decoration: none;
+}
+.btn-primary {
+  background: linear-gradient(135deg, var(--orichalcum), var(--orichalcum-deep));
+  color: var(--obsidian);
+}
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(245,158,11,0.3); color: var(--obsidian); }
+.btn-ghost {
+  background: rgba(255,255,255,0.05);
+  border: 1px solid rgba(255,255,255,0.1);
+  color: var(--bone);
+}
+.btn-ghost:hover { background: rgba(255,255,255,0.09); border-color: rgba(255,255,255,0.18); color: var(--chalk); transform: translateY(-2px); }
+.btn-palace {
+  background: rgba(0,229,255,0.07);
+  border: 1px solid rgba(0,229,255,0.22);
+  color: var(--cyan);
+}
+.btn-palace:hover { background: rgba(0,229,255,0.14); box-shadow: 0 0 20px rgba(0,229,255,0.18); color: var(--cyan); transform: translateY(-2px); }
 
-    /* TRAINING EXAMPLE BLOCK */
-    .ex-block {
-      background: var(--bg3); border: 1px solid var(--border); border-radius: 10px;
-      padding: 18px 22px; font-family: 'Courier New', monospace; font-size: 12px;
-      color: var(--text2); line-height: 1.7; overflow-x: auto;
-    }
-    .ex-block .key { color: var(--c1); }
-    .ex-block .val { color: var(--c3); }
-    .ex-block .conf { color: var(--c4); }
-    .ex-block .src { color: var(--c5); }
-    .ex-type { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+/* ── SECTIONS ───────────────────────────────────────── */
+section { padding: 100px 0; position: relative; }
+.container { max-width: 1300px; margin: 0 auto; padding: 0 28px; }
+.section-eyebrow {
+  font-size: 0.68rem; letter-spacing: 3px; text-transform: uppercase;
+  color: var(--orichalcum); font-weight: 700; font-family: var(--font-mono);
+  margin-bottom: 14px; text-align: center;
+}
+.section-title {
+  font-family: var(--font-serif);
+  font-size: clamp(2.2rem, 5vw, 3.4rem);
+  color: var(--chalk); text-align: center;
+  margin-bottom: 16px; font-weight: 400;
+}
+.section-desc { color: var(--smoke); text-align: center; max-width: 640px; margin: 0 auto 60px; font-size: 1.0rem; line-height: 1.7; }
 
-    /* ROADMAP */
-    .rm { border-left: 2px solid var(--border); }
-    .rm-phase { padding: 24px 0 24px 32px; border-left: none; position: relative; }
-    .rm-phase::before {
-      content: ''; position: absolute; left: -8px; top: 28px;
-      width: 14px; height: 14px; border-radius: 50%; border: 2px solid;
-    }
-    .rp0::before{border-color:var(--c5);background:rgba(239,68,68,.2);}
-    .rp1::before{border-color:var(--c1);background:rgba(0,212,255,.2);}
-    .rp2::before{border-color:var(--c3);background:rgba(16,185,129,.2);}
-    .rp3::before{border-color:var(--c2);background:rgba(124,58,237,.2);}
-    .rm-inner { display: flex; gap: 20px; }
-    .rm-label { flex-shrink: 0; width: 120px; }
-    .rm-name { font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; }
-    .rn0{color:var(--c5);}.rn1{color:var(--c1);}.rn2{color:var(--c3);}.rn3{color:var(--c2);}
-    .rm-time { font-size: 11px; color: var(--text3); margin-top: 3px; }
-    .rm-content { flex: 1; }
-    .rm-title { font-size: 17px; font-weight: 700; margin-bottom: 6px; }
-    .rm-desc { font-size: 13px; color: var(--text2); line-height: 1.6; margin-bottom: 12px; }
-    .rm-tags { display: flex; flex-wrap: wrap; gap: 7px; }
-    .rm-tag { background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 12px; color: var(--text2); }
+/* ── GLASS CARDS ────────────────────────────────────── */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+}
+.glass-light {
+  background: rgba(26,26,46,0.5);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 12px;
+}
 
-    /* PAPER CARDS */
-    .paper { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 22px; }
-    .paper-n { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
-    .paper-t { font-size: 15px; font-weight: 700; font-style: italic; color: var(--text); margin-bottom: 8px; line-height: 1.4; }
-    .paper-venue { font-size: 12px; color: var(--c3); margin-bottom: 12px; }
-    .paper-claims { list-style: none; }
-    .paper-claims li { font-size: 12px; color: var(--text2); padding: 3px 0 3px 14px; position: relative; line-height: 1.5; }
-    .paper-claims li::before { content: '→'; position: absolute; left: 0; color: var(--text3); }
+/* ── SEVEN PILLARS / WINGS ──────────────────────────── */
+#pillars { background: linear-gradient(180deg, var(--obsidian) 0%, var(--basalt) 50%, var(--obsidian) 100%); }
+.pillars-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 20px; }
+.pillar-card {
+  padding: 28px 28px 24px;
+  border-left: 3px solid var(--orichalcum);
+  position: relative; overflow: hidden;
+  transition: transform 0.25s, box-shadow 0.25s;
+}
+.pillar-card:hover { transform: translateY(-3px); box-shadow: 0 12px 40px rgba(0,0,0,0.4); }
+.pillar-card::before {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(135deg, rgba(245,158,11,0.04) 0%, transparent 60%);
+  pointer-events: none;
+}
+.pillar-num {
+  font-family: var(--font-serif); font-style: italic;
+  font-size: 3rem; color: rgba(245,158,11,0.15);
+  position: absolute; top: 16px; right: 20px; line-height: 1;
+}
+.pillar-icon { font-size: 1.7rem; margin-bottom: 12px; }
+.pillar-name {
+  font-family: var(--font-serif); font-size: 1.25rem;
+  color: var(--chalk); margin-bottom: 8px; font-weight: 400;
+}
+.pillar-desc { font-size: 0.88rem; color: var(--smoke); line-height: 1.65; }
+.pillar-tag {
+  display: inline-block; margin-top: 12px;
+  font-size: 0.68rem; font-family: var(--font-mono);
+  color: var(--orichalcum); background: rgba(245,158,11,0.1);
+  border: 1px solid rgba(245,158,11,0.2); border-radius: 6px;
+  padding: 2px 8px;
+}
 
-    /* STATUS */
-    .status-row { display: flex; flex-wrap: wrap; gap: 8px; }
-    .sbadge { display: flex; align-items: center; gap: 7px; background: var(--bg3); border: 1px solid var(--border); border-radius: 7px; padding: 7px 12px; font-size: 12px; color: var(--text2); }
-    .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
-    .dg{background:var(--c3);box-shadow:0 0 5px var(--c3);}
-    .dy{background:var(--c4);box-shadow:0 0 5px var(--c4);}
-    .db{background:var(--c1);box-shadow:0 0 5px var(--c1);}
-    .dr{background:var(--c5);box-shadow:0 0 5px var(--c5);}
-    .dgr{background:var(--text3);}
+/* pillar color variants */
+.pillar-card.p2 { border-left-color: var(--cyan); }
+.pillar-card.p2::before { background: linear-gradient(135deg, rgba(0,229,255,0.04) 0%, transparent 60%); }
+.pillar-card.p2 .pillar-tag { color: var(--cyan); background: rgba(0,229,255,0.08); border-color: rgba(0,229,255,0.2); }
+.pillar-card.p3 { border-left-color: var(--emerald); }
+.pillar-card.p3::before { background: linear-gradient(135deg, rgba(52,211,153,0.04) 0%, transparent 60%); }
+.pillar-card.p3 .pillar-tag { color: var(--emerald); background: rgba(52,211,153,0.08); border-color: rgba(52,211,153,0.2); }
+.pillar-card.p4 { border-left-color: var(--violet); }
+.pillar-card.p4::before { background: linear-gradient(135deg, rgba(167,139,250,0.04) 0%, transparent 60%); }
+.pillar-card.p4 .pillar-tag { color: var(--violet); background: rgba(167,139,250,0.08); border-color: rgba(167,139,250,0.2); }
+.pillar-card.p5 { border-left-color: var(--coral); }
+.pillar-card.p5::before { background: linear-gradient(135deg, rgba(248,113,113,0.04) 0%, transparent 60%); }
+.pillar-card.p5 .pillar-tag { color: var(--coral); background: rgba(248,113,113,0.08); border-color: rgba(248,113,113,0.2); }
+.pillar-card.p6 { border-left-color: var(--rust); }
+.pillar-card.p6::before { background: linear-gradient(135deg, rgba(232,82,10,0.04) 0%, transparent 60%); }
+.pillar-card.p6 .pillar-tag { color: var(--rust); background: rgba(232,82,10,0.08); border-color: rgba(232,82,10,0.2); }
+.pillar-card.p7 { border-left-color: var(--orichalcum-glow); }
 
-    /* QUOTE */
-    .quote { border-left: 3px solid var(--c2); padding: 16px 24px; background: rgba(124,58,237,.06); border-radius: 0 8px 8px 0; font-size: 16px; color: var(--text2); font-style: italic; line-height: 1.65; margin: 28px 0; }
+/* ── PALACE VIEWER ──────────────────────────────────── */
+#palace { background: var(--basalt); }
+.palace-header { text-align: center; margin-bottom: 20px; }
+.palace-shell {
+  position: relative; border-radius: 20px; overflow: hidden;
+  border: 1px solid var(--glass-border);
+  background: rgba(10,10,15,0.85);
+  min-height: 560px;
+}
+#palace-canvas {
+  width: 100%; height: 560px; display: block;
+  cursor: grab;
+}
+#palace-canvas:active { cursor: grabbing; }
+.palace-legend {
+  display: flex; flex-wrap: wrap; gap: 14px 24px;
+  justify-content: center; margin-top: 20px;
+}
+.legend-item {
+  display: flex; align-items: center; gap: 7px;
+  font-size: 0.78rem; color: var(--smoke); font-family: var(--font-mono);
+}
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; }
+.palace-controls {
+  display: flex; gap: 10px; justify-content: center; margin-top: 18px;
+}
+.palace-ctrl-btn {
+  padding: 7px 16px; border-radius: 8px;
+  background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08);
+  color: var(--bone); font-size: 0.78rem; cursor: pointer;
+  transition: all 0.2s; font-family: var(--font-mono);
+}
+.palace-ctrl-btn:hover { background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.25); color: var(--orichalcum); }
+.palace-tooltip {
+  position: absolute; padding: 10px 14px; border-radius: 10px;
+  background: var(--glass-bg-heavy); border: 1px solid var(--glass-border);
+  backdrop-filter: blur(16px); pointer-events: none;
+  font-size: 0.82rem; color: var(--chalk); white-space: nowrap;
+  z-index: 10; display: none;
+  font-family: var(--font-mono);
+}
+.palace-tooltip .tt-name { color: var(--orichalcum); font-weight: 600; margin-bottom: 3px; }
+.palace-tooltip .tt-desc { color: var(--smoke); font-size: 0.75rem; }
 
-    /* FOOTER */
-    footer { text-align: center; padding: 48px 20px; border-top: 1px solid var(--border); color: var(--text3); font-size: 13px; }
-    footer strong { color: var(--text2); }
-    footer a { color: var(--text3); text-decoration: none; }
-    footer a:hover { color: var(--c1); }
+/* ── DISCOVERY FLYWHEEL ────────────────────────────── */
+#discovery { background: var(--obsidian); }
+.flywheel-container { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: start; }
+.flywheel-visual { position: relative; }
+.flywheel-canvas { width: 100%; height: 380px; border-radius: 16px; overflow: hidden; background: rgba(10,10,15,0.6); border: 1px solid rgba(245,158,11,0.1); }
+#flywheel-svg { width: 100%; height: 380px; }
+.flywheel-steps { display: flex; flex-direction: column; gap: 14px; }
+.fw-step {
+  display: flex; gap: 16px; align-items: flex-start;
+  padding: 18px 20px; border-radius: 12px;
+  background: rgba(26,26,46,0.5); border: 1px solid rgba(255,255,255,0.06);
+  transition: border-color 0.25s, background 0.25s;
+}
+.fw-step:hover { border-color: rgba(245,158,11,0.2); background: rgba(26,26,46,0.8); }
+.fw-num {
+  min-width: 32px; height: 32px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--font-serif); font-size: 1rem;
+  background: rgba(245,158,11,0.12); color: var(--orichalcum);
+  border: 1px solid rgba(245,158,11,0.25);
+}
+.fw-body .fw-title { font-weight: 600; color: var(--chalk); font-size: 0.92rem; margin-bottom: 3px; }
+.fw-body .fw-desc { font-size: 0.82rem; color: var(--smoke); line-height: 1.55; }
+.fw-code { font-family: var(--font-mono); font-size: 0.72rem; color: var(--orichalcum); background: rgba(245,158,11,0.08); border: 1px solid rgba(245,158,11,0.15); border-radius: 5px; padding: 1px 6px; margin-top: 5px; display: inline-block; }
 
-    @keyframes pulse { 0%,100%{opacity:.6;} 50%{opacity:1;} }
-    .live-badge {
-      display: inline-flex; align-items: center; gap: 7px;
-      background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.35);
-      border-radius: 20px; padding: 5px 14px; font-size: 12px; color: var(--c5);
-      animation: pulse 2s ease-in-out infinite; margin: 4px;
-    }
-    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--c5); }
-    .phero-badge {
-      display: inline-flex; align-items: center; gap: 7px;
-      background: rgba(16,185,129,.1); border: 1px solid rgba(16,185,129,.3);
-      border-radius: 20px; padding: 5px 14px; font-size: 12px; color: var(--c3);
-      animation: pulse 2.8s ease-in-out infinite; margin: 4px;
-    }
-    .phero-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--c3); }
+/* ── CRATES ARCHITECTURE ────────────────────────────── */
+#crates { background: linear-gradient(180deg, var(--basalt) 0%, var(--obsidian) 100%); }
+.crates-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+.crate-card {
+  padding: 18px 18px 16px;
+  border-radius: 12px; background: rgba(18,18,26,0.8);
+  border: 1px solid rgba(255,255,255,0.06);
+  transition: all 0.22s; position: relative; overflow: hidden;
+}
+.crate-card:hover { transform: translateY(-3px); border-color: rgba(245,158,11,0.22); box-shadow: 0 8px 28px rgba(0,0,0,0.35); }
+.crate-card::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; }
+.crate-card.cat-foundation::before { background: linear-gradient(90deg, var(--orichalcum), var(--orichalcum-deep)); }
+.crate-card.cat-model::before { background: linear-gradient(90deg, var(--violet), var(--violet-dim)); }
+.crate-card.cat-memory::before { background: linear-gradient(90deg, var(--cyan), var(--cyan-dim)); }
+.crate-card.cat-validator::before { background: linear-gradient(90deg, var(--emerald), var(--emerald-dim)); }
+.crate-card.cat-discovery::before { background: linear-gradient(90deg, var(--coral), var(--coral-dim)); }
+.crate-card.cat-security::before { background: linear-gradient(90deg, var(--violet), #c084fc); }
+.crate-card.cat-interface::before { background: linear-gradient(90deg, var(--smoke), #374151); }
 
-    /* DIAGRAM GALLERY */
-    .diag-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(560px, 1fr)); gap: 20px; }
-    .diag-card {
-      background: var(--bg2); border: 1px solid var(--border); border-radius: 14px;
-      overflow: hidden; transition: all .25s; cursor: pointer; text-decoration: none;
-    }
-    .diag-card:hover { transform: translateY(-3px); box-shadow: 0 0 28px rgba(124,58,237,.25); border-color: var(--c2); }
-    .diag-card img { width: 100%; height: auto; display: block; }
-    .diag-meta { padding: 14px 18px; display: flex; align-items: flex-start; gap: 12px; }
-    .diag-num { font-size: 11px; font-weight: 800; color: var(--c2); background: rgba(124,58,237,.12);
-      border: 1px solid rgba(124,58,237,.3); border-radius: 6px; padding: 3px 9px;
-      white-space: nowrap; flex-shrink: 0; margin-top: 1px; }
-    .diag-title { font-size: 14px; font-weight: 700; margin-bottom: 3px; }
-    .diag-sub { font-size: 12px; color: var(--text3); }
-    .diag-badge { display: inline-block; background: rgba(0,212,255,.08);
-      border: 1px solid rgba(0,212,255,.2); border-radius: 4px;
-      padding: 2px 7px; font-size: 10px; color: var(--c1); margin-top: 5px; }
+.crate-name { font-family: var(--font-mono); font-size: 0.82rem; font-weight: 600; color: var(--chalk); margin-bottom: 6px; }
+.crate-desc { font-size: 0.78rem; color: var(--smoke); line-height: 1.5; margin-bottom: 10px; }
+.crate-tests {
+  font-family: var(--font-mono); font-size: 0.68rem;
+  color: var(--emerald); background: rgba(52,211,153,0.08);
+  border: 1px solid rgba(52,211,153,0.18); border-radius: 5px;
+  padding: 2px 7px; display: inline-block;
+}
 
-    /* RUST SECTION */
-    .rust-intro {
-      background: linear-gradient(135deg, rgba(232,82,10,.06), rgba(0,0,0,0));
-      border: 1px solid rgba(232,82,10,.25); border-left: 3px solid var(--c7);
-      border-radius: 12px; padding: 22px 28px; margin-bottom: 28px;
-      font-size: 14px; color: var(--text2); line-height: 1.7;
-    }
-    .rust-intro strong { color: var(--c7); }
-    .crate-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; margin: 20px 0; }
-    .crate-card {
-      background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
-      padding: 14px 16px; transition: all .2s;
-    }
-    .crate-card:hover { border-color: var(--c7); box-shadow: 0 0 14px rgba(232,82,10,.15); transform: translateY(-1px); }
-    .crate-name { font-family: 'Courier New', monospace; font-size: 13px; font-weight: 700; color: var(--c7); margin-bottom: 5px; }
-    .crate-desc { font-size: 11px; color: var(--text3); line-height: 1.45; }
-    .crate-port { font-size: 10px; color: var(--text3); margin-top: 5px; font-style: italic; }
-    .crate-port.new { color: var(--c3); }
-    .crate-port.copy { color: var(--c2); }
+/* ── PAPERS ─────────────────────────────────────────── */
+#papers { background: var(--obsidian); }
+.papers-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; }
+.paper-card { padding: 24px; border-radius: 14px; transition: all 0.22s; }
+.paper-card:hover { transform: translateY(-3px); box-shadow: 0 12px 40px rgba(0,0,0,0.35); }
+.paper-venue {
+  font-size: 0.68rem; letter-spacing: 2px; text-transform: uppercase;
+  font-family: var(--font-mono); font-weight: 700; margin-bottom: 10px;
+}
+.paper-title { font-family: var(--font-serif); font-size: 1.05rem; color: var(--chalk); margin-bottom: 8px; font-weight: 400; line-height: 1.4; }
+.paper-desc { font-size: 0.82rem; color: var(--smoke); line-height: 1.6; }
+.paper-tag {
+  display: inline-block; margin-top: 12px;
+  font-size: 0.68rem; font-family: var(--font-mono);
+  border-radius: 5px; padding: 2px 8px;
+}
 
-    .build-stage {
-      display: flex; gap: 18px; padding: 18px 0 18px 28px;
-      border-left: 2px solid rgba(232,82,10,.25); position: relative; margin-bottom: 0;
-    }
-    .build-stage::before {
-      content: ''; position: absolute; left: -7px; top: 22px;
-      width: 12px; height: 12px; border-radius: 50%;
-      background: var(--c7); border: 2px solid rgba(232,82,10,.4);
-    }
-    .bs-label { flex-shrink: 0; width: 100px; }
-    .bs-num { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; color: var(--c7); }
-    .bs-weeks { font-size: 11px; color: var(--text3); margin-top: 2px; }
-    .bs-content { flex: 1; }
-    .bs-title { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
-    .bs-crates { font-family: 'Courier New', monospace; font-size: 12px; color: var(--c7); margin-bottom: 5px; }
-    .bs-milestone { font-size: 12px; color: var(--text2); }
-    .bs-milestone strong { color: var(--c3); }
+/* ── VERSIONS TIMELINE ──────────────────────────────── */
+#versions { background: var(--basalt); }
+.timeline { position: relative; padding-left: 28px; }
+.timeline::before { content:''; position:absolute; left:9px; top:0; bottom:0; width:1px; background: linear-gradient(180deg, var(--orichalcum) 0%, rgba(245,158,11,0.1) 100%); }
+.tl-item { position: relative; margin-bottom: 32px; }
+.tl-dot {
+  position: absolute; left: -23px; top: 4px;
+  width: 12px; height: 12px; border-radius: 50%;
+  background: var(--orichalcum); border: 2px solid var(--obsidian);
+  box-shadow: 0 0 8px rgba(245,158,11,0.5);
+}
+.tl-item.current .tl-dot { background: var(--emerald); box-shadow: 0 0 12px rgba(52,211,153,0.6); }
+.tl-version { font-family: var(--font-mono); font-size: 0.78rem; color: var(--orichalcum); font-weight: 700; letter-spacing: 1px; margin-bottom: 4px; }
+.tl-item.current .tl-version { color: var(--emerald); }
+.tl-title { font-family: var(--font-serif); font-size: 1.1rem; color: var(--chalk); margin-bottom: 6px; font-weight: 400; }
+.tl-desc { font-size: 0.83rem; color: var(--smoke); line-height: 1.6; }
+.tl-badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.tl-badge { font-size: 0.68rem; font-family: var(--font-mono); padding: 2px 8px; border-radius: 5px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); color: var(--smoke); }
+.tl-badge.gold { background: rgba(245,158,11,0.1); border-color: rgba(245,158,11,0.2); color: var(--orichalcum); }
+.tl-badge.green { background: rgba(52,211,153,0.1); border-color: rgba(52,211,153,0.2); color: var(--emerald); }
+.tl-badge.cyan { background: rgba(0,229,255,0.1); border-color: rgba(0,229,255,0.2); color: var(--cyan); }
 
-    .prop-table { width: 100%; border-collapse: collapse; background: var(--bg2); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); margin-top: 20px; }
-    .prop-table th { background: var(--bg3); padding: 10px 16px; text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text3); border-bottom: 1px solid var(--border); }
-    .prop-table td { padding: 10px 16px; font-size: 12px; border-bottom: 1px solid rgba(26,51,82,.5); color: var(--text2); }
-    .prop-table tr:last-child td { border-bottom: none; }
-    .prop-table td:first-child { font-weight: 700; color: var(--text); font-size: 11px; }
-    .prop-bad { color: var(--text3); }
-    .prop-good { color: var(--c3); font-weight: 700; }
+/* ── STATS ──────────────────────────────────────────── */
+#stats { background: var(--obsidian); }
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 16px; margin-bottom: 48px; }
+.stat-card {
+  padding: 28px 24px; text-align: center;
+  border-radius: 14px;
+  transition: transform 0.22s;
+}
+.stat-card:hover { transform: translateY(-3px); }
+.stat-card .big-num {
+  font-family: var(--font-serif); font-size: 3rem;
+  line-height: 1; margin-bottom: 8px;
+}
+.stat-card .big-label { font-size: 0.72rem; letter-spacing: 2px; text-transform: uppercase; color: var(--smoke); font-weight: 600; }
+.bench-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.bench-table th { padding: 10px 14px; text-align: left; font-size: 0.7rem; letter-spacing: 2px; text-transform: uppercase; color: var(--smoke); font-weight: 700; border-bottom: 1px solid rgba(255,255,255,0.06); font-family: var(--font-mono); }
+.bench-table td { padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+.bench-table tr:last-child td { border-bottom: none; }
+.bench-table .val { font-family: var(--font-mono); color: var(--orichalcum); font-weight: 700; font-size: 0.9rem; }
+.bench-table .val.cyan { color: var(--cyan); }
+.bench-table .val.emerald { color: var(--emerald); }
+.bench-table .val.violet { color: var(--violet); }
+
+/* ── INNER SANCTUM (Atlantis Lore) ─────────────────── */
+#sanctum { background: linear-gradient(180deg, var(--obsidian) 0%, var(--basalt) 50%, var(--obsidian) 100%); position: relative; overflow: hidden; }
+.sanctum-rings {
+  position: absolute; top: 50%; left: 50%;
+  transform: translate(-50%,-50%);
+  pointer-events: none; z-index: 0;
+}
+.sanctum-ring {
+  position: absolute; border-radius: 50%;
+  top: 50%; left: 50%; transform: translate(-50%,-50%);
+  border: 1px solid rgba(245,158,11,0.06);
+  animation: ring-pulse 10s ease-in-out infinite;
+}
+.sanctum-ring:nth-child(1){ width:200px;height:200px; border-color:rgba(245,158,11,0.12); animation-delay: 0s; }
+.sanctum-ring:nth-child(2){ width:380px;height:380px; border-color:rgba(245,158,11,0.08); animation-delay: 1.5s; }
+.sanctum-ring:nth-child(3){ width:560px;height:560px; border-color:rgba(0,229,255,0.06); animation-delay: 3s; }
+.sanctum-ring:nth-child(4){ width:740px;height:740px; border-color:rgba(0,229,255,0.04); animation-delay: 4.5s; }
+.sanctum-content { position: relative; z-index: 1; text-align: center; max-width: 680px; margin: 0 auto; }
+.sanctum-sigil { font-size: 4rem; margin-bottom: 24px; line-height: 1; }
+.sanctum-title { font-family: var(--font-serif); font-size: clamp(2rem, 5vw, 3rem); color: var(--chalk); margin-bottom: 16px; font-weight: 400; }
+.sanctum-subtitle { font-family: var(--font-serif); font-style: italic; color: var(--orichalcum); font-size: 1.15rem; margin-bottom: 24px; }
+.sanctum-lore { color: var(--smoke); font-size: 0.93rem; line-height: 1.75; margin-bottom: 36px; }
+.sanctum-lore strong { color: var(--orichalcum); }
+
+/* ── MCP TOOLS SECTION ──────────────────────────────── */
+#mcp { background: var(--basalt); }
+.mcp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+.mcp-cat { padding: 22px; border-radius: 13px; }
+.mcp-cat-title { font-size: 0.68rem; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; font-family: var(--font-mono); margin-bottom: 14px; }
+.mcp-tools { display: flex; flex-wrap: wrap; gap: 5px; }
+.mcp-tool {
+  font-family: var(--font-mono); font-size: 0.7rem;
+  background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.07);
+  color: var(--smoke); padding: 3px 8px; border-radius: 5px;
+}
+
+/* ── FOOTER ─────────────────────────────────────────── */
+footer {
+  border-top: 1px solid rgba(255,255,255,0.05);
+  padding: 40px 28px; text-align: center;
+  color: var(--smoke); font-size: 0.82rem;
+}
+footer .footer-brand { font-family: var(--font-serif); font-size: 1.3rem; color: var(--orichalcum); margin-bottom: 12px; }
+footer .footer-links { display: flex; gap: 20px; justify-content: center; margin: 14px 0; flex-wrap: wrap; }
+footer .footer-links a { color: var(--smoke); font-size: 0.8rem; }
+footer .footer-links a:hover { color: var(--orichalcum); }
+
+/* ── UTILITIES ──────────────────────────────────────── */
+.divider { border: none; border-top: 1px solid rgba(255,255,255,0.05); margin: 0; }
+.tag-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.tag { font-size: 0.7rem; font-family: var(--font-mono); padding: 3px 9px; border-radius: 6px; }
+.tag-gold { background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.2); color: var(--orichalcum); }
+.tag-cyan { background: rgba(0,229,255,0.08); border: 1px solid rgba(0,229,255,0.18); color: var(--cyan); }
+.tag-green { background: rgba(52,211,153,0.08); border: 1px solid rgba(52,211,153,0.18); color: var(--emerald); }
+.tag-rust { background: rgba(232,82,10,0.08); border: 1px solid rgba(232,82,10,0.18); color: var(--rust); }
+
+@media (max-width: 900px) {
+  .flywheel-container { grid-template-columns: 1fr; }
+  .flywheel-visual { display: none; }
+}
+@media (max-width: 700px) {
+  .stats-row { gap: 24px; }
+  .pillars-grid { grid-template-columns: 1fr; }
+  .nav-links { display: none; }
+}
   </style>
 </head>
 <body>
-<canvas id="bg"></canvas>
 
-<div class="z1 wrap">
+<!-- ════════════════════════════════════════════════════
+     NAVIGATION
+     ════════════════════════════════════════════════════ -->
+<nav class="nav" id="nav">
+  <div class="nav-brand">
+    <div class="nav-icon">At</div>
+    <span>ATLAS</span>
+  </div>
+  <ul class="nav-links">
+    <li><a href="#pillars">Seven Pillars</a></li>
+    <li><a href="#palace">Palace Viewer</a></li>
+    <li><a href="#discovery">Discovery</a></li>
+    <li><a href="#crates">Architecture</a></li>
+    <li><a href="#papers">Papers</a></li>
+    <li><a href="#stats">Stats</a></li>
+    <li><a href="#sanctum" class="sanctum-link">🏛 Inner Sanctum</a></li>
+  </ul>
+</nav>
 
-  <!-- HERO -->
-  <div class="hero">
-    <div class="v-badge">🔴 ATLAS v4.0 · ASTRA-dev + TRM-CausalValidator + Pure Rust · VBRL Holdings · 2026</div>
-    <h1 class="atlas">ATLAS</h1>
-    <div class="acronym">
-      <span class="ap ap1">A · Active Inference</span>
-      <span class="ap ap2">T · Training</span>
-      <span class="ap ap3">L · Learned</span>
-      <span class="ap ap4">A · Adaptive</span>
-      <span class="ap ap5">S · Stigmergy</span>
+<!-- ════════════════════════════════════════════════════
+     HERO
+     ════════════════════════════════════════════════════ -->
+<section class="hero" id="overview">
+  <div class="hero-bg"></div>
+  <div class="rings-container">
+    <div class="ring"></div>
+    <div class="ring"></div>
+    <div class="ring"></div>
+    <div class="ring"></div>
+    <div class="ring"></div>
+  </div>
+  <div class="hero-content">
+    <div class="live-pill">
+      <span class="live-dot"></span>
+      v1.0.0 · Production Release · 383/383 Tests
     </div>
-    <p class="tagline">The first LLM trained on real scientific discoveries — not web scrapes, not GPT-4 synthetic data. A closed-loop system where the model and the autonomous research engine make each other smarter. Every causal claim validated by a recursive neural module before it reaches training.</p>
-    <p class="sub">OLMo 3 7B · GraphPalace · ASTRA-dev · Morphic Resonance · RLVR · ZK Claims · TRM-CausalValidator</p>
-    <div style="margin-top: 20px;">
-      <span class="live-badge"><span class="live-dot"></span> ASTRA discovering · ~10s/cycle</span>
-      <span class="phero-badge"><span class="phero-dot"></span> pheromone system active</span>
+
+    <h1 class="atlas-title">
+      ATLAS
+      <span class="of-atlantis">of Atlantis</span>
+    </h1>
+
+    <p class="atlas-lore">
+      In the beginning, Atlas was King of Atlantis — he who holds up the sky,<br>
+      who shoulders the weight of all knowledge. The AI that doesn't scrape<br>
+      the internet. The AI that <em>discovers</em> the world.
+    </p>
+
+    <div class="acronym-row">
+      <span class="ap ap-a">A — Active-inference</span>
+      <span class="ap ap-t">T — Training</span>
+      <span class="ap ap-l">L — with Learned</span>
+      <span class="ap ap-a2">A — Adaptive</span>
+      <span class="ap ap-s">S — Stigmergy</span>
+    </div>
+
+    <div class="stats-row">
+      <div class="stat-item">
+        <span class="stat-num">383</span>
+        <span class="stat-label">Tests Passing</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-num cyan">20</span>
+        <span class="stat-label">Crates</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-num emerald">0</span>
+        <span class="stat-label">External Deps</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-num violet">28</span>
+        <span class="stat-label">MCP Tools</span>
+      </div>
+    </div>
+
+    <div class="hero-cta">
+      <a href="https://github.com/web3guru888/ATLAS" class="btn btn-primary" target="_blank">
+        ◆ View on GitHub
+      </a>
+      <a href="#palace" class="btn btn-palace">
+        🏛 Enter the Palace
+      </a>
+      <a href="#discovery" class="btn btn-ghost">
+        ↓ Discovery Flywheel
+      </a>
     </div>
   </div>
+</section>
 
-  <!-- BREAKTHROUGH -->
-  <div class="breakthrough">
-    <em>Don't train on what humans wrote about the world.</em><br>
-    <em>Train on what you actually discover about the world.</em><br>
-    <em>Validate what you claim — recursively, not generatively.</em><br><br>
-    ATLAS v3.0 adds <strong>TRM-CausalValidator</strong> — a 7M-parameter recursive module that validates every causal graph before it enters the training corpus. Based on Samsung SAIL's Tiny Recursive Model (arXiv:2510.04871, 45% ARC-AGI-1 at 7M params). ATLAS's pheromone curriculum and TRM's recursive validation are two independent proofs of the same principle: <em>structured computation beats brute-force scale.</em><br><br>
-    ATLAS v4.0 adds the final architectural decision: <strong style="color:var(--c7);">Pure Rust, Zero Dependencies</strong> — 16 crates, built from scratch, every algorithm ported from its original source. No PyPI. No crates.io. One static binary. Total sovereign ownership.
+<!-- ════════════════════════════════════════════════════
+     SEVEN PILLARS
+     ════════════════════════════════════════════════════ -->
+<section id="pillars">
+  <div class="container">
+    <p class="section-eyebrow">Seven Wings of Knowledge</p>
+    <h2 class="section-title">The Seven Pillars</h2>
+    <p class="section-desc">Each pillar is an architectural innovation. Together, they form an intelligence that improves itself by discovering the world — not by reading what others wrote about it.</p>
+
+    <div class="pillars-grid">
+      <div class="pillar-card glass">
+        <div class="pillar-num">I</div>
+        <div class="pillar-icon">🏛️</div>
+        <div class="pillar-name">GraphPalace Memory</div>
+        <div class="pillar-desc">Pheromone-weighted persistent knowledge palace. Semantic A* pathfinding with HNSW approximate search. 5-type pheromone system — exploitation, exploration, success, traversal, recency.</div>
+        <div class="pillar-tag">atlas-palace · 28 MCP tools · MMAS ceiling</div>
+      </div>
+
+      <div class="pillar-card glass p2">
+        <div class="pillar-num">II</div>
+        <div class="pillar-icon">🧬</div>
+        <div class="pillar-name">Morphic Warm-Start</div>
+        <div class="pillar-desc">O(1/√T) cross-run convergence — mathematically proven. Cumulative regret drops from 189 → 57 steps over 80 generations. R² = 0.982, p &lt; 10⁻³⁰. Knowledge compounds across sessions.</div>
+        <div class="pillar-tag" style="color:var(--cyan);background:rgba(0,229,255,0.08);border-color:rgba(0,229,255,0.2);">BUTTERS · O(1/√T) proven</div>
+      </div>
+
+      <div class="pillar-card glass p3">
+        <div class="pillar-num">III</div>
+        <div class="pillar-icon">🐜</div>
+        <div class="pillar-name">Stigmergic RLVR</div>
+        <div class="pillar-desc">r_total = α·r_verifiable + β·r_pheromone. Pheromone decay prevents reward hacking. MMAS ceiling stops saturation (arXiv:2604.00067). Training guided by stigmergic ant-colony intelligence.</div>
+        <div class="pillar-tag">pheromone reward · decay gates</div>
+      </div>
+
+      <div class="pillar-card glass p4">
+        <div class="pillar-num">IV</div>
+        <div class="pillar-icon">🔭</div>
+        <div class="pillar-name">Active Inference Data Gen</div>
+        <div class="pillar-desc">Palace cold spots direct ASTRA to fill knowledge gaps autonomously. OODA loop: Observe → Orient → Decide → Act. ~8K LOC, NASA/WHO/World Bank/ArXiv APIs, ~86K quality examples/month.</div>
+        <div class="pillar-tag">atlas-astra · ~10s/cycle · LiveDiscoveryCorpus</div>
+      </div>
+
+      <div class="pillar-card glass p5">
+        <div class="pillar-num">V</div>
+        <div class="pillar-icon">🔐</div>
+        <div class="pillar-name">ZK Knowledge Claims</div>
+        <div class="pillar-desc">Schnorr proof chain from LLM output to raw API data. Hallucinations have broken proof trails — cryptographically verifiable. Groth16 interface-identical to the BLS12-381 system in asi-build.</div>
+        <div class="pillar-tag">atlas-zk · Schnorr · Groth16 interface</div>
+      </div>
+
+      <div class="pillar-card glass p6">
+        <div class="pillar-num">VI</div>
+        <div class="pillar-icon">📡</div>
+        <div class="pillar-name">LiveDiscoveryCorpus</div>
+        <div class="pillar-desc">ASTRA's output as a living training dataset. 5 quality gates: causal validity, confidence threshold, novelty check, pheromone alignment, ZK proof. Zero stale or duplicated information.</div>
+        <div class="pillar-tag">atlas-corpus · 5 gates · pheromone sampler</div>
+      </div>
+
+      <div class="pillar-card glass p7">
+        <div class="pillar-num">VII</div>
+        <div class="pillar-icon">⚖️</div>
+        <div class="pillar-name">TRM-CausalValidator</div>
+        <div class="pillar-desc">7M-param recursive validator: z = net(x,y,z) × 6 recursions. &lt;10ms causal graph pass/fail. Quality Gate 6. Generates Type 5 training traces. Samsung SAIL architecture (arXiv:2510.04871).</div>
+        <div class="pillar-tag" style="color:var(--orichalcum-glow);background:rgba(251,191,36,0.08);border-color:rgba(251,191,36,0.2);">atlas-trm · 7M params · &lt;10ms</div>
+      </div>
+    </div>
   </div>
+</section>
 
-  <!-- ASTRA STATS -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num" style="background:linear-gradient(135deg,var(--c5),var(--c2));">A</div>
-      <div>
-        <div class="sec-title">ASTRA-dev: What It Brings</div>
-        <div class="sec-sub">Proven autonomous discovery engine — already integrated with GraphPalace in MemPalace-AGI</div>
+<!-- ════════════════════════════════════════════════════
+     PALACE VIEWER
+     ════════════════════════════════════════════════════ -->
+<section id="palace">
+  <div class="container">
+    <p class="section-eyebrow">Inner Sanctum · Architectural Graph</p>
+    <h2 class="section-title">The Memory Palace</h2>
+    <p class="section-desc">Twenty crates, one coherent system. Each node is a palace room. Each edge is a dependency. Pheromone trails glow brightest where the greatest discoveries flow.</p>
+
+    <div class="palace-shell">
+      <canvas id="palace-canvas"></canvas>
+      <div class="palace-tooltip" id="palace-tooltip">
+        <div class="tt-name" id="tt-name">–</div>
+        <div class="tt-desc" id="tt-desc">–</div>
       </div>
     </div>
 
-    <div class="stats-band">
-      <div class="stat"><div class="stat-val sv1">540+</div><div class="stat-label">Unique discoveries · 45 experiments</div></div>
-      <div class="stat"><div class="stat-val sv2">5,251+</div><div class="stat-label">KG triples from live data</div></div>
-      <div class="stat"><div class="stat-val sv3">d=10.6</div><div class="stat-label">Cohen's d · memory vs. baseline</div></div>
-      <div class="stat"><div class="stat-val sv4">34.4×</div><div class="stat-label">More discoveries than no-memory</div></div>
-      <div class="stat"><div class="stat-val sv5">100%</div><div class="stat-label">Dedup accuracy · 5-heuristic system</div></div>
-      <div class="stat"><div class="stat-val sv1">R²=0.924</div><div class="stat-label">Convergence fit · p&lt;0.001</div></div>
-      <div class="stat"><div class="stat-val sv2">16</div><div class="stat-label">Live data sources (NASA, WHO, WB…)</div></div>
-      <div class="stat"><div class="stat-val sv3">~10s</div><div class="stat-label">Per discovery cycle · continuous</div></div>
+    <div class="palace-legend">
+      <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div>Foundation</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#a78bfa"></div>Model</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#00e5ff"></div>Memory &amp; MCP</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#34d399"></div>Validator</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#f87171"></div>Discovery</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#c084fc"></div>Security</div>
+      <div class="legend-item"><div class="legend-dot" style="background:#6b7280"></div>Interface</div>
     </div>
+    <div class="palace-controls">
+      <button class="palace-ctrl-btn" id="btn-reset">⟳ Reset</button>
+      <button class="palace-ctrl-btn" id="btn-pulse">✦ Pulse</button>
+      <button class="palace-ctrl-btn" id="btn-orbit">◎ Orbit</button>
+    </div>
+  </div>
+</section>
 
-    <div class="grid g3">
-      <div class="card ct5">
-        <div class="card-icon">🔬</div>
-        <div class="card-title">OODA Discovery Engine</div>
-        <div class="card-body">89 endpoints. Hypothesis lifecycle management. Every hypothesis is Observe → Orient (semantic search in palace) → Decide (Bayesian scoring) → Act (causal inference run). Only validated hypotheses enter the corpus.</div>
+<!-- ════════════════════════════════════════════════════
+     DISCOVERY FLYWHEEL
+     ════════════════════════════════════════════════════ -->
+<section id="discovery">
+  <div class="container">
+    <p class="section-eyebrow">ASTRA OODA Engine</p>
+    <h2 class="section-title">The Discovery Flywheel</h2>
+    <p class="section-desc">Every 10 seconds, ATLAS discovers something real. The flywheel never stops — palace cold spots direct ASTRA to fill gaps, validated findings become training data, pheromones guide the next cycle.</p>
+
+    <div class="flywheel-container">
+      <div class="flywheel-visual">
+        <div class="flywheel-canvas">
+          <svg id="flywheel-svg" viewBox="0 0 400 380"></svg>
+        </div>
       </div>
-      <div class="card ct5">
-        <div class="card-icon">⚗️</div>
-        <div class="card-title">Causal Inference, Not Correlation</div>
-        <div class="card-body">PC and FCI algorithms on real data. Not "CO₂ and temperature are correlated" — but "CO₂ causally drives temperature increase (conf=0.847, PC-validated on 146 years of NASA GISTEMP)". This is what gets into the training corpus.</div>
-      </div>
-      <div class="card ct5">
-        <div class="card-icon">🌐</div>
-        <div class="card-title">Cross-Domain Structural Analogies</div>
-        <div class="card-body">201K+ structural analogies identified. Climate → Epidemiology → Economics → Astrophysics → Cryptography. 1.37× cross-domain acceleration. The training data contains causal bridges between scientific fields no human dataset has.</div>
+      <div class="flywheel-steps">
+        <div class="fw-step">
+          <div class="fw-num">1</div>
+          <div class="fw-body">
+            <div class="fw-title">Cold Spots → Target</div>
+            <div class="fw-desc">Palace maps knowledge density. Cold spots = unexplored domains. ASTRA receives directed queries to fill gaps.</div>
+            <span class="fw-code">cold_spots() → query targets</span>
+          </div>
+        </div>
+        <div class="fw-step">
+          <div class="fw-num">2</div>
+          <div class="fw-body">
+            <div class="fw-title">Live API Discovery</div>
+            <div class="fw-desc">NASA POWER, WHO GHO, World Bank, ArXiv. PC/FCI causal inference, Bayesian confidence scoring, Granger causality.</div>
+            <span class="fw-code">atlas discover --cycles 5</span>
+          </div>
+        </div>
+        <div class="fw-step">
+          <div class="fw-num">3</div>
+          <div class="fw-body">
+            <div class="fw-title">Quality Gate Gauntlet</div>
+            <div class="fw-desc">5 quality gates + TRM recursive validation. Gate 6 is the causal validator — only verified discoveries enter the corpus.</div>
+            <span class="fw-code">TRM: z = net(x,y,z) × 6</span>
+          </div>
+        </div>
+        <div class="fw-step">
+          <div class="fw-num">4</div>
+          <div class="fw-body">
+            <div class="fw-title">ZK Proof Chain</div>
+            <div class="fw-desc">Schnorr proof attached. Every training example has a cryptographic chain from LLM output to raw API response.</div>
+            <span class="fw-code">atlas prove --claim "..."</span>
+          </div>
+        </div>
+        <div class="fw-step">
+          <div class="fw-num">5</div>
+          <div class="fw-body">
+            <div class="fw-title">Pheromone Deposit</div>
+            <div class="fw-desc">Validated paths get pheromone deposits. MMAS ceiling prevents saturation. Next cycle gravitates toward proven discovery routes.</div>
+            <span class="fw-code">deposit_pheromones(path, reward)</span>
+          </div>
+        </div>
+        <div class="fw-step">
+          <div class="fw-num">6</div>
+          <div class="fw-body">
+            <div class="fw-title">SFT Training</div>
+            <div class="fw-desc">LoRA adapters, gradient accumulation, QLoRA compression, safetensors checkpoints. Pheromone sampler weights training batches by discovery quality.</div>
+            <span class="fw-code">atlas train --corpus corpus.json</span>
+          </div>
+        </div>
       </div>
     </div>
   </div>
+</section>
 
-  <div class="div"></div>
+<!-- ════════════════════════════════════════════════════
+     CRATES ARCHITECTURE
+     ════════════════════════════════════════════════════ -->
+<section id="crates">
+  <div class="container">
+    <p class="section-eyebrow">Pure Rust · Zero External Dependencies</p>
+    <h2 class="section-title">20 Crates, One System</h2>
+    <p class="section-desc">The SQLite principle applied to AI infrastructure. Every billion-parameter transformer starts with <code style="font-family:var(--font-mono);font-size:0.85rem;color:var(--orichalcum)">pub struct Tensor { data: Vec&lt;f32&gt;, shape: Vec&lt;usize&gt; }</code></p>
 
-  <!-- EFFICIENCY PROOF -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num" style="background:linear-gradient(135deg,var(--c4),#f97316);">E</div>
-      <div>
-        <div class="sec-title">The Efficiency Proof: Two Independent Validations</div>
-        <div class="sec-sub">Structured computation beats brute-force scale — proven at inference time and training time, by separate research groups</div>
+    <div class="crates-grid">
+      <!-- Foundation -->
+      <div class="crate-card cat-foundation">
+        <div class="crate-name">atlas-core</div>
+        <div class="crate-desc">Error types, traits, config. The seed of everything.</div>
+        <span class="crate-tests">✓ foundation</span>
+      </div>
+      <div class="crate-card cat-foundation">
+        <div class="crate-name">atlas-tensor</div>
+        <div class="crate-desc">f32 Tensor + CUDA FFI. matmul.cu, attention.cu, quant.cu via raw extern "C".</div>
+        <span class="crate-tests">✓ Tesla T4 sm_75</span>
+      </div>
+      <div class="crate-card cat-foundation">
+        <div class="crate-name">atlas-grad</div>
+        <div class="crate-desc">Autograd tape, VJPs for matmul/relu/add, backward() pass.</div>
+        <span class="crate-tests">✓ stage 1</span>
+      </div>
+      <div class="crate-card cat-foundation">
+        <div class="crate-name">atlas-optim</div>
+        <div class="crate-desc">AdamW + weight decay, CosineScheduler with warmup, grad clipping.</div>
+        <span class="crate-tests">✓ 50 steps: loss 0.038</span>
+      </div>
+      <div class="crate-card cat-foundation">
+        <div class="crate-name">atlas-quant</div>
+        <div class="crate-desc">INT4/INT8 quantization, QLoRA, LoRA adapters (rank=8, alpha=16). 7.1× compression.</div>
+        <span class="crate-tests">✓ 7.1× compression</span>
+      </div>
+      <!-- Model -->
+      <div class="crate-card cat-model">
+        <div class="crate-name">atlas-model</div>
+        <div class="crate-desc">RMSNorm, RoPE, SwiGLU, GQA, safetensors loader. OLMo 3 1B + LLaMA 3.2 configs.</div>
+        <span class="crate-tests">✓ 1.24B params</span>
+      </div>
+      <div class="crate-card cat-model">
+        <div class="crate-name">atlas-tokenize</div>
+        <div class="crate-desc">GPT-2 BPE tokenizer, merge-table loader, encode/decode roundtrip.</div>
+        <span class="crate-tests">✓ roundtrip</span>
+      </div>
+      <!-- Memory -->
+      <div class="crate-card cat-memory">
+        <div class="crate-name">atlas-palace</div>
+        <div class="crate-desc">5-type pheromone system, MMAS ceiling, A* semantic pathfinding, HNSW ANN, Active Inference agents, 5 archetypes.</div>
+        <span class="crate-tests">✓ 304K ins/s</span>
+      </div>
+      <div class="crate-card cat-memory">
+        <div class="crate-name">atlas-mcp</div>
+        <div class="crate-desc">MCP server, JSON-RPC 2.0, 28 palace tools over stdin/stdout, bearer token auth.</div>
+        <span class="crate-tests">✓ 28 tools</span>
+      </div>
+      <!-- Validator -->
+      <div class="crate-card cat-validator">
+        <div class="crate-name">atlas-trm</div>
+        <div class="crate-desc">TRM-CausalValidator. z = net(x,y,z) × 6 recursions. 7M params, &lt;10ms. Quality Gate 6.</div>
+        <span class="crate-tests">✓ &lt;10ms</span>
+      </div>
+      <div class="crate-card cat-validator">
+        <div class="crate-name">atlas-causal</div>
+        <div class="crate-desc">PC algorithm, Fisher-Z independence test, FCI, Granger causality, B-H FDR, CUSUM.</div>
+        <span class="crate-tests">✓ pure Rust</span>
+      </div>
+      <div class="crate-card cat-validator">
+        <div class="crate-name">atlas-bayes</div>
+        <div class="crate-desc">BetaPrior, BayesNetwork, BIC model comparison. Confidence scoring for discovery pipeline.</div>
+        <span class="crate-tests">✓ BIC compare</span>
+      </div>
+      <!-- Discovery -->
+      <div class="crate-card cat-discovery">
+        <div class="crate-name">atlas-astra</div>
+        <div class="crate-desc">OODA discovery engine, ~8K LOC. NASA/WHO/World Bank/ArXiv, hypothesis lifecycle.</div>
+        <span class="crate-tests">✓ ~10s/cycle</span>
+      </div>
+      <div class="crate-card cat-discovery">
+        <div class="crate-name">atlas-corpus</div>
+        <div class="crate-desc">LiveDiscoveryCorpus, 5 quality gates, pheromone sampler, SFT trainer, LoRA, grad-accum.</div>
+        <span class="crate-tests">✓ 9.7K steps/s</span>
+      </div>
+      <div class="crate-card cat-discovery">
+        <div class="crate-name">atlas-http</div>
+        <div class="crate-desc">HTTP/1.1 via raw libc syscalls, TLS, connection pooling, retry. Zero external deps.</div>
+        <span class="crate-tests">✓ no reqwest</span>
+      </div>
+      <div class="crate-card cat-discovery">
+        <div class="crate-name">atlas-json</div>
+        <div class="crate-desc">Recursive-descent JSON parser, zero-copy string interning. No serde dependency.</div>
+        <span class="crate-tests">✓ no serde</span>
+      </div>
+      <!-- Security -->
+      <div class="crate-card cat-security">
+        <div class="crate-name">atlas-zk</div>
+        <div class="crate-desc">Schnorr proofs, ProvenanceChain. SHA-256 (FIPS 180-4) + HMAC-SHA256, Groth16 interface.</div>
+        <span class="crate-tests">✓ ZK provenance</span>
+      </div>
+      <div class="crate-card cat-security">
+        <div class="crate-name">atlas-safety</div>
+        <div class="crate-desc">5-state FSM: BOOT→NOMINAL→DEGRADED→SAFE_MODE→EMERGENCY_STOP. CircuitBreaker, audit trail.</div>
+        <span class="crate-tests">✓ 11 tests</span>
+      </div>
+      <div class="crate-card cat-security">
+        <div class="crate-name">atlas-bridge</div>
+        <div class="crate-desc">Rings↔Ethereum ZK bridge interface. Groth16Claim on every tx. Sepolia-compatible.</div>
+        <span class="crate-tests">✓ 0xBf6a13… Sepolia</span>
+      </div>
+      <!-- Interface -->
+      <div class="crate-card cat-interface">
+        <div class="crate-name">atlas-cli</div>
+        <div class="crate-desc">Full pipeline binary: discover · train · eval · prove · palace · status · bench · mcp serve</div>
+        <span class="crate-tests">✓ 383 tests total</span>
       </div>
     </div>
-    <div style="overflow-x:auto;">
-      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px;">
+
+    <div class="tag-row" style="justify-content:center;margin-top:28px;">
+      <span class="tag tag-gold">20 crates</span>
+      <span class="tag tag-rust">Zero external Rust deps</span>
+      <span class="tag tag-cyan">3 CUDA kernels</span>
+      <span class="tag tag-green">sm_75 Tesla T4 validated</span>
+      <span class="tag tag-gold">Apache 2.0</span>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════
+     MCP TOOLS
+     ════════════════════════════════════════════════════ -->
+<section id="mcp">
+  <div class="container">
+    <p class="section-eyebrow">Model Context Protocol</p>
+    <h2 class="section-title">28 Palace Tools</h2>
+    <p class="section-desc">atlas-mcp exposes the full GraphPalace memory engine via JSON-RPC 2.0 over stdin/stdout. Any MCP-compatible agent can navigate, search, and deposit pheromones.</p>
+
+    <div class="mcp-grid">
+      <div class="mcp-cat glass" style="border-color:rgba(0,229,255,0.2);">
+        <div class="mcp-cat-title" style="color:var(--cyan)">🧭 Palace Navigation (8)</div>
+        <div class="mcp-tools">
+          <span class="mcp-tool" style="color:var(--cyan);border-color:rgba(0,229,255,0.15)">palace_search</span>
+          <span class="mcp-tool">palace_navigate</span>
+          <span class="mcp-tool">palace_path</span>
+          <span class="mcp-tool">palace_status</span>
+          <span class="mcp-tool">palace_list_rooms</span>
+          <span class="mcp-tool">palace_list_wings</span>
+          <span class="mcp-tool">palace_name</span>
+          <span class="mcp-tool">palace_similarity</span>
+        </div>
+      </div>
+      <div class="mcp-cat glass" style="border-color:rgba(245,158,11,0.2);">
+        <div class="mcp-cat-title" style="color:var(--orichalcum)">📦 Palace Operations (5)</div>
+        <div class="mcp-tools">
+          <span class="mcp-tool" style="color:var(--orichalcum);border-color:rgba(245,158,11,0.15)">palace_add_wing</span>
+          <span class="mcp-tool">palace_add_room</span>
+          <span class="mcp-tool">palace_add_drawer</span>
+          <span class="mcp-tool">palace_save</span>
+          <span class="mcp-tool">palace_export</span>
+        </div>
+      </div>
+      <div class="mcp-cat glass" style="border-color:rgba(52,211,153,0.2);">
+        <div class="mcp-cat-title" style="color:var(--emerald)">📊 Knowledge Graph (7)</div>
+        <div class="mcp-tools">
+          <span class="mcp-tool" style="color:var(--emerald);border-color:rgba(52,211,153,0.15)">kg_add</span>
+          <span class="mcp-tool">kg_add_temporal</span>
+          <span class="mcp-tool">kg_add_confidence</span>
+          <span class="mcp-tool">kg_query</span>
+          <span class="mcp-tool">kg_contradict</span>
+          <span class="mcp-tool">kg_invalidate</span>
+          <span class="mcp-tool">kg_find_similar</span>
+        </div>
+      </div>
+      <div class="mcp-cat glass" style="border-color:rgba(167,139,250,0.2);">
+        <div class="mcp-cat-title" style="color:var(--violet)">🐜 Stigmergy (5)</div>
+        <div class="mcp-tools">
+          <span class="mcp-tool" style="color:var(--violet);border-color:rgba(167,139,250,0.15)">pheromone_deposit</span>
+          <span class="mcp-tool">pheromone_decay</span>
+          <span class="mcp-tool">pheromone_hot_paths</span>
+          <span class="mcp-tool">pheromone_cold_spots</span>
+          <span class="mcp-tool">pheromone_build_graph</span>
+        </div>
+      </div>
+      <div class="mcp-cat glass" style="border-color:rgba(248,113,113,0.2);">
+        <div class="mcp-cat-title" style="color:var(--coral)">📖 Agent Diary (3)</div>
+        <div class="mcp-tools">
+          <span class="mcp-tool" style="color:var(--coral);border-color:rgba(248,113,113,0.15)">agent_create</span>
+          <span class="mcp-tool">diary_write</span>
+          <span class="mcp-tool">diary_read</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════
+     PAPERS
+     ════════════════════════════════════════════════════ -->
+<section id="papers">
+  <div class="container">
+    <p class="section-eyebrow">Research Strategy</p>
+    <h2 class="section-title">Six Papers</h2>
+    <p class="section-desc">ATLAS is not just software — it is a research programme. Each paper contributes a distinct scientific claim, targeting the top venues in ML and security.</p>
+
+    <div class="papers-grid">
+      <div class="paper-card glass" style="border-left: 3px solid var(--orichalcum);">
+        <div class="paper-venue" style="color:var(--orichalcum)">EMNLP 2026 · Paper 1</div>
+        <div class="paper-title">ATLAS Architecture + LiveDiscoveryCorpus</div>
+        <div class="paper-desc">Introducing the full ATLAS system: active-inference training on real causal discoveries from live APIs. First training paradigm where the curriculum is never stale.</div>
+        <span class="paper-tag" style="background:rgba(245,158,11,0.1);border:1px solid rgba(245,158,11,0.2);color:var(--orichalcum);">core architecture</span>
+      </div>
+      <div class="paper-card glass" style="border-left: 3px solid var(--cyan);">
+        <div class="paper-venue" style="color:var(--cyan)">NeurIPS 2026 · Paper 2</div>
+        <div class="paper-title">Discovery Flywheel — Closed-Loop Scientific Intelligence</div>
+        <div class="paper-desc">The first AI system that improves itself by discovering causal relationships from live data, not by distilling another AI's outputs. A new paradigm for self-improvement.</div>
+        <span class="paper-tag" style="background:rgba(0,229,255,0.08);border:1px solid rgba(0,229,255,0.2);color:var(--cyan);">self-improvement</span>
+      </div>
+      <div class="paper-card glass" style="border-left: 3px solid var(--emerald);">
+        <div class="paper-venue" style="color:var(--emerald)">ICML 2027 · Paper 3</div>
+        <div class="paper-title">Stigmergic RLVR — Pheromone Reward Prevents Policy Collapse</div>
+        <div class="paper-desc">r_total = α·r_verifiable + β·r_pheromone. Pheromone decay as an entropy regulariser. MMAS ceiling eliminates reward hacking. Validated on ATLAS discovery tasks.</div>
+        <span class="paper-tag" style="background:rgba(52,211,153,0.08);border:1px solid rgba(52,211,153,0.2);color:var(--emerald);">stigmergic RL</span>
+      </div>
+      <div class="paper-card glass" style="border-left: 3px solid var(--violet);">
+        <div class="paper-venue" style="color:var(--violet)">ICLR 2027 · Paper 4</div>
+        <div class="paper-title">O(1/√T) Morphic Convergence for LLMs</div>
+        <div class="paper-desc">Mathematically proven cross-run convergence via morphic warm-start. R²=0.982, p&lt;10⁻³⁰. Co-authored with Robin. Connects BUTTERS simulation to Yang 2026 mean-field RL theory.</div>
+        <span class="paper-tag" style="background:rgba(167,139,250,0.08);border:1px solid rgba(167,139,250,0.2);color:var(--violet);">O(1/√T) proven</span>
+      </div>
+      <div class="paper-card glass" style="border-left: 3px solid var(--coral);">
+        <div class="paper-venue" style="color:var(--coral)">IEEE S&P 2027 · Paper 5</div>
+        <div class="paper-title">End-to-End ZK Provenance for LLM Outputs</div>
+        <div class="paper-desc">Cryptographic proof chains from raw API data to trained model output. Hallucinations have broken Schnorr trails. A new standard for AI accountability.</div>
+        <span class="paper-tag" style="background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.2);color:var(--coral);">ZK provenance</span>
+      </div>
+      <div class="paper-card glass" style="border-left: 3px solid var(--rust);">
+        <div class="paper-venue" style="color:var(--rust)">ICLR/NeurIPS 2027 · Paper 6</div>
+        <div class="paper-title">Hybrid Generative-Recursive Architecture (TRM Integration)</div>
+        <div class="paper-desc">TRM-CausalValidator as the recursive self-consistency layer. 7M params, 0.1% compute overhead, 6 recursive passes. A new architectural paradigm for trustworthy generation.</div>
+        <span class="paper-tag" style="background:rgba(232,82,10,0.08);border:1px solid rgba(232,82,10,0.2);color:var(--rust);">TRM integration</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════
+     VERSION HISTORY
+     ════════════════════════════════════════════════════ -->
+<section id="versions">
+  <div class="container">
+    <p class="section-eyebrow">Release History</p>
+    <h2 class="section-title">Seven Stages to Atlantis</h2>
+    <p class="section-desc">From a single Tensor struct to 383 passing tests across 20 production crates. Each stage is a milestone, each milestone a palace room.</p>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:48px;">
+      <div class="timeline">
+        <div class="tl-item current">
+          <div class="tl-dot"></div>
+          <div class="tl-version">v1.0.0 · 2026-04-15 · PRODUCTION</div>
+          <div class="tl-title">The King of Atlantis</div>
+          <div class="tl-desc">383/383 tests, 20 crates, zero external deps. CI/CD, CHANGELOG, REPRODUCIBILITY, bench subcommand. GitHub Actions green. Tesla T4 GPU validated.</div>
+          <div class="tl-badges">
+            <span class="tl-badge green">383 tests</span>
+            <span class="tl-badge green">20 crates</span>
+            <span class="tl-badge gold">v1.0.0 tag</span>
+            <span class="tl-badge cyan">issue #1 closed</span>
+          </div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-dot"></div>
+          <div class="tl-version">v0.7.0 · CI + Bench</div>
+          <div class="tl-title">The Chronicle</div>
+          <div class="tl-desc">CHANGELOG.md, REPRODUCIBILITY.md, GitHub Actions CI matrix, atlas bench subcommand. 383 tests.</div>
+          <div class="tl-badges"><span class="tl-badge">383 tests</span><span class="tl-badge gold">CI green</span></div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-dot"></div>
+          <div class="tl-version">v0.5.0 + v0.6.0 · Safety + Bridge</div>
+          <div class="tl-title">The Guardian</div>
+          <div class="tl-desc">atlas-safety (5-state FSM + CircuitBreaker), atlas-bridge (Rings↔ETH ZK), Groth16 stub, LoRA adapters, gradient accumulation, safetensors checkpoint.</div>
+          <div class="tl-badges"><span class="tl-badge">383 tests</span><span class="tl-badge cyan">ZK bridge</span><span class="tl-badge">safety FSM</span></div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-dot"></div>
+          <div class="tl-version">v0.5.0 · Training Loop</div>
+          <div class="tl-title">The Learner</div>
+          <div class="tl-desc">Real SFT training loop: AdamW, pheromone curriculum sampler, OLMo 3 weight loading, QLoRA, 353 tests.</div>
+          <div class="tl-badges"><span class="tl-badge">353 tests</span><span class="tl-badge gold">pheromone SFT</span></div>
+        </div>
+      </div>
+      <div class="timeline">
+        <div class="tl-item">
+          <div class="tl-dot"></div>
+          <div class="tl-version">v0.3.0 + v0.4.0 · Discovery</div>
+          <div class="tl-title">The Explorer</div>
+          <div class="tl-desc">Real HTTP discovery engine, hypothesis lifecycle, NASA/WHO/World Bank connectors, safetensors model loader. 260 tests.</div>
+          <div class="tl-badges"><span class="tl-badge">260 tests</span><span class="tl-badge cyan">live APIs</span></div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-dot"></div>
+          <div class="tl-version">v0.2.0 · Palace + MCP</div>
+          <div class="tl-title">The Memory Keeper</div>
+          <div class="tl-desc">Real 5-type pheromone system, MMAS ceiling (arXiv:2604.00067), A* semantic pathfinding, Active Inference agents, MCP server with 28 tools. 236 tests.</div>
+          <div class="tl-badges"><span class="tl-badge">236 tests</span><span class="tl-badge gold">MMAS</span><span class="tl-badge cyan">28 MCP tools</span></div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-dot"></div>
+          <div class="tl-version">v0.1.0 · Infrastructure</div>
+          <div class="tl-title">The Foundation Stone</div>
+          <div class="tl-desc">17 crates, all 7 build stages. f32 matmul CPU+GPU. AdamW 50 steps: loss 0.038. INT4+LoRA: 7.1× compression. Tesla T4 validated. 186 tests.</div>
+          <div class="tl-badges"><span class="tl-badge">186 tests</span><span class="tl-badge gold">stage 1-7</span><span class="tl-badge cyan">T4 CUDA</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ════════════════════════════════════════════════════
+     STATS
+     ════════════════════════════════════════════════════ -->
+<section id="stats">
+  <div class="container">
+    <p class="section-eyebrow">Benchmarks · v1.0.0 · Tesla T4</p>
+    <h2 class="section-title">By the Numbers</h2>
+    <p class="section-desc">All benchmarks run on a real Tesla T4 (sm_75, CUDA 12.9, Rust 1.94.1). Zero synthetic results.</p>
+
+    <div class="stats-grid">
+      <div class="stat-card glass">
+        <div class="big-num" style="color:var(--emerald)">383</div>
+        <div class="big-label">Tests Passing</div>
+      </div>
+      <div class="stat-card glass">
+        <div class="big-num" style="color:var(--orichalcum)">20</div>
+        <div class="big-label">Rust Crates</div>
+      </div>
+      <div class="stat-card glass">
+        <div class="big-num" style="color:var(--cyan)">28</div>
+        <div class="big-label">MCP Tools</div>
+      </div>
+      <div class="stat-card glass">
+        <div class="big-num" style="color:var(--violet)">0</div>
+        <div class="big-label">External Deps</div>
+      </div>
+      <div class="stat-card glass">
+        <div class="big-num" style="color:var(--coral)">6</div>
+        <div class="big-label">Research Papers</div>
+      </div>
+      <div class="stat-card glass">
+        <div class="big-num" style="color:var(--emerald)">7</div>
+        <div class="big-label">Stages Complete</div>
+      </div>
+    </div>
+
+    <div class="glass" style="padding: 28px; overflow-x: auto;">
+      <table class="bench-table">
         <thead>
-          <tr style="border-bottom:1px solid var(--border);">
-            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;white-space:nowrap;">Domain</th>
-            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;">System</th>
-            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;">Mechanism</th>
-            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;">Scale claimed</th>
-            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;">Actual result</th>
+          <tr>
+            <th>Component</th>
+            <th>Operation</th>
+            <th>Throughput</th>
+            <th>Notes</th>
           </tr>
         </thead>
         <tbody>
-          <tr style="border-bottom:1px solid var(--border);background:rgba(249,115,22,.05);">
-            <td style="padding:12px 14px;color:#f97316;font-weight:700;">Inference-time</td>
-            <td style="padding:12px 14px;color:var(--text);">TRM-CausalValidator<br><span style="font-size:11px;color:var(--text3);">Samsung SAIL Montreal<br>arXiv:2510.04871</span></td>
-            <td style="padding:12px 14px;color:var(--text2);">Test-time recursion<br>z = net(x,y,z) × 6 passes<br>attention-free MLP</td>
-            <td style="padding:12px 14px;color:var(--text3);">Kaplan scaling law<br>predicts ~5–10B params<br>for 45% ARC-AGI-1</td>
-            <td style="padding:12px 14px;"><span style="color:#f97316;font-weight:700;">7M params → 45% ARC-AGI-1</span><br><span style="font-size:11px;color:var(--text3);">0.14% of predicted requirement<br>beats DeepSeek R1, o3-mini, Gemini 2.5 Pro</span></td>
+          <tr>
+            <td>🏛️ atlas-palace</td>
+            <td>Insertions</td>
+            <td class="val">304K / sec</td>
+            <td>GPU server (astra-01)</td>
           </tr>
-          <tr style="background:rgba(16,185,129,.05);">
-            <td style="padding:12px 14px;color:var(--c3);font-weight:700;">Training-time</td>
-            <td style="padding:12px 14px;color:var(--text);">ATLAS Morphic Warm-Start<br><span style="font-size:11px;color:var(--text3);">BUTTERS · Robin et al.<br>O(1/√T) confirmed</span></td>
-            <td style="padding:12px 14px;color:var(--text2);">Pheromone curriculum<br>Cross-run warm-start<br>stigmergic memory transfer</td>
-            <td style="padding:12px 14px;color:var(--text3);">Standard scaling<br>predicts 3–5× more<br>params for same gain</td>
-            <td style="padding:12px 14px;"><span style="color:var(--c3);font-weight:700;">70% regret reduction (189→57 steps)</span><br><span style="font-size:11px;color:var(--text3);">R²=0.982, p&lt;10⁻³⁰ · O(1/√T) confirmed<br>7B with curriculum ≈ 20–30B vanilla</span></td>
+          <tr>
+            <td>🏛️ atlas-palace</td>
+            <td>A* queries</td>
+            <td class="val cyan">9.7K / sec</td>
+            <td>Pheromone-weighted</td>
+          </tr>
+          <tr>
+            <td>🎓 atlas-corpus</td>
+            <td>SFT training steps</td>
+            <td class="val emerald">9.7K steps / sec</td>
+            <td>LoRA, grad-accum</td>
+          </tr>
+          <tr>
+            <td>⚖️ atlas-trm</td>
+            <td>Quality gate throughput</td>
+            <td class="val violet">1.16M / sec</td>
+            <td>TRM recursive validator</td>
+          </tr>
+          <tr>
+            <td>⚙️ atlas-tensor</td>
+            <td>AdamW 50 steps (MLP)</td>
+            <td class="val">loss 0.038</td>
+            <td>T4 CUDA sm_75</td>
+          </tr>
+          <tr>
+            <td>🗜️ atlas-quant</td>
+            <td>INT4+LoRA compression</td>
+            <td class="val emerald">7.1×</td>
+            <td>vs. f32 baseline</td>
           </tr>
         </tbody>
       </table>
     </div>
-    <div class="breakthrough" style="margin-bottom:0;font-size:15px;">
-      <strong>Shared principle</strong>: Neither system achieves its result by adding parameters. Both impose <em>structure on the computation</em> — TRM through iterative latent refinement within a forward pass, ATLAS through pheromone-guided curriculum across training runs. These mechanisms are <strong>orthogonal and complementary</strong> — TRM validates individual causal claims at inference time; ATLAS curriculum learns <em>which</em> claims matter over training time. Together they form ATLAS v3.0.
-    </div>
   </div>
+</section>
 
-  <div class="div"></div>
-
-  <!-- THE FLYWHEEL -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num">2</div>
-      <div>
-        <div class="sec-title">The Discovery Flywheel</div>
-        <div class="sec-sub">The closed loop that makes ATLAS self-improving — no other architecture has this</div>
-      </div>
-    </div>
-
-    <div class="flywheel-wrap">
-      <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:20px;">CLOSED TRAINING LOOP · ACCELERATES WITH EACH CYCLE</div>
-
-      <div class="fw-row">
-        <div class="fw-node fw-n1">ASTRA-dev<br><small>OODA · ~10s/cycle</small></div>
-        <span class="fw-arr">→</span>
-        <div class="fw-node fw-n2">GraphPalace<br><small>deposit_pheromones()</small></div>
-        <span class="fw-arr">→</span>
-        <div class="fw-node fw-n3">LiveDiscoveryCorpus<br><small>quality-gated · causal · novel</small></div>
-        <span class="fw-arr">→</span>
-        <div class="fw-node fw-n4">OLMo 3 7B<br><small>continuous SFT + RLVR</small></div>
-        <span class="fw-arr">→</span>
-        <div class="fw-node fw-n5">Better Hypotheses<br><small>Orient phase upgrade</small></div>
-      </div>
-      <div class="fw-row" style="padding-left:20px;">
-        <span style="color:var(--text3);font-size:22px;">↑</span>
-        <span class="fw-label">feeds back</span>
-        <span style="flex:1;border-top:1px dashed rgba(255,255,255,.12);margin:0 10px;"></span>
-        <span class="fw-label">better discoveries ↓</span>
-        <span style="color:var(--text3);font-size:22px;">↓</span>
-      </div>
-      <div class="fw-loop">
-        🔄 <strong style="color:var(--c1);">atlas-7b</strong> generates better Orient-phase hypotheses
-        → ASTRA makes better/more discoveries
-        → richer LiveDiscoveryCorpus
-        → better atlas-7b
-        → <em style="color:var(--c3);">accelerating flywheel</em>
-      </div>
-
-      <div style="margin-top:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;">
-        <div style="background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:14px;">
-          <div style="font-size:11px;color:var(--c5);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Without ATLAS</div>
-          <div style="font-size:13px;color:var(--text2);">ASTRA calls GPT-4 for Orient<br>Generic model, expensive<br>No domain specialization<br>No pheromone awareness</div>
-        </div>
-        <div style="background:rgba(0,212,255,.07);border:1px solid rgba(0,212,255,.2);border-radius:8px;padding:14px;">
-          <div style="font-size:11px;color:var(--c1);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">With ATLAS</div>
-          <div style="font-size:13px;color:var(--text2);">ASTRA calls atlas-7b for Orient<br>Trained on 500K+ own discoveries<br>Deep domain specialization<br>Pheromone-path aware · $0 cost</div>
-        </div>
-        <div style="background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.2);border-radius:8px;padding:14px;">
-          <div style="font-size:11px;color:var(--c3);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Expected improvement</div>
-          <div style="font-size:13px;color:var(--text2);">DC-24 proved 1.83× novelty transfer<br>Domain model → 2-5× projected<br>Same O(1/√T) morphic bound<br>Self-improving without humans</div>
-        </div>
+<!-- ════════════════════════════════════════════════════
+     INNER SANCTUM — The Atlantis Lore
+     ════════════════════════════════════════════════════ -->
+<section id="sanctum">
+  <div class="sanctum-rings">
+    <div class="sanctum-ring"></div>
+    <div class="sanctum-ring"></div>
+    <div class="sanctum-ring"></div>
+    <div class="sanctum-ring"></div>
+  </div>
+  <div class="container">
+    <div class="sanctum-content">
+      <div class="sanctum-sigil">🏛️</div>
+      <h2 class="sanctum-title">The Inner Sanctum</h2>
+      <p class="sanctum-subtitle">Where the King of Atlantis holds court</p>
+      <p class="sanctum-lore">
+        In Plato's <em>Critias</em>, <strong>Atlas</strong> was the first-born son of Poseidon and the first King of Atlantis — ruler of the ringed island, guardian of the Orichalcum mines, holder of the sky itself. He gave his name to the Atlantic, and to the mountain that holds the world aloft.<br><br>
+        Our <strong>ATLAS</strong> is the same. An AI that holds the weight of all knowledge — not by reading what others wrote, but by reaching into the world and pulling truth from it directly. The <strong>pheromone trails</strong> are the rivers of Atlantis. The <strong>GraphPalace</strong> is the palace at its centre. The <strong>Discovery Flywheel</strong> is the waterwheel that powers the city.<br><br>
+        Atlantis was said to have possessed knowledge so advanced it seemed like magic. ATLAS builds that knowledge — real causal relationships, cryptographically verified, stigmergically optimised — one discovery at a time.
+      </p>
+      <div style="display:flex;gap:14px;justify-content:center;flex-wrap:wrap;">
+        <a href="https://github.com/web3guru888/ATLAS" class="btn btn-primary" target="_blank">◆ GitHub</a>
+        <a href="https://github.com/web3guru888/ATLAS/blob/main/CHARTER.md" class="btn btn-ghost" target="_blank">📜 Charter</a>
+        <a href="https://github.com/web3guru888/ATLAS/blob/main/CITATION.cff" class="btn btn-ghost" target="_blank">📑 Cite</a>
       </div>
     </div>
   </div>
+</section>
 
-  <div class="div"></div>
-
-  <!-- WHY ASTRA DATA IS BETTER -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num">3</div>
-      <div>
-        <div class="sec-title">Why ASTRA Data is Better Than Any Static Dataset</div>
-        <div class="sec-sub">The highest-quality scientific training data that has ever existed</div>
-      </div>
-    </div>
-    <div style="overflow-x:auto;">
-      <table class="cmp">
-        <tr>
-          <th>Property</th>
-          <th>Dolma / web scrapes</th>
-          <th>Human-curated datasets</th>
-          <th>GPT-4 synthetic data</th>
-          <th style="color:var(--c1);">ASTRA-dev discoveries</th>
-        </tr>
-        <tr><td>Ground truth</td><td class="no">Opinion/hearsay</td><td class="no">Manually checked</td><td class="no">Model hallucinations possible</td><td class="atlas-v">✅ API-verified, causal</td></tr>
-        <tr><td>Novelty guarantee</td><td class="no">Unknown, likely stale</td><td class="no">Curated once</td><td class="no">Repeats training data</td><td class="atlas-v">✅ 100% dedup-confirmed</td></tr>
-        <tr><td>Causal grounding</td><td class="no">Correlational at best</td><td class="no">Mostly correlational</td><td class="no">None</td><td class="atlas-v">✅ PC/FCI inference</td></tr>
-        <tr><td>Confidence scores</td><td class="no">None</td><td class="no">Sometimes</td><td class="no">None</td><td class="atlas-v">✅ Bayesian P(H|E)</td></tr>
-        <tr><td>Cross-domain links</td><td class="no">Incidental</td><td class="no">Domain-specific</td><td class="no">Surface-level</td><td class="atlas-v">✅ 201K+ structural analogies</td></tr>
-        <tr><td>Currency</td><td class="no">Training cutoff frozen</td><td class="no">Updated rarely</td><td class="no">Static after generation</td><td class="atlas-v">✅ Continuous · ~10s/cycle</td></tr>
-        <tr><td>Full provenance</td><td class="no">Unknown</td><td class="no">Partial</td><td class="no">None</td><td class="atlas-v">✅ API → analysis → claim</td></tr>
-        <tr><td>Self-improving</td><td class="no">Static</td><td class="no">Static</td><td class="no">Static</td><td class="atlas-v">✅ d=10.6 memory effect</td></tr>
-        <tr><td>ZK verifiable</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="atlas-v">✅ Schnorr proof chain</td></tr>
-      </table>
-    </div>
+<!-- ════════════════════════════════════════════════════
+     FOOTER
+     ════════════════════════════════════════════════════ -->
+<footer>
+  <div class="footer-brand">ATLAS of Atlantis</div>
+  <p>Active-inference Training with Learned Adaptive Stigmergy · v1.0.0 Production Release</p>
+  <div class="footer-links">
+    <a href="https://github.com/web3guru888/ATLAS">GitHub</a>
+    <a href="https://github.com/web3guru888/ATLAS/blob/main/CHARTER.md">Charter</a>
+    <a href="https://github.com/web3guru888/ATLAS/blob/main/CHANGELOG.md">Changelog</a>
+    <a href="https://github.com/web3guru888/ATLAS/blob/main/REPRODUCIBILITY.md">Reproducibility</a>
+    <a href="https://github.com/web3guru888/GraphPalace">GraphPalace</a>
   </div>
-
-  <div class="div"></div>
-
-  <!-- TRAINING EXAMPLES -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num">4</div>
-      <div>
-        <div class="sec-title">Discovery → Training Example</div>
-        <div class="sec-sub">How ASTRA discoveries become OLMo training data</div>
-      </div>
-    </div>
-    <div class="grid g2">
-      <div>
-        <div class="ex-type">Raw ASTRA Discovery</div>
-        <div class="ex-block">
-<span class="key">"hypothesis"</span>: <span class="val">"Elevated Arctic CO₂ correlates with +2.3°C temperature increase"</span>,<br>
-<span class="key">"domain"</span>: <span class="val">"climate"</span>,<br>
-<span class="conf">"confidence"</span>: <span class="conf">0.847</span>,<br>
-<span class="key">"evidence"</span>: [<span class="src">"NASA_GISTEMP_2024"</span>, <span class="src">"NOAA_CO2_monthly"</span>],<br>
-<span class="key">"causal_chain"</span>: [<span class="val">"CO2 → temp_rise → arctic_ice_loss"</span>],<br>
-<span class="key">"cross_domain"</span>: [<span class="val">"epi:respiratory_mortality"</span>, <span class="val">"econ:agricultural_GDP"</span>],<br>
-<span class="conf">"novelty_score"</span>: <span class="conf">0.923</span>,<br>
-<span class="conf">"pheromone_intensity"</span>: <span class="conf">0.784</span>
-        </div>
-      </div>
-      <div style="display:flex;flex-direction:column;gap:12px;">
-        <div>
-          <div class="ex-type">→ Type 1: Causal Q&A Training Pair</div>
-          <div class="ex-block">
-<span class="key">Q:</span> <span class="val">What is the causal relationship between Arctic CO₂ and temperature?</span><br><br>
-<span class="key">A:</span> <span class="val">Based on NASA GISTEMP (146yr) + NOAA CO₂ data, PC/FCI causal inference confirms CO₂ increase causally drives +2.3°C Arctic temperature rise (conf=0.847). Not merely correlated — causal direction established. Evidence chain: NASA_GISTEMP_2024 → PC_algorithm → validated 2026-04-15.</span>
-          </div>
-        </div>
-        <div>
-          <div class="ex-type">→ Type 2: Cross-Domain DPO Pair</div>
-          <div class="ex-block">
-<span class="key">CHOSEN</span> <span class="conf">(pheromone=0.784)</span>:<br>
-<span class="val">"CO₂-driven temperature rise (0.847) causally links to respiratory mortality via WHO_GHO data — cross-domain causal chain confirmed"</span><br><br>
-<span class="key">REJECTED</span> <span class="conf">(pheromone=0.12)</span>:<br>
-<span class="val">"Climate change generally affects health outcomes"</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="div"></div>
-
-  <!-- SIX PILLARS -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num">5</div>
-      <div>
-        <div class="sec-title">Seven Pillars (v3.0)</div>
-        <div class="sec-sub">Six original + TRM-CausalValidator — recursive validation as a first-class architectural component</div>
-      </div>
-    </div>
-    <div class="grid g3">
-      <div class="card ct1"><div class="card-icon">🏛️</div><div class="card-title">GraphPalace Memory</div><div class="card-body">Pheromone-weighted persistent knowledge. search_by_embedding() + navigate() + hot_paths() at inference. Dedup-confirmed discoveries deposited as pheromone-weighted rooms. Cold spots = training gaps.</div></div>
-      <div class="card ct4"><div class="card-icon">🌊</div><div class="card-title">Morphic Warm-Start</div><div class="card-body">Cross-run curriculum intelligence. O(1/√T) convergence — proven in BUTTERS (R²=0.982, p&lt;10⁻³⁰). Each run's gradient map guides next run. Pheromone decay = natural curriculum forgetting.</div></div>
-      <div class="card ct3"><div class="card-icon">⚗️</div><div class="card-title">Stigmergic RLVR</div><div class="card-body">r_total = α·r_verifiable + β·r_pheromone. Pheromone reward provides temporal credit across episodes. Decay prevents reward hacking. Validated reasoning paths get higher reward than lucky shortcuts.</div></div>
-      <div class="card ct2"><div class="card-icon">🧬</div><div class="card-title">Active Inference Data Gen</div><div class="card-body">Palace cold spots → GraphPalace AI agents generate synthetic examples AND direct ASTRA to fetch real data for those domains. Real + synthetic data, both stigmergically directed.</div></div>
-      <div class="card ct6"><div class="card-icon">🔐</div><div class="card-title">ZK Knowledge Claims</div><div class="card-body">Full provenance chain: LLM output → training example → ASTRA discovery → causal inference run → raw API data → NASA/WHO/World Bank. Schnorr proof at every link. Hallucinations detectable — no valid proof trail.</div></div>
-      <div class="card ct5"><div class="card-icon">🔴</div><div class="card-title" style="color:var(--c5);">LiveDiscoveryCorpus</div><div class="card-body">ASTRA-dev's continuous output as a living training dataset. ~10s/cycle. Quality-gated: Bayesian > 0.65, novelty > 0.55, causal inference completed, live API source. ~86K quality examples/month. Self-improving via flywheel.</div></div>
-      <div class="card" style="border-top:2px solid #f97316;"><div class="card-icon" style="font-size:22px;font-weight:900;color:#f97316;">TRM</div><div class="card-title" style="color:#f97316;">TRM-CausalValidator ← v3.0</div><div class="card-body">7M-param recursive module (Samsung SAIL, arXiv:2510.04871). Validates causal graph consistency before corpus entry. z = net(x,y,z) × 6 recursions. <strong style="color:#f97316;">0.1% of atlas-7b compute</strong> for structured causal graph checking. Generates Type 5 training traces. Quality Gate 6.</div></div>
-    </div>
-  </div>
-
-  <div class="div"></div>
-
-  <!-- ROADMAP -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num">6</div>
-      <div>
-        <div class="sec-title">Implementation Roadmap (v3.0)</div>
-        <div class="sec-sub">Phase 0 mostly done — Phase 3 now includes TRM-CausalValidator (~500 LOC)</div>
-      </div>
-    </div>
-    <div class="rm">
-      <div class="rm-phase rp0">
-        <div class="rm-inner">
-          <div class="rm-label"><div class="rm-name rn0">Phase 0</div><div class="rm-time">1 week · mostly done</div></div>
-          <div class="rm-content">
-            <div class="rm-title">ASTRA + GraphPalace Merge</div>
-            <div class="rm-desc">The MemPalace-AGI project already built 12 integration components (PalaceDiscoveryMemory, MemoryAugmentedOrient, KnowledgeGraphBridge, etc.). Merge into ATLAS workspace. Seed the LiveDiscoveryCorpus — run ASTRA for 1 week, generate 10K+ quality-gated training examples.</div>
-            <div class="rm-tags"><span class="rm-tag">PalaceDiscoveryMemory ✅</span><span class="rm-tag">MemoryAugmentedOrient ✅</span><span class="rm-tag">KnowledgeGraphBridge ✅</span><span class="rm-tag">LiveDiscoveryCorpus harvester</span><span class="rm-tag">Quality gate pipeline</span><span class="rm-tag">Seed corpus (1 week)</span></div>
-          </div>
-        </div>
-      </div>
-      <div class="rm-phase rp1">
-        <div class="rm-inner">
-          <div class="rm-label"><div class="rm-name rn1">Phase 1</div><div class="rm-time">2-4 weeks</div></div>
-          <div class="rm-content">
-            <div class="rm-title">ATLAS-Lite: Palace-Augmented Inference</div>
-            <div class="rm-desc">OLMo 3 7B with GraphPalace as tool call. Seeded with ASTRA discoveries. First comparison: ASTRA-seeded palace vs. Dolma-seeded palace vs. vanilla OLMo on scientific reasoning questions. Paper 1 proof of concept likely done here in week 1.</div>
-            <div class="rm-tags"><span class="rm-tag">OLMo 3 7B loaded</span><span class="rm-tag">Palace tool call wired</span><span class="rm-tag">Pheromone deposit hook</span><span class="rm-tag">ASTRA vs Dolma palace eval</span><span class="rm-tag">OLMES baseline</span></div>
-          </div>
-        </div>
-      </div>
-      <div class="rm-phase rp2">
-        <div class="rm-inner">
-          <div class="rm-label"><div class="rm-name rn2">Phase 2</div><div class="rm-time">4-8 weeks</div></div>
-          <div class="rm-content">
-            <div class="rm-title">ATLAS-SFT: First Live Training Run</div>
-            <div class="rm-desc">Fine-tune OLMo 7B on LiveDiscoveryCorpus (QLoRA, RTX 4090). Pheromone-guided batch sampler. Then swap atlas-7b into ASTRA's Orient phase — measure discovery improvement. Run 3 sequential morphic-warm-start runs to confirm O(1/√T).</div>
-            <div class="rm-tags"><span class="rm-tag">Pheromone data sampler</span><span class="rm-tag">QLoRA SFT on corpus</span><span class="rm-tag">atlas-7b → ASTRA Orient</span><span class="rm-tag">Flywheel measurement</span><span class="rm-tag">O(1/√T) curve</span><span class="rm-tag">DPO palace pairs</span></div>
-          </div>
-        </div>
-      </div>
-      <div class="rm-phase rp3" style="border-left:none;">
-        <div class="rm-inner">
-          <div class="rm-label"><div class="rm-name rn3">Phase 3</div><div class="rm-time">2-4 months</div></div>
-          <div class="rm-content">
-            <div class="rm-title">ATLAS-Full: Stigmergic RLVR + ZK + TRM + Papers</div>
-            <div class="rm-desc">Full closed loop. Pheromone reward in RLVR. ZK provenance chains from output to NASA API. TRM-CausalValidator deployed as Quality Gate 6. Continuous fine-tuning as corpus grows. atlas-7b on HuggingFace. Six papers submitted.</div>
-            <div class="rm-tags"><span class="rm-tag">Stigmergic RLVR</span><span class="rm-tag">ZK full chain</span><span class="rm-tag">TRM-CausalValidator</span><span class="rm-tag">Validation Router</span><span class="rm-tag">Type 5 traces</span><span class="rm-tag">Continuous fine-tuning</span><span class="rm-tag">atlas-7b release</span><span class="rm-tag">Paper 1: Architecture</span><span class="rm-tag">Paper 2: Discovery Flywheel</span><span class="rm-tag">Paper 3: RLVR</span><span class="rm-tag">Paper 4: O(1/√T)</span><span class="rm-tag">Paper 5: ZK Provenance</span><span class="rm-tag" style="background:rgba(249,115,22,.15);border-color:rgba(249,115,22,.4);color:#f97316;">Paper 6: Hybrid Gen-Recursive ← NEW</span></div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="div"></div>
-
-  <!-- PAPERS -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num">7</div>
-      <div>
-        <div class="sec-title">Paper Strategy (v3.0)</div>
-        <div class="sec-sub">Six publishable contributions — TRM integration adds Paper 6 and strengthens Papers 1 &amp; 3</div>
-      </div>
-    </div>
-    <div class="grid g2" style="gap:14px;">
-      <div class="paper" style="border-top:2px solid var(--c5);">
-        <div class="paper-n">Paper 1 · NEW with ASTRA</div>
-        <div class="paper-t">"ATLAS: Training LLMs on Their Own Discoveries via Stigmergic Curriculum Learning"</div>
-        <div class="paper-venue">🎯 EMNLP 2026 · Architecture + LiveDiscoveryCorpus</div>
-        <ul class="paper-claims">
-          <li>First LLM trained primarily on autonomous-AI-generated causal discoveries</li>
-          <li>ASTRA data > Dolma > GPT-4-synthetic on domain scientific reasoning</li>
-          <li>LiveDiscoveryCorpus release (~500K examples, open)</li>
-          <li>Pheromone curriculum outperforms uniform/hand-crafted</li>
-        </ul>
-      </div>
-      <div class="paper" style="border-top:2px solid var(--c5);">
-        <div class="paper-n">Paper 2 · NEW with ASTRA</div>
-        <div class="paper-t">"The Discovery Flywheel: Closed-Loop Fine-tuning Between an Autonomous Research Engine and an LLM"</div>
-        <div class="paper-venue">🎯 NeurIPS 2026 · Closed-loop scientific intelligence</div>
-        <ul class="paper-claims">
-          <li>First demonstration of LLM ↔ autonomous research engine closed loop</li>
-          <li>Discovery quality improves measurably each training iteration</li>
-          <li>Extends DC-24 (1.83× novelty) to model-in-the-loop setting</li>
-          <li>Acceleration: each cycle faster/richer than the last</li>
-        </ul>
-      </div>
-      <div class="paper" style="border-top:2px solid var(--c3);">
-        <div class="paper-n">Paper 3 · Stigmergic RLVR <span style="font-size:10px;color:#f97316;">[TRM-strengthened]</span></div>
-        <div class="paper-t">"Collective Reinforcement: Pheromone-Augmented Reward Shaping Prevents Policy Collapse in LLM RLVR"</div>
-        <div class="paper-venue">🎯 ICML 2027</div>
-        <ul class="paper-claims">
-          <li>r_pheromone reduces reward hacking vs. standard RLVR</li>
-          <li>Temporal credit across episodes via pheromone trails</li>
-          <li>Decay rate controls exploration/exploitation</li>
-          <li style="color:#f97316;">TRM citation: "TRM (7M params) outperforms 1B+ via recursive structure at inference time. ATLAS (7B params) outperforms vanilla 20B+ via pheromone structure at training time. Common factor: architectural inductive bias, not parameter count."</li>
-        </ul>
-      </div>
-      <div class="paper" style="border-top:2px solid var(--c4);">
-        <div class="paper-n">Paper 4 · Co-author: Robin</div>
-        <div class="paper-t">"Morphic Resonance in Gradient Descent: O(1/√T) Cross-Run Convergence via Stigmergic Memory Transfer"</div>
-        <div class="paper-venue">🎯 ICLR 2027 · Extends BUTTERS to neural networks</div>
-        <ul class="paper-claims">
-          <li>LLM fine-tuning with stigmergic warm-start follows O(1/√T)</li>
-          <li>Extends Robin's BUTTERS result from tabular RL to LLM training</li>
-          <li>Palace topology converges to fixed point = knowledge boundary</li>
-        </ul>
-      </div>
-      <div class="paper" style="border-top:2px solid var(--c6);">
-        <div class="paper-n">Paper 5 · ZK Provenance</div>
-        <div class="paper-t">"End-to-End Verifiable LLM Outputs: Cryptographic Provenance from Model Response to Raw Data Source"</div>
-        <div class="paper-venue">🎯 IEEE S&P 2027 · Security / trustworthy AI</div>
-        <ul class="paper-claims">
-          <li>Schnorr chains: output → discovery → causal run → live API</li>
-          <li>Hallucinations detectable via broken proof chains</li>
-          <li>Framework for trustworthy AI in medical/legal/financial</li>
-        </ul>
-      </div>
-      <div class="paper" style="border-top:2px solid #f97316;">
-        <div class="paper-n">Paper 6 · NEW v3.0</div>
-        <div class="paper-t">"Beyond Scaling: Hybrid Generative-Recursive Architectures for Scientific Causal Reasoning"</div>
-        <div class="paper-venue">🎯 ICLR / NeurIPS 2027 · Architecture innovation</div>
-        <ul class="paper-claims">
-          <li>First integration of TRM-style recursive validator with generative LLM in a scientific discovery pipeline</li>
-          <li>Validation Router: structured causal graph → TRM-CV (7M); open-ended reasoning → atlas-7b (7B)</li>
-          <li>Type 5 training traces: TRM's recursive refinement steps teach atlas-7b how to reason about graph structure</li>
-          <li>Key claim: hybrid architecture beats either component alone at lower total compute than scaling atlas-7b to handle both tasks</li>
-          <li>Builds on TRM (Jolicoeur-Martineau, 2025) — same architecture, extended to domain-specific causal graphs trained on ASTRA data</li>
-        </ul>
-      </div>
-      <div class="paper" style="border-top:2px solid var(--text3);opacity:.7;">
-        <div class="paper-n">Bonus: ASTRA-ATLAS Dataset Paper</div>
-        <div class="paper-t">"LiveDiscoveryCorpus: A Continuously Growing Dataset of Causally-Grounded Scientific Findings from Autonomous AI Research"</div>
-        <div class="paper-venue">🎯 Dataset track · NeurIPS / ICML</div>
-        <ul class="paper-claims">
-          <li>Release of 500K+ quality-gated ASTRA discoveries as open dataset</li>
-          <li>Every example: Bayesian-scored, causal, dedup-confirmed, provenance-traced</li>
-          <li>Benchmark comparison on existing scientific reasoning tasks</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-
-  <div class="div"></div>
-
-  <!-- COMPONENT STATUS -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num">8</div>
-      <div>
-        <div class="sec-title">Component Status</div>
-        <div class="sec-sub">What's already built vs. what needs to be built</div>
-      </div>
-    </div>
-    <div style="margin-bottom:16px;font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;">Already Built ✅</div>
-    <div class="status-row" style="margin-bottom:24px;">
-      <div class="sbadge"><div class="dot dg"></div>GraphPalace PyO3 (36 methods)</div>
-      <div class="sbadge"><div class="dot dg"></div>ASTRA-dev (89 endpoints, 685 tests)</div>
-      <div class="sbadge"><div class="dot dg"></div>PalaceDiscoveryMemory adapter</div>
-      <div class="sbadge"><div class="dot dg"></div>MemoryAugmentedOrient</div>
-      <div class="sbadge"><div class="dot dg"></div>KnowledgeGraphBridge (causal → triples)</div>
-      <div class="sbadge"><div class="dot dg"></div>DomainSpecialistManager</div>
-      <div class="sbadge"><div class="dot dg"></div>RetrievalProfiles (3 OODA phases)</div>
-      <div class="sbadge"><div class="dot dg"></div>BUTTERS O(1/√T) confirmed</div>
-      <div class="sbadge"><div class="dot dg"></div>asi-build ZK Schnorr proofs</div>
-      <div class="sbadge"><div class="dot dg"></div>OLMo 3 7B (Apache 2.0)</div>
-      <div class="sbadge"><div class="dot dg"></div>Open Instruct RLVR pipeline</div>
-      <div class="sbadge"><div class="dot dg"></div>100% dedup accuracy (5-heuristic)</div>
-    </div>
-    <div style="margin-bottom:16px;font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;">To Build ⬜</div>
-    <div class="status-row" style="margin-bottom:24px;">
-      <div class="sbadge"><div class="dot dy"></div>LiveDiscoveryCorpus harvester (~200 LOC)</div>
-      <div class="sbadge"><div class="dot dy"></div>Quality gate pipeline (5 gates)</div>
-      <div class="sbadge"><div class="dot dy"></div>Pheromone-weighted batch sampler</div>
-      <div class="sbadge"><div class="dot dy"></div>OLMo ↔ GraphPalace tool call bridge</div>
-      <div class="sbadge"><div class="dot dy"></div>Orient-phase OLMo helper (replaces GPT-4)</div>
-      <div class="sbadge"><div class="dot dy"></div>Continuous fine-tuning loop</div>
-    </div>
-    <div style="margin-bottom:16px;font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;">Phase 3 Research ⬜</div>
-    <div class="status-row">
-      <div class="sbadge"><div class="dot db"></div>Stigmergic RLVR reward function</div>
-      <div class="sbadge"><div class="dot db"></div>Multi-scale L1/L2/L3 pheromones</div>
-      <div class="sbadge"><div class="dot db"></div>ZK full provenance chain (output → API)</div>
-      <div class="sbadge"><div class="dot dgr"></div>atlas-7b HuggingFace release</div>
-    </div>
-    <div style="margin-bottom:16px;font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-top:20px;">Phase 3 — TRM-CausalValidator (v3.0) ⬜</div>
-    <div class="status-row">
-      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>TRM training data prep (~5K causal graphs)</div>
-      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>TRM-CausalValidator model (~500 LOC)</div>
-      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>Validation Router (structured → TRM | open → atlas-7b)</div>
-      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>Type 5 training example generator</div>
-      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>Quality Gate 6 integration</div>
-      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>TRM accuracy benchmark (200 held-out graphs)</div>
-    </div>
-  </div>
-
-  <div class="div"></div>
-
-  <!-- PURE RUST -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num" style="background:linear-gradient(135deg,var(--c7),#c44208);">9</div>
-      <div>
-        <div class="sec-title" style="color:var(--c7);">Built in Pure Rust — Zero Dependencies</div>
-        <div class="sec-sub">SQLite philosophy applied to AI infrastructure · 16 crates · ~22-week build order · sovereign, auditable, portable</div>
-      </div>
-    </div>
-
-    <div class="rust-intro">
-      The SQLite principle: <strong>no external dependencies</strong>. SQLite is the most deployed database on Earth — not because it's the fastest, but because it runs anywhere, answers to no one, and has never been broken by a supply-chain compromise.<br><br>
-      ATLAS makes the same choice: <strong>zero Rust crate dependencies</strong>. Zero means zero — no tokio, no tch, no candle, no ndarray. Every algorithm is written from scratch or ported from its original C/Python source into our codebase.<br><br>
-      CUDA is a system runtime, not a crate. It is called via raw <code style="background:rgba(232,82,10,.12);padding:1px 5px;border-radius:3px;">extern "C"</code> FFI from <code style="background:rgba(232,82,10,.12);padding:1px 5px;border-radius:3px;">build.rs</code> + <code style="background:rgba(232,82,10,.12);padding:1px 5px;border-radius:3px;">kernels/*.cu</code>. No cudarc wrapper, no cuBLAS Rust binding. The same principle that makes SQLite trustworthy, applied to the GPU.
-    </div>
-
-    <!-- CRATE GRID -->
-    <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">16 Crates — Workspace Structure</div>
-    <div class="crate-grid">
-      <div class="crate-card">
-        <div class="crate-name">atlas-core</div>
-        <div class="crate-desc">Error types, traits, config primitives. The foundation everything else imports.</div>
-        <div class="crate-port new">Write from scratch — trivial</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-tensor</div>
-        <div class="crate-desc">Tensor{data,shape}, matmul, element-wise ops, CUDA FFI bridge. The seed of everything.</div>
-        <div class="crate-port new">Write from scratch + CUDA kernels</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-grad</div>
-        <div class="crate-desc">Autograd tape. Forward + backward pass through any computation graph. The hard part.</div>
-        <div class="crate-port new">Port micrograd concept (~2K LOC)</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-optim</div>
-        <div class="crate-desc">AdamW, cosine LR scheduler, weight decay. Standard algorithms — ~300 LOC.</div>
-        <div class="crate-port new">Write from standard algorithm</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-quant</div>
-        <div class="crate-desc">INT4 / INT8 quantization. QLoRA dequant for 24GB VRAM training of 7B model.</div>
-        <div class="crate-port new">Port bitsandbytes quant logic</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-model</div>
-        <div class="crate-desc">Transformer: MultiHeadAttn, FFN, RMSNorm, RoPE embeddings. OLMo 3 architecture config + weights loader.</div>
-        <div class="crate-port new">Port OLMo 3 architecture spec</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-tokenize</div>
-        <div class="crate-desc">BPE tokenizer. Encode/decode. Vocabulary management. Load OLMo tokenizer files.</div>
-        <div class="crate-port new">Port sentencepiece BPE algorithm</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-palace</div>
-        <div class="crate-desc">GraphPalace engine — 36 methods, stigmergic navigation, pheromone deposit/decay, semantic search.</div>
-        <div class="crate-port copy">Strip PyO3 bindings — already Rust</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-trm</div>
-        <div class="crate-desc">TRM-CausalValidator: 7M params, 2-layer MLP, z=net(x,y,z)×6 recursions. Quality Gate 6.</div>
-        <div class="crate-port new">Implement from arXiv:2510.04871 (~500 LOC)</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-causal</div>
-        <div class="crate-desc">PC / FCI causal inference algorithms. The core of ASTRA's scientific rigor. ~800 LOC each.</div>
-        <div class="crate-port new">Port from py-causal / tetrad Java source</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-bayes</div>
-        <div class="crate-desc">Bayesian confidence scoring. P(H|E) updates. The quality gate backbone.</div>
-        <div class="crate-port new">Port from fetch-agi Python source</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-astra</div>
-        <div class="crate-desc">Full ASTRA OODA engine — Observe, Orient, Decide, Act. 89 endpoints. The largest port (~8K LOC).</div>
-        <div class="crate-port new">Port from astra-dev Python source</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-corpus</div>
-        <div class="crate-desc">LiveDiscoveryCorpus: harvester, 5 quality gates, pheromone-weighted batch sampler, Type 5 generator.</div>
-        <div class="crate-port new">Port from fetch-agi Python source</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-zk</div>
-        <div class="crate-desc">ZK Schnorr proofs. Full provenance chain: LLM output → ASTRA discovery → live API.</div>
-        <div class="crate-port copy">Direct copy — already pure Rust in asi-build</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-http / atlas-json</div>
-        <div class="crate-desc">HTTP client (NASA/WHO/WB APIs) via raw libc syscalls. JSON parser ported from source.</div>
-        <div class="crate-port new">Port from ureq / pjson C source</div>
-      </div>
-      <div class="crate-card">
-        <div class="crate-name">atlas-cli</div>
-        <div class="crate-desc">CLI entrypoint: <code style="font-size:10px;">atlas train</code>, <code style="font-size:10px;">atlas discover</code>, <code style="font-size:10px;">atlas eval</code>, <code style="font-size:10px;">atlas prove</code>. Clap-free arg parsing.</div>
-        <div class="crate-port new">Write from scratch</div>
-      </div>
-    </div>
-
-    <div style="display:flex;gap:16px;margin:12px 0 24px;flex-wrap:wrap;">
-      <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--c3);"><span style="width:10px;height:10px;border-radius:2px;background:var(--c3);display:inline-block;"></span>Write from scratch / new port</div>
-      <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--c2);"><span style="width:10px;height:10px;border-radius:2px;background:var(--c2);display:inline-block;"></span>Already Rust — strip bindings / direct copy</div>
-    </div>
-
-    <!-- BUILD ORDER -->
-    <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">Build Order — 7 Stages (~22 Weeks)</div>
-    <div style="border-left:2px solid rgba(232,82,10,.25);margin-bottom:24px;">
-      <div class="build-stage">
-        <div class="bs-label"><div class="bs-num">Stage 1</div><div class="bs-weeks">Weeks 1–4</div></div>
-        <div class="bs-content">
-          <div class="bs-title">Foundation</div>
-          <div class="bs-crates">atlas-core → atlas-tensor → atlas-grad → atlas-optim → atlas-quant</div>
-          <div class="bs-milestone">Milestone: <strong>f32 matmul on CPU + GPU (CUDA FFI), AdamW, backward pass through 2-layer MLP</strong></div>
-        </div>
-      </div>
-      <div class="build-stage">
-        <div class="bs-label"><div class="bs-num">Stage 2</div><div class="bs-weeks">Weeks 5–7</div></div>
-        <div class="bs-content">
-          <div class="bs-title">Model</div>
-          <div class="bs-crates">atlas-model → atlas-tokenize</div>
-          <div class="bs-milestone">Milestone: <strong>Load OLMo 3 7B weights, run forward pass, generate tokens — all in pure Rust</strong></div>
-        </div>
-      </div>
-      <div class="build-stage">
-        <div class="bs-label"><div class="bs-num">Stage 3</div><div class="bs-weeks">Weeks 8–9</div></div>
-        <div class="bs-content">
-          <div class="bs-title">Palace</div>
-          <div class="bs-crates">atlas-palace</div>
-          <div class="bs-milestone">Milestone: <strong>36-method GraphPalace native (no Python), palace search + pheromone deposit</strong></div>
-        </div>
-      </div>
-      <div class="build-stage">
-        <div class="bs-label"><div class="bs-num">Stage 4</div><div class="bs-weeks">Weeks 10–11</div></div>
-        <div class="bs-content">
-          <div class="bs-title">TRM Validator</div>
-          <div class="bs-crates">atlas-trm</div>
-          <div class="bs-milestone">Milestone: <strong>TRM-CausalValidator running — z=net(x,y,z)×6, causal graph pass/fail at &lt;10ms</strong></div>
-        </div>
-      </div>
-      <div class="build-stage">
-        <div class="bs-label"><div class="bs-num">Stage 5</div><div class="bs-weeks">Weeks 12–16</div></div>
-        <div class="bs-content">
-          <div class="bs-title">Discovery Engine</div>
-          <div class="bs-crates">atlas-http → atlas-json → atlas-bayes → atlas-causal → atlas-zk → atlas-astra</div>
-          <div class="bs-milestone">Milestone: <strong>Full ASTRA OODA in Rust — observe NASA/WHO APIs, orient, decide, act, ZK provenance</strong></div>
-        </div>
-      </div>
-      <div class="build-stage">
-        <div class="bs-label"><div class="bs-num">Stage 6</div><div class="bs-weeks">Weeks 17–20</div></div>
-        <div class="bs-content">
-          <div class="bs-title">Training Loop</div>
-          <div class="bs-crates">atlas-corpus → atlas-trm (integrated) → full backward pass + pheromone sampler</div>
-          <div class="bs-milestone">Milestone: <strong>QLoRA SFT on LiveDiscoveryCorpus, pheromone-guided batches, Type 5 traces fed back</strong></div>
-        </div>
-      </div>
-      <div class="build-stage" style="border-left:none;">
-        <div class="bs-label"><div class="bs-num">Stage 7</div><div class="bs-weeks">Weeks 21–22</div></div>
-        <div class="bs-content">
-          <div class="bs-title">ZK + CLI + Release</div>
-          <div class="bs-crates">atlas-zk (extended) → atlas-cli</div>
-          <div class="bs-milestone">Milestone: <strong>End-to-end proof chain, atlas-7b released as single static binary, benchmark suite</strong></div>
-        </div>
-      </div>
-    </div>
-
-    <!-- VALUE TABLE -->
-    <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Why Zero Dependencies Makes ATLAS More Valuable</div>
-    <div style="overflow-x:auto;">
-      <table class="prop-table">
-        <tr>
-          <th>Property</th>
-          <th>With crates.io dependencies</th>
-          <th style="color:var(--c7);">Pure Rust, Zero Deps (ATLAS v4.0)</th>
-        </tr>
-        <tr><td>Portability</td><td class="prop-bad">Breaks when deps change API</td><td class="prop-good">Compiles anywhere with rustc — forever</td></tr>
-        <tr><td>Auditability</td><td class="prop-bad">~50K LOC of transitive deps to read</td><td class="prop-good">Only atlas code — every line ours to audit</td></tr>
-        <tr><td>IP ownership</td><td class="prop-bad">Contaminated by transitive MIT/Apache-2.0</td><td class="prop-good">Clean IP — 100% VBRL Holdings</td></tr>
-        <tr><td>Deployment</td><td class="prop-bad">cargo install pulls the internet</td><td class="prop-good">Single static binary, runs fully offline</td></tr>
-        <tr><td>Security</td><td class="prop-bad">Supply chain attack surface</td><td class="prop-good">Zero supply chain — no attack surface</td></tr>
-        <tr><td>Longevity</td><td class="prop-bad">Deps abandoned → broken in 5 years</td><td class="prop-good">atlas builds in 2040 exactly as it does today</td></tr>
-        <tr><td>Moat</td><td class="prop-bad">Replicable: same pip install + same crates</td><td class="prop-good">Cannot be reproduced without porting every dependency from scratch</td></tr>
-        <tr><td>Speed</td><td class="prop-bad">Limited by what crates expose</td><td class="prop-good">Kernels tuned exactly to our tensor shapes and usage patterns</td></tr>
-      </table>
-    </div>
-
-    <div style="background:rgba(232,82,10,.06);border:1px solid rgba(232,82,10,.2);border-radius:10px;padding:16px 20px;margin-top:20px;font-size:13px;color:var(--text2);">
-      <strong style="color:var(--c7);">Already Rust, near-zero porting work:</strong> GraphPalace (strip PyO3 bindings) and ZK Schnorr proofs (direct copy from asi-build) are the two biggest components and they're already pure Rust. The two hardest original implementations are the autograd backward pass (~2K LOC) and the full ASTRA OODA port (~8K LOC Python → Rust). Everything else is table stakes.
-    </div>
-  </div>
-
-  <div class="div"></div>
-
-  <!-- ARCHITECTURE DIAGRAMS -->
-  <div class="sec">
-    <div class="sec-hdr">
-      <div class="sec-num">10</div>
-      <div>
-        <div class="sec-title">Architecture Diagrams</div>
-        <div class="sec-sub">8 publication-quality figures · 300 DPI · Graphviz DOT + Matplotlib · ready for academic papers · Fig. 8 new in v3.0</div>
-      </div>
-    </div>
-    <div class="diag-grid">
-
-      <a class="diag-card" href="diagrams/01_atlas_full_architecture.png" target="_blank">
-        <img src="diagrams/01_atlas_full_architecture.png" alt="ATLAS Full System Architecture" loading="lazy">
-        <div class="diag-meta">
-          <div class="diag-num">Fig. 1</div>
-          <div>
-            <div class="diag-title">Full System Architecture</div>
-            <div class="diag-sub">Six subsystems: Live Data Sources → ASTRA OODA → GraphPalace → LiveDiscoveryCorpus → OLMo 3 7B → ZK Layer. The complete ATLAS v2.0 stack in one view.</div>
-            <span class="diag-badge">Graphviz TB</span>
-          </div>
-        </div>
-      </a>
-
-      <a class="diag-card" href="diagrams/02_discovery_flywheel.png" target="_blank">
-        <img src="diagrams/02_discovery_flywheel.png" alt="ATLAS Discovery Flywheel" loading="lazy">
-        <div class="diag-meta">
-          <div class="diag-num">Fig. 2</div>
-          <div>
-            <div class="diag-title">Discovery Flywheel</div>
-            <div class="diag-sub">The closed self-improving loop: ASTRA discoveries → GraphPalace pheromones → LiveDiscoveryCorpus → OLMo SFT/RLVR → atlas-7b in ASTRA Orient → better hypotheses. d = 10.6, R² = 0.924, 34.4× more discoveries.</div>
-            <span class="diag-badge">Matplotlib circular</span>
-          </div>
-        </div>
-      </a>
-
-      <a class="diag-card" href="diagrams/03_astra_ooda_palace.png" target="_blank">
-        <img src="diagrams/03_astra_ooda_palace.png" alt="ASTRA OODA + GraphPalace Integration" loading="lazy">
-        <div class="diag-meta">
-          <div class="diag-num">Fig. 3</div>
-          <div>
-            <div class="diag-title">ASTRA OODA + Palace Integration</div>
-            <div class="diag-sub">How OBSERVE→ORIENT→DECIDE→ACT maps to GraphPalace methods. search_by_embedding, KG pathfinding, hot_paths, deposit_pheromones at each stage. Loop closure via atlas-7b Orient helper.</div>
-            <span class="diag-badge">Graphviz LR</span>
-          </div>
-        </div>
-      </a>
-
-      <a class="diag-card" href="diagrams/04_morphic_warm_start.png" target="_blank">
-        <img src="diagrams/04_morphic_warm_start.png" alt="Morphic Warm-Start Cross-Run Convergence" loading="lazy">
-        <div class="diag-meta">
-          <div class="diag-num">Fig. 4</div>
-          <div>
-            <div class="diag-title">Morphic Warm-Start: Cross-Run Convergence</div>
-            <div class="diag-sub">Pheromone heatmap showing cold → warm → hot palace state across 3 training runs. Convergence curves: ATLAS vs standard fine-tuning vs O(1/√T) theory bound. 70% regret reduction (189→57 steps), R²=0.982, p&lt;10⁻³⁰.</div>
-            <span class="diag-badge">Matplotlib 2-panel</span>
-          </div>
-        </div>
-      </a>
-
-      <a class="diag-card" href="diagrams/05_pheromone_reward.png" target="_blank">
-        <img src="diagrams/05_pheromone_reward.png" alt="Stigmergic RLVR Pheromone Reward Function" loading="lazy">
-        <div class="diag-meta">
-          <div class="diag-num">Fig. 5</div>
-          <div>
-            <div class="diag-title">Stigmergic RLVR — Pheromone Reward Function</div>
-            <div class="diag-sub">Signal merge diagram: r_total = α·r_v + β·r_φ. Verifiable task reward + pheromone density reward through two weighted streams. α decreases over training, β increases as palace matures. Decay curve φ(t) = φ₀·e⁻ᵗ/τ prevents reward hacking.</div>
-            <span class="diag-badge">Matplotlib signal flow</span>
-          </div>
-        </div>
-      </a>
-
-      <a class="diag-card" href="diagrams/06_zk_provenance_chain.png" target="_blank">
-        <img src="diagrams/06_zk_provenance_chain.png" alt="ZK Provenance Chain" loading="lazy">
-        <div class="diag-meta">
-          <div class="diag-num">Fig. 6</div>
-          <div>
-            <div class="diag-title">ZK Provenance Chain</div>
-            <div class="diag-sub">End-to-end verifiable LLM outputs: LLM output → Training Example → ASTRA Discovery → Causal Inference → Raw API → NASA/WHO/World Bank. Schnorr proofs π₁–π₄ at every link. Full proof anchored on Sepolia.</div>
-            <span class="diag-badge">Graphviz chain</span>
-          </div>
-        </div>
-      </a>
-
-      <a class="diag-card" href="diagrams/07_training_pipeline.png" target="_blank">
-        <img src="diagrams/07_training_pipeline.png" alt="ATLAS Training Pipeline Phase Roadmap" loading="lazy">
-        <div class="diag-meta">
-          <div class="diag-num">Fig. 7</div>
-          <div>
-            <div class="diag-title">Training Pipeline — Phase Roadmap</div>
-            <div class="diag-sub">4-phase roadmap from existing components to self-improving scientific intelligence. Phase 0 (1 week, any hardware) → Phase 1 (2–4 weeks, RTX 4090) → Phase 2 (4–8 weeks) → Phase 3 (3–6 months, RTX 4090×2 + A100). Component status legend: Already Built / To Build / Phase 3 Research.</div>
-            <span class="diag-badge">Matplotlib phase grid</span>
-          </div>
-        </div>
-      </a>
-
-    </div>
-      <a class="diag-card" href="diagrams/08_hybrid_generative_recursive.png" target="_blank">
-        <img src="diagrams/08_hybrid_generative_recursive.png" alt="Hybrid Generative-Recursive Architecture" loading="lazy">
-        <div class="diag-meta">
-          <div class="diag-num" style="color:#f97316;background:rgba(249,115,22,.12);border-color:rgba(249,115,22,.3);">Fig. 8</div>
-          <div>
-            <div class="diag-title" style="color:#f97316;">Hybrid Generative-Recursive Architecture ← v3.0</div>
-            <div class="diag-sub">atlas-7b (7B, generative) + TRM-CausalValidator (7M, recursive) operating as complementary components. Validation Router splits workload: structured causal graphs → TRM; open-ended reasoning → atlas-7b. Validated discoveries merge into GraphPalace + LiveDiscoveryCorpus. Type 5 training traces feed back into atlas-7b SFT.</div>
-            <span class="diag-badge" style="color:#f97316;background:rgba(249,115,22,.08);border-color:rgba(249,115,22,.2);">Graphviz TB · NEW v3.0</span>
-          </div>
-        </div>
-      </a>
-
-    <div style="margin-top:18px;font-size:12px;color:var(--text3);text-align:center;">
-      Click any diagram to open full resolution (300 DPI) · Suitable for journal submission
-    </div>
-  </div>
-
-  <div class="div"></div>
-
-  <div class="quote">
-    "Every other LLM is trained on what humans wrote about the world.<br>
-    atlas-7b is trained on what the system actually discovers about the world —<br>
-    real causal relationships, live API data, Bayesian-confirmed, dedup-verified, running every 10 seconds.<br>
-    Every causal claim validated recursively before it touches the training corpus.<br>
-    This is not a better fine-tuning recipe. This is a different paradigm."
-  </div>
-
-</div><!-- /wrap -->
-
-<footer class="z1">
-  <strong>ATLAS v4.0</strong> · Active-inference Training with Learned Adaptive Stigmergy + ASTRA-dev + TRM-CausalValidator + Pure Rust<br>
-  <span style="margin-top:8px;display:block;">VBRL Holdings · Robin · Kyall · 2026</span>
-  <span style="margin-top:8px;display:block;font-size:11px;">
-    <a href="/fetch-agi-dashboard/">System Dashboard</a> · 
-    Orchestrated by FETCH-AGI
-  </span>
+  <p style="margin-top:8px;font-size:0.75rem;">
+    Apache 2.0 (code) · CC BY 4.0 (docs) · Built by <a href="https://github.com/web3guru888">Robin</a> + FETCH-AGI · VBRL Holdings
+  </p>
 </footer>
 
+<!-- ════════════════════════════════════════════════════
+     SCRIPTS
+     ════════════════════════════════════════════════════ -->
 <script>
-const canvas = document.getElementById('bg');
-const ctx = canvas.getContext('2d');
-let W, H, stars = [], particles = [];
+/* ── NAV SCROLL ─────────────────────────────────────── */
+const nav = document.getElementById('nav');
+window.addEventListener('scroll', () => {
+  nav.classList.toggle('scrolled', window.scrollY > 40);
+});
 
-function init() {
-  W = canvas.width = window.innerWidth;
-  H = canvas.height = window.innerHeight;
-  stars = Array.from({length:180}, () => ({
-    x: Math.random()*W, y: Math.random()*H,
-    r: Math.random()*1.1, o: Math.random()*.5+.1,
-    dy: Math.random()*.12+.02, t: Math.random()*Math.PI*2
-  }));
-}
+/* ── PALACE VIEWER ──────────────────────────────────── */
+(function() {
+  const canvas = document.getElementById('palace-canvas');
+  const ctx = canvas.getContext('2d');
+  const tooltip = document.getElementById('palace-tooltip');
+  const ttName = document.getElementById('tt-name');
+  const ttDesc = document.getElementById('tt-desc');
 
-function spawn() {
-  // pheromone particles (green) + discovery sparks (red)
-  const isDisc = Math.random() < 0.35;
-  particles.push({
-    x: isDisc ? Math.random()*W : W*.3 + Math.random()*W*.4,
-    y: H + 10,
-    vx: (Math.random()-.5)*.8,
-    vy: -(Math.random()*1.8+.4),
-    life: 1,
-    r: Math.random()*2+.8,
-    type: isDisc ? 'disc' : 'phero'
+  // Crate definitions: [name, category, description, tests]
+  const NODES = [
+    // Foundation
+    { id:'core',     cat:'foundation', label:'atlas-core',     desc:'Error types, traits, config',            tests:'root' },
+    { id:'tensor',   cat:'foundation', label:'atlas-tensor',   desc:'f32 Tensor + CUDA FFI (T4 sm_75)',       tests:'T4 GPU' },
+    { id:'grad',     cat:'foundation', label:'atlas-grad',     desc:'Autograd tape, VJPs, backward()',        tests:'stage 1' },
+    { id:'optim',    cat:'foundation', label:'atlas-optim',    desc:'AdamW, CosineScheduler, grad clip',      tests:'loss 0.038' },
+    { id:'quant',    cat:'foundation', label:'atlas-quant',    desc:'INT4/INT8, QLoRA, LoRA adapters',        tests:'7.1× comp.' },
+    // Model
+    { id:'model',    cat:'model',      label:'atlas-model',    desc:'RMSNorm, RoPE, SwiGLU, GQA',            tests:'1.24B params' },
+    { id:'tokenize', cat:'model',      label:'atlas-tokenize', desc:'GPT-2 BPE tokenizer',                   tests:'roundtrip' },
+    // Memory
+    { id:'palace',   cat:'memory',     label:'atlas-palace',   desc:'5-type pheromones, A*, HNSW, AI agents', tests:'304K/s' },
+    { id:'mcp',      cat:'memory',     label:'atlas-mcp',      desc:'MCP server, 28 tools, JSON-RPC 2.0',    tests:'28 tools' },
+    // Validator
+    { id:'trm',      cat:'validator',  label:'atlas-trm',      desc:'TRM z=net(x,y,z)×6, 7M params',        tests:'<10ms' },
+    { id:'causal',   cat:'validator',  label:'atlas-causal',   desc:'PC/FCI, Fisher-Z, Granger',             tests:'pure Rust' },
+    { id:'bayes',    cat:'validator',  label:'atlas-bayes',    desc:'BetaPrior, BayesNet, BIC',              tests:'BIC compare' },
+    // Discovery
+    { id:'astra',    cat:'discovery',  label:'atlas-astra',    desc:'OODA ~8K LOC, NASA/WHO/ArXiv',          tests:'~10s/cycle' },
+    { id:'corpus',   cat:'discovery',  label:'atlas-corpus',   desc:'LiveDiscoveryCorpus, 5 gates, SFT',     tests:'9.7K/s' },
+    { id:'http',     cat:'discovery',  label:'atlas-http',     desc:'HTTP/1.1 via libc syscalls, TLS',       tests:'no reqwest' },
+    { id:'json',     cat:'discovery',  label:'atlas-json',     desc:'Recursive-descent JSON, zero-copy',     tests:'no serde' },
+    // Security
+    { id:'zk',       cat:'security',   label:'atlas-zk',       desc:'Schnorr + Groth16, ProvenanceChain',   tests:'ZK proof' },
+    { id:'safety',   cat:'security',   label:'atlas-safety',   desc:'5-state FSM, CircuitBreaker, audit',    tests:'11 tests' },
+    { id:'bridge',   cat:'security',   label:'atlas-bridge',   desc:'Rings↔ETH ZK bridge, Sepolia',         tests:'Sepolia' },
+    // Interface
+    { id:'cli',      cat:'interface',  label:'atlas-cli',      desc:'Full pipeline: discover train eval …',  tests:'383 tests' },
+  ];
+
+  const CAT_COLORS = {
+    foundation: '#f59e0b',
+    model:      '#a78bfa',
+    memory:     '#00e5ff',
+    validator:  '#34d399',
+    discovery:  '#f87171',
+    security:   '#c084fc',
+    interface:  '#6b7280',
+  };
+
+  // Edges: [source, target]
+  const EDGES = [
+    // core is dependency of everything
+    ['core','tensor'],['core','grad'],['core','optim'],['core','quant'],
+    ['core','model'],['core','tokenize'],['core','palace'],['core','mcp'],
+    ['core','trm'],['core','causal'],['core','bayes'],
+    ['core','astra'],['core','corpus'],['core','http'],['core','json'],
+    ['core','zk'],['core','safety'],['core','bridge'],['core','cli'],
+    // foundation chain
+    ['tensor','grad'],['grad','optim'],['optim','quant'],['quant','model'],
+    ['model','tokenize'],
+    // palace + mcp
+    ['palace','mcp'],
+    // validator chain
+    ['bayes','causal'],['causal','trm'],
+    // discovery chain
+    ['http','json'],['json','astra'],['astra','corpus'],
+    // security chain
+    ['zk','bridge'],['zk','safety'],
+    // corpus uses palace + bayes
+    ['palace','corpus'],['bayes','corpus'],['trm','corpus'],
+    // astra uses http, json, bayes, causal
+    ['bayes','astra'],['causal','astra'],
+    // cli uses everything
+    ['model','cli'],['palace','cli'],['corpus','cli'],['zk','cli'],['safety','cli'],['bridge','cli'],
+  ];
+
+  // Physics state
+  let nodes = [], W, H;
+  let dragging = null, dragOffX = 0, dragOffY = 0;
+  let orbitMode = false, orbitAngle = 0;
+  let pulseActive = false, pulseTime = 0;
+  let animFrame;
+
+  function initNodes() {
+    W = canvas.width = canvas.offsetWidth;
+    H = canvas.height = canvas.offsetHeight;
+
+    // Radial layout by category
+    const catAngles = {
+      foundation: -Math.PI/2 - 0.3,
+      model:      -Math.PI/2 + 1.2,
+      memory:     0,
+      validator:  Math.PI/2 - 0.4,
+      discovery:  Math.PI,
+      security:   Math.PI + 0.8,
+      interface:  Math.PI * 1.7,
+    };
+    const catRadius = {
+      foundation: 0.28,
+      model:      0.22,
+      memory:     0.28,
+      validator:  0.22,
+      discovery:  0.28,
+      security:   0.22,
+      interface:  0.12,
+    };
+    const catCounts = {};
+    NODES.forEach(n => { catCounts[n.cat] = (catCounts[n.cat]||0); });
+    const catIdx = {};
+    NODES.forEach(n => { catIdx[n.cat] = 0; });
+
+    nodes = NODES.map((n, i) => {
+      const angle = catAngles[n.cat] + catIdx[n.cat] * 0.55;
+      const r = Math.min(W,H) * catRadius[n.cat];
+      catIdx[n.cat]++;
+      return {
+        ...n,
+        x: W/2 + r * Math.cos(angle) + (Math.random()-0.5)*30,
+        y: H/2 + r * Math.sin(angle) + (Math.random()-0.5)*30,
+        vx: 0, vy: 0,
+        r: n.id === 'core' ? 24 : n.id === 'cli' ? 20 : 15,
+        glow: 0,
+      };
+    });
+  }
+
+  function getNode(id) { return nodes.find(n => n.id === id); }
+
+  function applyForces() {
+    const k = 0.012, repel = 4200, damping = 0.82;
+    nodes.forEach(a => {
+      // Repulsion
+      nodes.forEach(b => {
+        if (a === b) return;
+        const dx = a.x - b.x, dy = a.y - b.y;
+        const dist = Math.max(Math.sqrt(dx*dx+dy*dy), 0.1);
+        const f = repel / (dist*dist);
+        a.vx += (dx/dist)*f;
+        a.vy += (dy/dist)*f;
+      });
+      // Pull to centre weakly
+      a.vx += (W/2 - a.x) * 0.003;
+      a.vy += (H/2 - a.y) * 0.003;
+    });
+    // Edge springs
+    EDGES.forEach(([aid,bid]) => {
+      const a = getNode(aid), b = getNode(bid);
+      if (!a || !b) return;
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.max(Math.sqrt(dx*dx+dy*dy), 0.1);
+      const target = 110;
+      const f = k * (dist - target);
+      a.vx += (dx/dist)*f; a.vy += (dy/dist)*f;
+      b.vx -= (dx/dist)*f; b.vy -= (dy/dist)*f;
+    });
+    nodes.forEach(n => {
+      if (n === dragging) return;
+      n.vx *= damping; n.vy *= damping;
+      n.x += n.vx; n.y += n.vy;
+      // Boundary
+      const pad = n.r + 8;
+      n.x = Math.max(pad, Math.min(W-pad, n.x));
+      n.y = Math.max(pad, Math.min(H-pad, n.y));
+    });
+  }
+
+  function draw(t) {
+    ctx.clearRect(0, 0, W, H);
+
+    // Background grid (subtle)
+    ctx.strokeStyle = 'rgba(245,158,11,0.03)';
+    ctx.lineWidth = 1;
+    for (let x = 0; x < W; x += 60) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+    for (let y = 0; y < H; y += 60) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+
+    // Orbit mode
+    if (orbitMode) {
+      orbitAngle += 0.004;
+      nodes.forEach((n, i) => {
+        if (n.id === 'core') return;
+        const baseAngle = (i / nodes.length) * Math.PI * 2 + orbitAngle;
+        const r = 180 + (i % 3) * 60;
+        n.x += (W/2 + r*Math.cos(baseAngle) - n.x) * 0.02;
+        n.y += (H/2 + r*Math.sin(baseAngle) - n.y) * 0.02;
+      });
+    }
+
+    // Pulse
+    if (pulseActive) {
+      pulseTime += 0.04;
+      nodes.forEach((n, i) => { n.glow = 0.4 + 0.6*Math.sin(pulseTime + i*0.5); });
+      if (pulseTime > Math.PI * 6) { pulseActive = false; nodes.forEach(n => n.glow = 0); }
+    }
+
+    // Draw edges
+    EDGES.forEach(([aid,bid]) => {
+      const a = getNode(aid), b = getNode(bid);
+      if (!a||!b) return;
+      const isPheromone = (bid === 'corpus' || bid === 'palace' || aid === 'palace');
+      const alpha = isPheromone ? 0.35 : 0.12;
+      const grad = ctx.createLinearGradient(a.x, a.y, b.x, b.y);
+      grad.addColorStop(0, CAT_COLORS[a.cat] + '44');
+      grad.addColorStop(1, CAT_COLORS[b.cat] + '22');
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = isPheromone ? 1.8 : 0.9;
+      ctx.setLineDash(isPheromone ? [] : [4,4]);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Animated dot along pheromone edges
+      if (isPheromone) {
+        const progress = (t * 0.0006 + EDGES.indexOf([aid,bid]) * 0.3) % 1;
+        const px = a.x + (b.x-a.x)*((t*0.0004)%1);
+        const py = a.y + (b.y-a.y)*((t*0.0004)%1);
+        ctx.beginPath();
+        ctx.arc(px, py, 2.5, 0, Math.PI*2);
+        ctx.fillStyle = CAT_COLORS[a.cat] + 'cc';
+        ctx.fill();
+      }
+    });
+
+    // Draw nodes
+    nodes.forEach(n => {
+      const c = CAT_COLORS[n.cat];
+      const glowR = n.r + 12 + n.glow*8;
+
+      // Glow
+      const grd = ctx.createRadialGradient(n.x, n.y, n.r*0.2, n.x, n.y, glowR);
+      grd.addColorStop(0, c + '55');
+      grd.addColorStop(1, c + '00');
+      ctx.beginPath(); ctx.arc(n.x, n.y, glowR, 0, Math.PI*2);
+      ctx.fillStyle = grd; ctx.fill();
+
+      // Node circle
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r, 0, Math.PI*2);
+      ctx.fillStyle = '#0a0a0f';
+      ctx.fill();
+      ctx.strokeStyle = c;
+      ctx.lineWidth = n.id === 'core' ? 2.5 : 1.5;
+      ctx.stroke();
+
+      // Inner dot
+      ctx.beginPath(); ctx.arc(n.x, n.y, n.r*0.35, 0, Math.PI*2);
+      ctx.fillStyle = c + 'aa'; ctx.fill();
+
+      // Label
+      ctx.fillStyle = n.id === 'core' ? c : '#d4d4e0';
+      ctx.font = n.id === 'core' ? `bold 10px "IBM Plex Mono"` : `9px "IBM Plex Mono"`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const shortName = n.label.replace('atlas-','');
+      ctx.fillText(shortName, n.x, n.y + n.r + 12);
+    });
+
+    applyForces();
+    animFrame = requestAnimationFrame(draw);
+  }
+
+  function resize() {
+    const wasW = W, wasH = H;
+    W = canvas.width = canvas.offsetWidth;
+    H = canvas.height = canvas.offsetHeight;
+    if (nodes.length) {
+      // Scale positions
+      nodes.forEach(n => { n.x = n.x / wasW * W; n.y = n.y / wasH * H; });
+    }
+  }
+
+  // Mouse interactions
+  canvas.addEventListener('mousemove', e => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+
+    if (dragging) { dragging.x = mx + dragOffX; dragging.y = my + dragOffY; return; }
+
+    let hovered = null;
+    for (const n of nodes) {
+      if (Math.hypot(n.x-mx, n.y-my) < n.r+6) { hovered = n; break; }
+    }
+
+    if (hovered) {
+      canvas.style.cursor = 'pointer';
+      tooltip.style.display = 'block';
+      tooltip.style.left = (mx + 12) + 'px';
+      tooltip.style.top = (my - 10) + 'px';
+      ttName.style.color = CAT_COLORS[hovered.cat];
+      ttName.textContent = hovered.label;
+      ttDesc.textContent = hovered.desc + ' · ' + hovered.tests;
+    } else {
+      canvas.style.cursor = 'grab';
+      tooltip.style.display = 'none';
+    }
   });
-}
 
-function frame() {
-  ctx.clearRect(0,0,W,H);
-
-  // stars
-  stars.forEach(s => {
-    s.t += .018; s.y -= s.dy;
-    if (s.y < -2) { s.y = H+2; s.x = Math.random()*W; }
-    const o = s.o * (.7 + .3*Math.sin(s.t));
-    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
-    ctx.fillStyle = `rgba(255,255,255,${o})`; ctx.fill();
+  canvas.addEventListener('mousedown', e => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    for (const n of nodes) {
+      if (Math.hypot(n.x-mx, n.y-my) < n.r+6) {
+        dragging = n; dragOffX = n.x-mx; dragOffY = n.y-my;
+        n.vx = 0; n.vy = 0; break;
+      }
+    }
   });
 
-  // particles
-  if (Math.random() < .4) spawn();
-  particles = particles.filter(p => p.life > 0);
-  particles.forEach(p => {
-    p.x += p.vx; p.y += p.vy; p.life -= .007;
-    const a = p.life * .35;
-    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
-    ctx.fillStyle = p.type === 'disc'
-      ? `rgba(239,68,68,${a})`
-      : `rgba(16,185,129,${a})`;
-    ctx.fill();
+  canvas.addEventListener('mouseup', () => { dragging = null; });
+  canvas.addEventListener('mouseleave', () => { dragging = null; tooltip.style.display = 'none'; });
+
+  // Controls
+  document.getElementById('btn-reset').addEventListener('click', () => {
+    orbitMode = false; pulseActive = false;
+    initNodes();
+  });
+  document.getElementById('btn-pulse').addEventListener('click', () => {
+    pulseActive = true; pulseTime = 0;
+  });
+  document.getElementById('btn-orbit').addEventListener('click', () => {
+    orbitMode = !orbitMode;
+    document.getElementById('btn-orbit').style.color = orbitMode ? 'var(--orichalcum)' : '';
   });
 
-  requestAnimationFrame(frame);
-}
+  window.addEventListener('resize', resize);
+  initNodes();
+  requestAnimationFrame(draw);
+})();
 
-init(); frame();
-window.addEventListener('resize', init);
+/* ── FLYWHEEL SVG ANIMATION ─────────────────────────── */
+(function() {
+  const svg = document.getElementById('flywheel-svg');
+  if (!svg) return;
+
+  const cx = 200, cy = 190, r = 130;
+  const steps = [
+    { label: 'Cold Spots', color: '#00e5ff', angle: -90 },
+    { label: 'Live APIs', color: '#f59e0b', angle: -30 },
+    { label: 'TRM Gate', color: '#34d399', angle: 30 },
+    { label: 'ZK Proof', color: '#c084fc', angle: 90 },
+    { label: 'Pheromone', color: '#f87171', angle: 150 },
+    { label: 'SFT Train', color: '#a78bfa', angle: 210 },
+  ];
+
+  // Draw circular arrows between nodes
+  let svgHTML = `<defs>
+    <filter id="glow-f"><feGaussianBlur stdDeviation="3" result="blur"/>
+    <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>`;
+
+  // Circular arc background
+  svgHTML += `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="rgba(245,158,11,0.08)" stroke-width="1"/>`;
+  svgHTML += `<circle cx="${cx}" cy="${cy}" r="${r-30}" fill="none" stroke="rgba(245,158,11,0.04)" stroke-width="1"/>`;
+
+  // ATLAS text in centre
+  svgHTML += `<text x="${cx}" y="${cy-10}" text-anchor="middle" font-family="Instrument Serif" font-size="24" fill="#f59e0b">ATLAS</text>`;
+  svgHTML += `<text x="${cx}" y="${cy+12}" text-anchor="middle" font-family="IBM Plex Mono" font-size="8" fill="#6b7280">DISCOVERY FLYWHEEL</text>`;
+
+  // Nodes + arcs
+  steps.forEach((s, i) => {
+    const rad = (s.angle - 90) * Math.PI / 180;
+    const nx = cx + r * Math.cos(rad);
+    const ny = cy + r * Math.sin(rad);
+
+    // Arc to next
+    const next = steps[(i+1)%steps.length];
+    const nrad = (next.angle - 90) * Math.PI / 180;
+    const nnx = cx + r * Math.cos(nrad);
+    const nny = cy + r * Math.sin(nrad);
+
+    const sweep = 1;
+    svgHTML += `<path d="M ${nx} ${ny} A ${r} ${r} 0 0 ${sweep} ${nnx} ${nny}" fill="none" stroke="${s.color}" stroke-width="1.5" stroke-opacity="0.35" stroke-dasharray="4,4"/>`;
+
+    // Node circle
+    svgHTML += `<circle cx="${nx}" cy="${ny}" r="22" fill="#0a0a0f" stroke="${s.color}" stroke-width="1.5" filter="url(#glow-f)"/>`;
+    svgHTML += `<circle cx="${nx}" cy="${ny}" r="7" fill="${s.color}" opacity="0.7"/>`;
+
+    // Label
+    const labelR = r + 28;
+    const lx = cx + labelR * Math.cos(rad);
+    const ly = cy + labelR * Math.sin(rad);
+    svgHTML += `<text x="${lx}" y="${ly}" text-anchor="middle" dominant-baseline="middle" font-family="IBM Plex Mono" font-size="8.5" fill="${s.color}">${s.label}</text>`;
+
+    // Animated dot
+    const animId = `fw-anim-${i}`;
+    const animDelay = (i / steps.length * 3).toFixed(1);
+    svgHTML += `<circle r="3" fill="${s.color}" opacity="0.8">
+      <animateMotion dur="3s" begin="${animDelay}s" repeatCount="indefinite" rotate="auto">
+        <mpath href="#fw-path-${i}"/>
+      </animateMotion>
+    </circle>`;
+
+    // Named path for animation
+    const nextRad = (next.angle - 90) * Math.PI / 180;
+    const nnx2 = cx + r * Math.cos(nextRad);
+    const nny2 = cy + r * Math.sin(nextRad);
+    svgHTML += `<path id="fw-path-${i}" d="M ${nx} ${ny} A ${r} ${r} 0 0 1 ${nnx2} ${nny2}" fill="none" visibility="hidden"/>`;
+  });
+
+  svg.innerHTML = svgHTML;
+})();
 </script>
 </body>
 </html>
