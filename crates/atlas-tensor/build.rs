@@ -17,6 +17,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    // Declare custom cfg flags so rustc's check-cfg lint doesn't warn
+    println!("cargo::rustc-check-cfg=cfg(atlas_cuda)");
+    println!("cargo::rustc-check-cfg=cfg(atlas_cpu_only)");
+
     // Emit rerun triggers
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=ATLAS_CUDA_ARCH");
