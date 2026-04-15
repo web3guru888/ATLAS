@@ -88,8 +88,21 @@ fn main() {
 
     // Tell cargo where to find it
     println!("cargo:rustc-link-search=native={}", out_dir.display());
+    // Also add CUDA lib directories so the linker can find libcudart
+    for dir in &[
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda-12.9/lib64",
+        "/usr/local/cuda-12.8/lib64",
+        "/usr/local/cuda-12.6/lib64",
+        "/usr/local/cuda-12.0/lib64",
+        "/usr/local/cuda-11.8/lib64",
+    ] {
+        if std::path::Path::new(dir).exists() {
+            println!("cargo:rustc-link-search=native={dir}");
+        }
+    }
     println!("cargo:rustc-link-lib=static=atlas_kernels");
-    println!("cargo:rustc-link-lib=cuda");
+    println!("cargo:rustc-link-lib=cudart");  // CUDA runtime (malloc/free/memcpy/sync/kernels)
     println!("cargo:rustc-cfg=atlas_cuda");
     eprintln!("[atlas-tensor/build.rs] CUDA kernels compiled OK ({arch})");
 }
