@@ -169,6 +169,7 @@ impl Tensor {
     }
 
     /// Upload to GPU. Returns self if CUDA not available (silently stays CPU).
+    #[allow(unused_mut)]
     pub fn to_cuda(mut self) -> Self {
         #[cfg(atlas_cuda)]
         {
@@ -183,6 +184,7 @@ impl Tensor {
     }
 
     /// Sync GPU→CPU (no-op if already on CPU).
+    #[allow(unused_mut)]
     pub fn to_cpu(mut self) -> Self {
         #[cfg(atlas_cuda)]
         {

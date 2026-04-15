@@ -281,7 +281,7 @@ void atlas_dequantize_int8(
     const int8_t* input, const float* scale, float* output,
     int n_rows, int n_cols
 ) {
-    dequantize_int8_kernel<<<n_rows, 32>>>(input, output, scale, n_rows, n_cols);
+    dequantize_int8_kernel<<<n_rows, 32>>>(input, scale, output, n_rows, n_cols);
     cudaDeviceSynchronize();
 }
 
