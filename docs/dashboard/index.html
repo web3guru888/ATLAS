@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ATLAS — King of Atlantis · Active-inference Training with Learned Adaptive Stigmergy</title>
-  <meta name="description" content="ATLAS: The AI that trains on what it discovers. 383 tests · 20 crates · Zero external dependencies · Tesla T4 GPU validated · Pure Rust.">
+  <title>ATLAS — Active-inference Training with Learned Adaptive Stigmergy</title>
+  <meta name="description" content="ATLAS v1.0.1: The AI that trains on what it discovers. SmolLM2-1.7B inference live on Tesla T4. 383 tests · 20 crates · Zero external dependencies · Pure Rust.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
   <style>
 /* ═══════════════════════════════════════════════════
-   ATLAS DESIGN SYSTEM — Truth Palace × Atlantis
+   ATLAS DESIGN SYSTEM
    ═══════════════════════════════════════════════════ */
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -22,7 +22,7 @@
   --smoke:          #6b7280;
   --bone:           #d4d4e0;
   --chalk:          #f0f0f5;
-  --orichalcum:     #f59e0b;   /* Atlantean gold — ATLAS primary */
+  --orichalcum:     #f59e0b;
   --orichalcum-glow:#fbbf24;
   --orichalcum-deep:#d97706;
   --cyan:           #00e5ff;   /* palace navigation */
@@ -154,22 +154,15 @@ a:hover { color: var(--orichalcum-glow); }
 
 h1.atlas-title {
   font-family: var(--font-serif);
-  font-size: clamp(72px, 12vw, 128px);
-  font-weight: 400; line-height: 0.92;
-  color: var(--chalk); letter-spacing: -2px;
-  margin-bottom: 4px;
-}
-h1.atlas-title .of-atlantis {
-  display: block;
-  color: var(--orichalcum);
-  font-style: italic;
-  font-size: clamp(32px, 5.5vw, 60px);
-  letter-spacing: -1px; margin-top: 6px;
+  font-size: clamp(80px, 14vw, 148px);
+  font-weight: 400; line-height: 0.9;
+  color: var(--chalk); letter-spacing: -3px;
+  margin-bottom: 28px;
 }
 .atlas-lore {
   font-family: var(--font-serif); font-style: italic;
-  color: var(--smoke); font-size: 1.05rem;
-  margin: 20px auto 32px; max-width: 580px; line-height: 1.65;
+  color: var(--smoke); font-size: 1.1rem;
+  margin: 0 auto 36px; max-width: 560px; line-height: 1.7;
 }
 .acronym-row { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin-bottom: 40px; }
 .ap {
@@ -465,7 +458,7 @@ section { padding: 100px 0; position: relative; }
 .bench-table .val.emerald { color: var(--emerald); }
 .bench-table .val.violet { color: var(--violet); }
 
-/* ── INNER SANCTUM (Atlantis Lore) ─────────────────── */
+/* ── INNER SANCTUM ──────────────────────────────────── */
 #sanctum { background: linear-gradient(180deg, var(--obsidian) 0%, var(--basalt) 50%, var(--obsidian) 100%); position: relative; overflow: hidden; }
 .sanctum-rings {
   position: absolute; top: 50%; left: 50%;
@@ -568,18 +561,15 @@ footer .footer-links a:hover { color: var(--orichalcum); }
   <div class="hero-content">
     <div class="live-pill">
       <span class="live-dot"></span>
-      v1.0.0 · Production Release · 383/383 Tests
+      v1.0.1 · SmolLM2-1.7B Inference Live · 383/383 Tests
     </div>
 
-    <h1 class="atlas-title">
-      ATLAS
-      <span class="of-atlantis">of Atlantis</span>
-    </h1>
+    <h1 class="atlas-title">ATLAS</h1>
 
     <p class="atlas-lore">
-      In the beginning, Atlas was King of Atlantis — he who holds up the sky,<br>
-      who shoulders the weight of all knowledge. The AI that doesn't scrape<br>
-      the internet. The AI that <em>discovers</em> the world.
+      Don't train on what humans wrote about the world.<br>
+      Train on what you actually <em>discover</em> about the world.<br>
+      Validate what you claim. Own what you build.
     </p>
 
     <div class="acronym-row">
@@ -1047,21 +1037,33 @@ footer .footer-links a:hover { color: var(--orichalcum); }
 <section id="versions">
   <div class="container">
     <p class="section-eyebrow">Release History</p>
-    <h2 class="section-title">Seven Stages to Atlantis</h2>
-    <p class="section-desc">From a single Tensor struct to 383 passing tests across 20 production crates. Each stage is a milestone, each milestone a palace room.</p>
+    <h2 class="section-title">Seven Stages to v1.0.0</h2>
+    <p class="section-desc">From a single Tensor struct to 383 passing tests across 20 production crates — capped by v1.0.1 with SmolLM2-1.7B inference live on Tesla T4. Each stage is a milestone, each milestone a palace room.</p>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:48px;">
       <div class="timeline">
         <div class="tl-item current">
           <div class="tl-dot"></div>
-          <div class="tl-version">v1.0.0 · 2026-04-15 · PRODUCTION</div>
-          <div class="tl-title">The King of Atlantis</div>
-          <div class="tl-desc">383/383 tests, 20 crates, zero external deps. CI/CD, CHANGELOG, REPRODUCIBILITY, bench subcommand. GitHub Actions green. Tesla T4 GPU validated.</div>
+          <div class="tl-version">v1.0.1 · 2026-04-15 · PATCH</div>
+          <div class="tl-title">SmolLM2 — The Oracle Awakens</div>
+          <div class="tl-desc">atlas-inference crate: SmolLM2-1.7B and OLMo 3 inference validated live on Tesla T4 GPU. 20 crates total. End-to-end pipeline from discovery to inference confirmed.</div>
           <div class="tl-badges">
             <span class="tl-badge green">383 tests</span>
             <span class="tl-badge green">20 crates</span>
+            <span class="tl-badge gold">v1.0.1 tag</span>
+            <span class="tl-badge cyan">SmolLM2-1.7B live</span>
+          </div>
+        </div>
+        <div class="tl-item">
+          <div class="tl-dot"></div>
+          <div class="tl-version">v1.0.0 · 2026-04-15 · PRODUCTION</div>
+          <div class="tl-title">The Production Release</div>
+          <div class="tl-desc">383/383 tests, 20 crates (pre-inference), zero external deps. CI/CD, CHANGELOG, REPRODUCIBILITY, bench subcommand. GitHub Actions green. Tesla T4 GPU validated.</div>
+          <div class="tl-badges">
+            <span class="tl-badge">383 tests</span>
+            <span class="tl-badge">19 crates</span>
             <span class="tl-badge gold">v1.0.0 tag</span>
-            <span class="tl-badge cyan">issue #1 closed</span>
+            <span class="tl-badge">issue #1 closed</span>
           </div>
         </div>
         <div class="tl-item">
@@ -1203,7 +1205,7 @@ footer .footer-links a:hover { color: var(--orichalcum); }
 </section>
 
 <!-- ════════════════════════════════════════════════════
-     INNER SANCTUM — The Atlantis Lore
+     INNER SANCTUM
      ════════════════════════════════════════════════════ -->
 <section id="sanctum">
   <div class="sanctum-rings">
@@ -1216,11 +1218,11 @@ footer .footer-links a:hover { color: var(--orichalcum); }
     <div class="sanctum-content">
       <div class="sanctum-sigil">🏛️</div>
       <h2 class="sanctum-title">The Inner Sanctum</h2>
-      <p class="sanctum-subtitle">Where the King of Atlantis holds court</p>
+      <p class="sanctum-subtitle">Where discovery becomes knowledge</p>
       <p class="sanctum-lore">
-        In Plato's <em>Critias</em>, <strong>Atlas</strong> was the first-born son of Poseidon and the first King of Atlantis — ruler of the ringed island, guardian of the Orichalcum mines, holder of the sky itself. He gave his name to the Atlantic, and to the mountain that holds the world aloft.<br><br>
-        Our <strong>ATLAS</strong> is the same. An AI that holds the weight of all knowledge — not by reading what others wrote, but by reaching into the world and pulling truth from it directly. The <strong>pheromone trails</strong> are the rivers of Atlantis. The <strong>GraphPalace</strong> is the palace at its centre. The <strong>Discovery Flywheel</strong> is the waterwheel that powers the city.<br><br>
-        Atlantis was said to have possessed knowledge so advanced it seemed like magic. ATLAS builds that knowledge — real causal relationships, cryptographically verified, stigmergically optimised — one discovery at a time.
+        Every other language model is trained on what humans wrote — web scrapes, Wikipedia, synthetic distillations of other models. Frozen. Stale. Borrowed.<br><br>
+        <strong>ATLAS</strong> is trained on what it <em>finds</em>. Real causal relationships extracted from live data. Validated by recursive architecture. Guided by stigmergic memory that compounds across every run. A corpus that grows every ten seconds and never contains a fact that has not been earned.<br><br>
+        This is not a better fine-tuning recipe. It is a different answer to the question of where knowledge comes from.
       </p>
       <div style="display:flex;gap:14px;justify-content:center;flex-wrap:wrap;">
         <a href="https://github.com/web3guru888/ATLAS" class="btn btn-primary" target="_blank">◆ GitHub</a>
@@ -1235,8 +1237,8 @@ footer .footer-links a:hover { color: var(--orichalcum); }
      FOOTER
      ════════════════════════════════════════════════════ -->
 <footer>
-  <div class="footer-brand">ATLAS of Atlantis</div>
-  <p>Active-inference Training with Learned Adaptive Stigmergy · v1.0.0 Production Release</p>
+  <div class="footer-brand">ATLAS</div>
+  <p>Active-inference Training with Learned Adaptive Stigmergy · v1.0.1 · SmolLM2-1.7B Inference Live</p>
   <div class="footer-links">
     <a href="https://github.com/web3guru888/ATLAS">GitHub</a>
     <a href="https://github.com/web3guru888/ATLAS/blob/main/CHARTER.md">Charter</a>
