@@ -10,6 +10,9 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
+[![Stage 1](https://img.shields.io/badge/Stage%201-COMPLETE%20✓-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-31%2F31%20passing-brightgreen.svg)](#status)
+[![CUDA](https://img.shields.io/badge/CUDA-sm__75%20T4-76b900.svg)](#status)
 
 ---
 
@@ -175,11 +178,12 @@ cargo test -p atlas-core -p atlas-tensor -p atlas-grad
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| atlas-core | ✅ Stage 0 | Error types, traits, config |
-| atlas-tensor | ✅ Stage 0 | CPU matmul, softmax, transpose; CUDA FFI stub |
-| atlas-grad | ✅ Stage 0 | Tape, matmul/relu backward |
-| atlas-optim | ⬜ Stage 1 | AdamW — to implement |
-| atlas-quant | ⬜ Stage 1 | INT4/INT8 — to implement |
+| atlas-core | ✅ Stage 1 | Error types, traits, config — 2/2 tests ✅ |
+| atlas-tensor | ✅ Stage 1 | CPU+GPU matmul, softmax, transpose, GpuBuf — 6/6 tests ✅ |
+| atlas-grad | ✅ Stage 1 | GradTape, matmul/relu backward — 9/9 tests ✅ |
+| atlas-optim | ✅ Stage 1 | AdamW + CosineScheduler — 6/6 tests ✅ |
+| atlas-quant | ✅ Stage 1 | INT8, INT4, QLoRA LoraAdapter — 7/7 tests ✅ |
+| CUDA kernels | ✅ Stage 1 | tiled GEMM sm_75, AdamW, INT8, INT4 — **compiled on Tesla T4** ✅ |
 | atlas-model | ⬜ Stage 2 | OLMo 3 transformer — to implement |
 | atlas-tokenize | ⬜ Stage 2 | BPE tokenizer port — to implement |
 | atlas-palace | ⬜ Stage 3 | GraphPalace Rust crates — strip PyO3 |
@@ -192,7 +196,6 @@ cargo test -p atlas-core -p atlas-tensor -p atlas-grad
 | atlas-http | ⬜ Stage 5 | HTTP via libc — implement |
 | atlas-json | ⬜ Stage 5 | JSON parser — port |
 | atlas-cli | ⬜ Stage 7 | CLI — implement |
-| CUDA kernels | ⬜ Stage 1 | matmul.cu tiled GEMM, attention.cu, quant.cu |
 
 ---
 
