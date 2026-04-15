@@ -10,5 +10,4 @@ repository.workspace = true
 [dependencies]
 atlas-core     = { path = "../atlas-core" }
 atlas-tensor   = { path = "../atlas-tensor" }
-atlas-grad     = { path = "../atlas-grad" }
-atlas-quant    = { path = "../atlas-quant" }
+atlas-json     = { path = "../atlas-json" }
