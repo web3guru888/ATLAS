@@ -11,6 +11,7 @@
 //! - `atlas prove`     — ZK Schnorr provenance proof (Stage 5)
 //! - `atlas palace`    — GraphPalace inspection (Stage 3)
 //! - `atlas status`    — System-wide health check
+//! - `atlas bench`     — End-to-end benchmark suite (palace/training/gates throughput)
 //!
 //! # Zero-dependency arg parsing: no clap, no structopt.
 
@@ -37,6 +38,7 @@ fn main() {
         "prove"     => cmd_prove(&args[2..]),
         "palace"    => cmd_palace(&args[2..]),
         "status"    => cmd_status(&args[2..]),
+        "bench"     => cmd_bench(&args[2..]),
         "--version" | "-V" => { println!("atlas {}", env!("CARGO_PKG_VERSION")); 0 }
         "--help" | "-h" => { print_usage(); 0 }
         cmd => {
@@ -98,6 +100,10 @@ COMMANDS:
 
     status      System health check: all crates, env, files
 
+    bench       End-to-end benchmark suite
+                  Palace insertions/A* queries, SFT training throughput,
+                  quality gate throughput. Prints ops/s for each component.
+
 OPTIONS:
     -h, --help     Print help
     -V, --version  Print version
@@ -110,7 +116,7 @@ ARCHITECTURE:
     Stage 4: atlas-trm (TRM-CausalValidator, depth-6 RNN, Bayesian)
     Stage 5: atlas-http, atlas-bayes, atlas-causal, atlas-zk, atlas-astra
     Stage 6: atlas-corpus (LiveDiscoveryCorpus, 5 quality gates, curriculum)
-    Stage 7: atlas-cli (this binary)
+    Stage 7: atlas-cli (this binary), bench suite
 
 LICENSE:
     Code: Apache 2.0 (LICENSE-CODE) · Docs: CC BY 4.0 (LICENSE)
@@ -631,6 +637,97 @@ const CRATE_TABLE: &[(&str, &str, &str)] = &[
     ("6", "atlas-corpus",   "LiveDiscoveryCorpus, 5 gates, curriculum"),
     ("7", "atlas-cli",      "this binary"),
 ];
+
+// ────────────────────────────────────────────────────────────────────────────
+//  bench
+// ────────────────────────────────────────────────────────────────────────────
+
+fn cmd_bench(_args: &[String]) -> i32 {
+    use atlas_palace::Palace;
+    use atlas_corpus::{LiveDiscoveryCorpus, GateConfig, SftTrainer, SftConfig};
+    use atlas_astra::Discovery;
+
+    println!("┌─ ATLAS bench ─────────────────────────────────────────────────────");
+    println!("│  Running end-to-end benchmark suite…");
+    println!("└───────────────────────────────────────────────────────────────────\n");
+
+    // ── 1. Palace benchmark ───────────────────────────────────────────────
+    {
+        let mut palace = Palace::new("bench", "/tmp/atlas-bench-palace");
+        let wing_id = palace.add_wing("bench-wing", "Benchmark wing");
+        let room_id = palace.add_room(&wing_id, "bench-room", "Benchmark room")
+            .unwrap_or_else(|_| format!("{wing_id}:room:0"));
+
+        let n_insert = 1000usize;
+        let insert_start = std::time::Instant::now();
+        for i in 0..n_insert {
+            let title   = format!("drawer-{i}");
+            let content = format!(
+                "benchmark content item {i}: the quick brown fox jumps over the lazy dog"
+            );
+            palace.add_drawer(&room_id, &title, &content, &[]).ok();
+        }
+        let insert_ms = insert_start.elapsed().as_micros() as f64 / 1000.0;
+        let insert_ops = n_insert as f64 / (insert_ms / 1000.0);
+
+        let n_query = 100usize;
+        let query_start = std::time::Instant::now();
+        for i in 0..n_query {
+            palace.search(&format!("benchmark item {}", i % 20), 10);
+        }
+        let query_ms = query_start.elapsed().as_micros() as f64 / 1000.0;
+        let query_ops = n_query as f64 / (query_ms / 1000.0);
+
+        println!("  Palace:");
+        println!("    Insertions : {n_insert} in {insert_ms:.1}ms = {insert_ops:.0} ops/s");
+        println!("    A* queries : {n_query} in {query_ms:.1}ms = {query_ops:.0} ops/s");
+    }
+
+    // ── 2. Training benchmark ─────────────────────────────────────────────
+    {
+        let cfg = SftConfig::default();
+        let mut trainer = SftTrainer::new(cfg);
+        let n_steps = 10u32;
+        let train_start = std::time::Instant::now();
+        for i in 0..n_steps {
+            trainer.train_step(i % 100, (i + 1) % 100).ok();
+        }
+        let elapsed_ms = train_start.elapsed().as_micros() as f64 / 1000.0;
+        let steps_per_s = n_steps as f64 / (elapsed_ms / 1000.0);
+        println!("  Training:");
+        println!("    SFT steps  : {n_steps} in {elapsed_ms:.1}ms = {steps_per_s:.0} steps/s");
+    }
+
+    // ── 3. Quality gate benchmark ─────────────────────────────────────────
+    {
+        let gate_cfg = GateConfig::default();
+        let corpus = LiveDiscoveryCorpus::new(gate_cfg);
+        let n_gates = 1000usize;
+        let gate_start = std::time::Instant::now();
+        for i in 0..n_gates {
+            let d = Discovery {
+                id:            format!("bench-{i}"),
+                title:         format!("H{i}: metric_a correlates with metric_b across {} observations in domain C", i + 100),
+                description:   format!("Benchmark discovery {i}: synthetic hypothesis for throughput measurement."),
+                causal_claims: vec![("metric_a".into(), "metric_b".into(), 0.85)],
+                quality_score: 0.85,
+                proof_commitment: i as u64,
+                source:        "bench".into(),
+                timestamp:     0,
+                tags:          vec!["benchmark".into()],
+                provenance:    None,
+            };
+            corpus.evaluate_gates(&d);
+        }
+        let elapsed_ms = gate_start.elapsed().as_micros() as f64 / 1000.0;
+        let gates_per_s = n_gates as f64 / (elapsed_ms / 1000.0);
+        println!("  Quality gates:");
+        println!("    Evaluations: {n_gates} in {elapsed_ms:.1}ms = {gates_per_s:.0} gates/s");
+    }
+
+    println!("\n  ✓ Benchmark complete");
+    0
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 //  Helpers

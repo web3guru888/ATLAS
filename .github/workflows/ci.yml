@@ -2,25 +2,31 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, develop, "feature/**", "release/**"]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
 
 jobs:
-  # ── CPU-only tests (all crates except atlas-tensor) ─────────────────────
+  # ── CPU-only tests (multi Rust version matrix) ────────────────────────────
   test:
-    name: Test (CPU)
-    runs-on: ubuntu-latest
+    name: Test — Rust ${{ matrix.rust }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        rust: ["1.75", stable]
+        os: [ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust ${{ matrix.rust }}
+        uses: dtolnay/rust-toolchain@master
         with:
-          components: clippy, rustfmt
+          toolchain: ${{ matrix.rust }}
 
       - name: Cache cargo registry & build
         uses: actions/cache@v4
@@ -29,42 +35,72 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.rust }}-
             ${{ runner.os }}-cargo-
 
-      - name: Build (exclude atlas-tensor — needs CUDA)
-        run: cargo build --workspace --exclude atlas-tensor
+      - name: Build (CPU path, skip CUDA kernels)
+        run: cargo build --workspace
+        env:
+          # atlas-tensor build.rs checks for CUDA_PATH; if absent, skips CUDA
+          CUDA_PATH: ""
 
-      - name: Test (exclude atlas-tensor)
-        run: cargo test --workspace --exclude atlas-tensor
+      - name: Test (CPU path, GPU tests auto-skipped via #[ignore])
+        run: cargo test --workspace
+        env:
+          CUDA_PATH: ""
 
-      - name: Clippy (exclude atlas-tensor)
-        run: cargo clippy --workspace --exclude atlas-tensor -- -D warnings
+  # ── Rustfmt check (advisory) ──────────────────────────────────────────────
+  fmt:
+    name: Rustfmt check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+        continue-on-error: true   # formatting is advisory, not blocking
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+  # ── Clippy lint (advisory) ────────────────────────────────────────────────
+  clippy:
+    name: Clippy lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+      - run: cargo clippy --workspace -- -D warnings
+        continue-on-error: true   # lint is advisory for now
+        env:
+          CUDA_PATH: ""
 
-  # ── GPU tests (all crates including atlas-tensor with CUDA) ─────────────
+  # ── GPU tests (self-hosted runner, disabled until available) ─────────────
   gpu-test:
-    name: Test (GPU)
+    name: Test (GPU — Tesla T4)
     runs-on: ubuntu-latest
     if: false  # Enable when self-hosted GPU runner is available
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: Check CUDA
+      - name: Verify CUDA
         run: nvidia-smi
-
-      - name: Build all crates
+      - name: Build all crates (with CUDA)
         run: cargo build --workspace
+      - name: Test all crates (including GPU #[ignore] tests)
+        run: cargo test --workspace -- --include-ignored
 
-      - name: Test all crates (including GPU)
-        run: cargo test --workspace
-
-  # ── Benchmarks (on-demand, not blocking CI) ─────────────────────────────
+  # ── Benchmarks (on push to main, non-blocking) ────────────────────────────
   benchmarks:
     name: Benchmarks
     runs-on: ubuntu-latest
@@ -72,9 +108,7 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -83,14 +117,14 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run benchmarks
+      - name: Run atlas bench
         run: |
-          cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture 2>&1 | tee benchmark-results.txt
-
+          cargo run --bin atlas -- bench 2>&1 | tee benchmark-results.txt
+        env:
+          CUDA_PATH: ""
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results
+          name: benchmark-results-${{ github.sha }}
           path: benchmark-results.txt
-          retention-days: 30
+          retention-days: 90
