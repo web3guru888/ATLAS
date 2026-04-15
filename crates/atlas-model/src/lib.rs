@@ -61,6 +61,76 @@ impl ModelConfig {
         }
     }
 
+    /// OLMo 3 1B (OLMo-2-0325-1B) configuration.
+    pub fn olmo3_1b() -> Self {
+        Self {
+            vocab_size:   100_352,
+            d_model:      2048,
+            n_layers:     16,
+            n_heads:      16,
+            n_kv_heads:   16,
+            ffn_hidden:   8192,
+            max_seq_len:  4096,
+            rope_theta:   500_000.0,
+            rms_norm_eps: 1e-5,
+        }
+    }
+
+    /// Llama 3.2 1B configuration.
+    pub fn llama32_1b() -> Self {
+        Self {
+            vocab_size:   128_256,
+            d_model:      2048,
+            n_layers:     16,
+            n_heads:      32,
+            n_kv_heads:   8,
+            ffn_hidden:   8192,
+            max_seq_len:  131_072,
+            rope_theta:   500_000.0,
+            rms_norm_eps: 1e-5,
+        }
+    }
+
+    /// Head dimension (d_model / n_heads).
+    pub fn head_dim(&self) -> usize {
+        self.d_model / self.n_heads
+    }
+
+    /// Key/value dimension per layer (n_kv_heads * head_dim).
+    pub fn kv_dim(&self) -> usize {
+        self.n_kv_heads * self.head_dim()
+    }
+
+    /// Total number of weight tensors expected in a safetensors file.
+    /// Per layer: 4 attn projections + 3 FFN weights + 2 norms = 9.
+    /// Plus: embedding, final norm, lm_head = 3.
+    pub fn expected_tensor_count(&self) -> usize {
+        self.n_layers * 9 + 3
+    }
+
+    /// Generate the expected safetensors tensor names for OLMo 3 / Llama 3.2
+    /// weight naming conventions.
+    pub fn expected_tensor_names(&self) -> Vec<String> {
+        let mut names = vec![
+            "model.embed_tokens.weight".to_string(),
+            "model.norm.weight".to_string(),
+            "lm_head.weight".to_string(),
+        ];
+        for i in 0..self.n_layers {
+            let pfx = format!("model.layers.{i}");
+            names.push(format!("{pfx}.self_attn.q_proj.weight"));
+            names.push(format!("{pfx}.self_attn.k_proj.weight"));
+            names.push(format!("{pfx}.self_attn.v_proj.weight"));
+            names.push(format!("{pfx}.self_attn.o_proj.weight"));
+            names.push(format!("{pfx}.mlp.gate_proj.weight"));
+            names.push(format!("{pfx}.mlp.up_proj.weight"));
+            names.push(format!("{pfx}.mlp.down_proj.weight"));
+            names.push(format!("{pfx}.input_layernorm.weight"));
+            names.push(format!("{pfx}.post_attention_layernorm.weight"));
+        }
+        names
+    }
+
     /// Tiny 2-layer 64-dim model for testing (no GPU required).
     pub fn tiny() -> Self {
         Self {
@@ -680,6 +750,66 @@ impl SafetensorsFile {
         })
     }
 
+    /// List all tensor names in this file.
+    pub fn tensor_names(&self) -> Vec<&str> {
+        self.tensors.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    /// Number of tensors in the file.
+    pub fn len(&self) -> usize {
+        self.tensors.len()
+    }
+
+    /// Whether the file contains no tensors.
+    pub fn is_empty(&self) -> bool {
+        self.tensors.is_empty()
+    }
+
+    /// Check if a tensor with the given name exists.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tensors.iter().any(|t| t.name == name)
+    }
+
+    /// Get tensor descriptor by name.
+    pub fn get_desc(&self, name: &str) -> Option<&TensorDesc> {
+        self.tensors.iter().find(|t| t.name == name)
+    }
+
+    /// Build a safetensors file from f32 tensors.
+    /// Returns the complete binary representation.
+    pub fn build_f32(tensors: &[(&str, &[usize], &[f32])]) -> Vec<u8> {
+        // 1. Serialize tensor data and compute offsets
+        let mut data_buf: Vec<u8> = Vec::new();
+        let mut entries: Vec<(String, String, Vec<usize>, usize, usize)> = Vec::new();
+        for &(name, shape, values) in tensors {
+            let start = data_buf.len();
+            for &v in values {
+                data_buf.extend_from_slice(&v.to_le_bytes());
+            }
+            let end = data_buf.len();
+            entries.push((name.to_string(), "F32".to_string(), shape.to_vec(), start, end));
+        }
+        // 2. Build JSON header manually (no dependency on atlas_json for writing)
+        let mut header = String::from("{");
+        for (i, (name, dtype, shape, start, end)) in entries.iter().enumerate() {
+            if i > 0 { header.push(','); }
+            let shape_str: Vec<String> = shape.iter().map(|s| s.to_string()).collect();
+            header.push_str(&format!(
+                "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+                name, dtype, shape_str.join(","), start, end
+            ));
+        }
+        header.push('}');
+        // 3. Assemble: 8-byte header length + header + data
+        let header_bytes = header.as_bytes();
+        let header_len = header_bytes.len() as u64;
+        let mut out = Vec::with_capacity(8 + header_bytes.len() + data_buf.len());
+        out.extend_from_slice(&header_len.to_le_bytes());
+        out.extend_from_slice(header_bytes);
+        out.extend_from_slice(&data_buf);
+        out
+    }
+
     /// Get tensor data as f32. Handles F32 and BF16 → f32 conversion.
     pub fn get_f32(&self, name: &str) -> Result<Vec<f32>> {
         let desc = self.tensors.iter()
@@ -947,6 +1077,292 @@ mod tests {
         let logits2 = model.forward_one(0);
         for (a, b) in logits1.iter().zip(logits2.iter()) {
             assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    // ── v0.4.0 tests: Validated Model Loading ──────────────────────────────
+
+    #[test]
+    fn safetensors_header_parse() {
+        // Build a synthetic safetensors binary with two F32 tensors
+        let values_a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let values_b: Vec<f32> = vec![7.0, 8.0];
+        let bytes = SafetensorsFile::build_f32(&[
+            ("weight_a", &[2, 3], &values_a),
+            ("bias_b",   &[2],    &values_b),
+        ]);
+        let st = SafetensorsFile::from_bytes(bytes).unwrap();
+        assert_eq!(st.len(), 2);
+        // Check tensor names
+        let names = st.tensor_names();
+        assert!(names.contains(&"weight_a"));
+        assert!(names.contains(&"bias_b"));
+        // Check descriptors
+        let da = st.get_desc("weight_a").unwrap();
+        assert_eq!(da.dtype, "F32");
+        assert_eq!(da.shape, vec![2, 3]);
+        let db = st.get_desc("bias_b").unwrap();
+        assert_eq!(db.shape, vec![2]);
+        // Check data
+        let a = st.get_f32("weight_a").unwrap();
+        assert_eq!(a, values_a);
+        let b = st.get_f32("bias_b").unwrap();
+        assert_eq!(b, values_b);
+    }
+
+    #[test]
+    fn f16_to_f32_conversion() {
+        // IEEE 754 half-precision test values:
+        // 1.0 in F16 = 0x3C00 (sign=0, exp=15, mant=0)
+        assert!((f16_to_f32(0x3C00) - 1.0).abs() < 1e-6, "1.0");
+        // -1.0 in F16 = 0xBC00
+        assert!((f16_to_f32(0xBC00) - (-1.0)).abs() < 1e-6, "-1.0");
+        // 0.0 in F16 = 0x0000
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        // -0.0 in F16 = 0x8000
+        assert!(f16_to_f32(0x8000).is_sign_negative() && f16_to_f32(0x8000) == 0.0, "-0.0");
+        // 0.5 in F16 = 0x3800 (sign=0, exp=14, mant=0)
+        assert!((f16_to_f32(0x3800) - 0.5).abs() < 1e-6, "0.5");
+        // 65504.0 (max normal F16) = 0x7BFF
+        assert!((f16_to_f32(0x7BFF) - 65504.0).abs() < 1.0, "max normal");
+        // Infinity = 0x7C00
+        assert!(f16_to_f32(0x7C00).is_infinite() && f16_to_f32(0x7C00) > 0.0, "+inf");
+        // -Infinity = 0xFC00
+        assert!(f16_to_f32(0xFC00).is_infinite() && f16_to_f32(0xFC00) < 0.0, "-inf");
+        // NaN = 0x7C01
+        assert!(f16_to_f32(0x7C01).is_nan(), "NaN");
+        // Denormal: smallest F16 subnormal = 0x0001 ≈ 5.96e-8
+        let tiny = f16_to_f32(0x0001);
+        assert!(tiny > 0.0 && tiny < 1e-6, "subnormal = {tiny}");
+
+        // Round-trip through the BF16 path for comparison:
+        // Build a safetensors with F16 data
+        let f16_1_0: [u8; 2] = 0x3C00u16.to_le_bytes();
+        let f16_half: [u8; 2] = 0x3800u16.to_le_bytes();
+        let mut data = Vec::new();
+        data.extend_from_slice(&f16_1_0);
+        data.extend_from_slice(&f16_half);
+        let st = SafetensorsFile {
+            tensors: vec![TensorDesc {
+                name: "x".into(),
+                dtype: "F16".into(),
+                shape: vec![2],
+                offsets: [0, 4],
+            }],
+            data,
+        };
+        let vals = st.get_f32("x").unwrap();
+        assert!((vals[0] - 1.0).abs() < 1e-6, "F16 load 1.0");
+        assert!((vals[1] - 0.5).abs() < 1e-6, "F16 load 0.5");
+    }
+
+    #[test]
+    fn bf16_to_f32_conversion() {
+        // BF16 = upper 16 bits of IEEE 754 f32
+        // 1.0 in BF16 = 0x3F80
+        let bf16_1_0 = (1.0f32.to_bits() >> 16) as u16;
+        assert_eq!(bf16_1_0, 0x3F80);
+        let recovered = f32::from_bits((bf16_1_0 as u32) << 16);
+        assert!((recovered - 1.0).abs() < 1e-5, "1.0");
+
+        // -2.0 in BF16 = 0xC000
+        let bf16_neg2 = ((-2.0f32).to_bits() >> 16) as u16;
+        assert_eq!(bf16_neg2, 0xC000);
+        let recovered2 = f32::from_bits((bf16_neg2 as u32) << 16);
+        assert!((recovered2 - (-2.0)).abs() < 1e-5, "-2.0");
+
+        // 0.0 in BF16 = 0x0000
+        let bf16_zero = (0.0f32.to_bits() >> 16) as u16;
+        assert_eq!(bf16_zero, 0x0000);
+        let recovered3 = f32::from_bits((bf16_zero as u32) << 16);
+        assert_eq!(recovered3, 0.0, "0.0");
+
+        // Build a safetensors file with 3 BF16 values
+        let mut data = Vec::new();
+        data.extend_from_slice(&bf16_1_0.to_le_bytes());
+        data.extend_from_slice(&bf16_neg2.to_le_bytes());
+        data.extend_from_slice(&bf16_zero.to_le_bytes());
+        let st = SafetensorsFile {
+            tensors: vec![TensorDesc {
+                name: "y".into(),
+                dtype: "BF16".into(),
+                shape: vec![3],
+                offsets: [0, 6],
+            }],
+            data,
+        };
+        let vals = st.get_f32("y").unwrap();
+        assert!((vals[0] - 1.0).abs() < 1e-5, "BF16 load 1.0");
+        assert!((vals[1] - (-2.0)).abs() < 1e-5, "BF16 load -2.0");
+        assert_eq!(vals[2], 0.0, "BF16 load 0.0");
+    }
+
+    #[test]
+    fn model_config_olmo3_1b_dims() {
+        let cfg = ModelConfig::olmo3_1b();
+        assert_eq!(cfg.vocab_size,  100_352);
+        assert_eq!(cfg.d_model,     2048);
+        assert_eq!(cfg.n_layers,    16);
+        assert_eq!(cfg.n_heads,     16);
+        assert_eq!(cfg.n_kv_heads,  16);   // OLMo 3 1B uses full MHA
+        assert_eq!(cfg.ffn_hidden,  8192);
+        assert_eq!(cfg.max_seq_len, 4096);
+        assert_eq!(cfg.head_dim(),  128);  // 2048 / 16
+        assert_eq!(cfg.kv_dim(),    2048); // 16 * 128 (same as d_model for MHA)
+        // 16 layers × 9 tensors/layer + 3 global = 147
+        assert_eq!(cfg.expected_tensor_count(), 147);
+    }
+
+    #[test]
+    fn model_config_llama32_1b_dims() {
+        let cfg = ModelConfig::llama32_1b();
+        assert_eq!(cfg.vocab_size,  128_256);
+        assert_eq!(cfg.d_model,     2048);
+        assert_eq!(cfg.n_layers,    16);
+        assert_eq!(cfg.n_heads,     32);
+        assert_eq!(cfg.n_kv_heads,  8);    // Llama 3.2 1B uses GQA
+        assert_eq!(cfg.ffn_hidden,  8192);
+        assert_eq!(cfg.max_seq_len, 131_072);
+        assert_eq!(cfg.head_dim(),  64);   // 2048 / 32
+        assert_eq!(cfg.kv_dim(),    512);  // 8 * 64
+        // GQA ratio: 32 / 8 = 4 query heads per KV head
+        assert_eq!(cfg.n_heads / cfg.n_kv_heads, 4);
+    }
+
+    #[test]
+    fn weight_mapping_covers_all_layers() {
+        // Verify that expected_tensor_names() generates the right names
+        // and that load_model_from_safetensors maps every one.
+        let cfg = ModelConfig::tiny(); // 2 layers, small
+        let names = cfg.expected_tensor_names();
+        // 2 layers × 9 + 3 global = 21
+        assert_eq!(names.len(), cfg.expected_tensor_count());
+        assert_eq!(names.len(), 21);
+
+        // Check global tensors
+        assert!(names.contains(&"model.embed_tokens.weight".to_string()));
+        assert!(names.contains(&"model.norm.weight".to_string()));
+        assert!(names.contains(&"lm_head.weight".to_string()));
+
+        // Check per-layer tensors for each layer
+        for i in 0..cfg.n_layers {
+            let pfx = format!("model.layers.{i}");
+            assert!(names.contains(&format!("{pfx}.self_attn.q_proj.weight")));
+            assert!(names.contains(&format!("{pfx}.self_attn.k_proj.weight")));
+            assert!(names.contains(&format!("{pfx}.self_attn.v_proj.weight")));
+            assert!(names.contains(&format!("{pfx}.self_attn.o_proj.weight")));
+            assert!(names.contains(&format!("{pfx}.mlp.gate_proj.weight")));
+            assert!(names.contains(&format!("{pfx}.mlp.up_proj.weight")));
+            assert!(names.contains(&format!("{pfx}.mlp.down_proj.weight")));
+            assert!(names.contains(&format!("{pfx}.input_layernorm.weight")));
+            assert!(names.contains(&format!("{pfx}.post_attention_layernorm.weight")));
+        }
+
+        // Also verify for a larger config
+        let cfg7b = ModelConfig::olmo3_7b();
+        let names7b = cfg7b.expected_tensor_names();
+        assert_eq!(names7b.len(), 32 * 9 + 3); // 291
+    }
+
+    #[test]
+    fn safetensors_roundtrip() {
+        // Build a synthetic safetensors file, serialize it, parse it back,
+        // and verify all tensor data survives the round trip.
+        let w1: Vec<f32> = vec![0.1, -0.2, 0.3, 0.4, -0.5, 0.6];
+        let w2: Vec<f32> = vec![1.0, 2.0, 3.0];
+        let w3: Vec<f32> = vec![-1.0];
+
+        let bytes = SafetensorsFile::build_f32(&[
+            ("layer.0.weight", &[2, 3], &w1),
+            ("layer.1.bias",   &[3],    &w2),
+            ("scalar",         &[1],    &w3),
+        ]);
+
+        // Parse back
+        let st = SafetensorsFile::from_bytes(bytes).unwrap();
+        assert_eq!(st.len(), 3);
+        assert!(st.contains("layer.0.weight"));
+        assert!(st.contains("layer.1.bias"));
+        assert!(st.contains("scalar"));
+        assert!(!st.contains("nonexistent"));
+
+        // Verify data
+        let r1 = st.get_f32("layer.0.weight").unwrap();
+        assert_eq!(r1.len(), 6);
+        for (a, b) in r1.iter().zip(w1.iter()) {
+            assert!((a - b).abs() < 1e-7, "{a} != {b}");
+        }
+
+        let r2 = st.get_f32("layer.1.bias").unwrap();
+        assert_eq!(r2, w2);
+
+        let r3 = st.get_f32("scalar").unwrap();
+        assert_eq!(r3, w3);
+
+        // Verify shapes
+        let d1 = st.get_desc("layer.0.weight").unwrap();
+        assert_eq!(d1.shape, vec![2, 3]);
+        let d2 = st.get_desc("layer.1.bias").unwrap();
+        assert_eq!(d2.shape, vec![3]);
+    }
+
+    #[test]
+    fn load_tiny_model_from_synthetic_safetensors() {
+        // Build a complete safetensors file for a tiny model and load it.
+        let cfg = ModelConfig::tiny(); // vocab=256, d=64, layers=2, heads=4, kv=2, ffn=128
+        let names = cfg.expected_tensor_names();
+
+        // Build all tensors with deterministic data
+        let mut tensor_data: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+        for name in &names {
+            let (shape, numel) = tensor_shape_for_config(&cfg, name);
+            // Fill with a simple pattern: index / numel
+            let data: Vec<f32> = (0..numel).map(|i| i as f32 * 0.001).collect();
+            tensor_data.push((name.clone(), shape, data));
+        }
+
+        // Build safetensors binary
+        let refs: Vec<(&str, &[usize], &[f32])> = tensor_data.iter()
+            .map(|(n, s, d)| (n.as_str(), s.as_slice(), d.as_slice()))
+            .collect();
+        let bytes = SafetensorsFile::build_f32(&refs);
+
+        // Write to a temp file and load
+        let tmp = "/tmp/atlas_test_tiny.safetensors";
+        std::fs::write(tmp, &bytes).unwrap();
+
+        let model = load_model_from_safetensors(tmp, cfg.clone()).unwrap();
+        // Model should have correct vocab
+        assert_eq!(model.vocab_size(), 256);
+        // Verify embedding was loaded (not random init)
+        let embed_tok = model.embed.embed_token(0);
+        assert!((embed_tok[0] - 0.0).abs() < 1e-6, "embed[0][0] = {}", embed_tok[0]);
+        assert!((embed_tok[1] - 0.001).abs() < 1e-6, "embed[0][1] = {}", embed_tok[1]);
+
+        // Clean up
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    /// Helper: compute the expected shape and numel for a tensor name given a config.
+    fn tensor_shape_for_config(cfg: &ModelConfig, name: &str) -> (Vec<usize>, usize) {
+        let d = cfg.d_model;
+        let kv = cfg.kv_dim();
+        let h = cfg.ffn_hidden;
+        let v = cfg.vocab_size;
+        match name {
+            _ if name == "model.embed_tokens.weight" => (vec![v, d],  v * d),
+            _ if name == "model.norm.weight"         => (vec![d],     d),
+            _ if name == "lm_head.weight"            => (vec![v, d],  v * d),
+            _ if name.ends_with("q_proj.weight")     => (vec![d, d],  d * d),
+            _ if name.ends_with("k_proj.weight")     => (vec![kv, d], kv * d),
+            _ if name.ends_with("v_proj.weight")     => (vec![kv, d], kv * d),
+            _ if name.ends_with("o_proj.weight")     => (vec![d, d],  d * d),
+            _ if name.ends_with("gate_proj.weight")  => (vec![h, d],  h * d),
+            _ if name.ends_with("up_proj.weight")    => (vec![h, d],  h * d),
+            _ if name.ends_with("down_proj.weight")  => (vec![d, h],  d * h),
+            _ if name.ends_with("input_layernorm.weight")          => (vec![d], d),
+            _ if name.ends_with("post_attention_layernorm.weight") => (vec![d], d),
+            _ => panic!("unknown tensor: {name}"),
         }
     }
 }

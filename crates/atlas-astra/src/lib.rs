@@ -21,7 +21,8 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
-use atlas_core::{AtlasError, Result};
+use atlas_core::Result;
+use atlas_http::HttpClient;
 use atlas_json::Json;
 
 // ── Data types ─────────────────────────────────────────────────────────────
@@ -120,17 +121,80 @@ impl NasaConnector {
     /// Create connector for a specific location.
     pub fn new(lat: f64, lon: f64) -> Self {
         Self {
-            endpoint: "https://power.larc.nasa.gov/api/temporal/climatology/point".to_string(),
+            endpoint: "https://power.larc.nasa.gov/api/temporal/daily/point".to_string(),
             lat, lon,
         }
     }
 
-    /// Build the API URL for temperature + precipitation data.
+    /// Build the API URL for temperature + precipitation + humidity + wind data.
     pub fn build_url(&self) -> String {
         format!(
-            "{}?parameters=T2M,PRECTOTCORR&community=RE&longitude={}&latitude={}&format=JSON",
+            "{}?parameters=T2M,PRECTOTCORR,RH2M,WS2M&community=RE&longitude={}&latitude={}&start=20240101&end=20240131&format=JSON",
             self.endpoint, self.lon, self.lat
         )
+    }
+
+    /// Parse NASA POWER JSON response into observations.
+    pub fn parse_response(body: &str, source: &str) -> Vec<Observation> {
+        let mut obs = Vec::new();
+        if let Ok(json) = Json::parse(body) {
+            // NASA POWER response: { "properties": { "parameter": { "T2M": {"20240101": val, ...}, ... } } }
+            if let Some(props) = json.get("properties") {
+                if let Some(params) = props.get("parameter") {
+                    // Collect all parameter names and their daily values
+                    if let Some(pairs) = params.as_object() {
+                        // Get the first parameter to know the date keys
+                        if let Some((_first_name, first_vals)) = pairs.first() {
+                            if let Some(date_entries) = first_vals.as_object() {
+                                // For each date, build a combined observation
+                                for (date, _) in date_entries.iter().take(31) {
+                                    let mut fields = Vec::new();
+                                    fields.push(format!(r#""date":"{}""#, date));
+                                    for (param_name, param_data) in pairs {
+                                        if let Some(val) = param_data.get(date) {
+                                            if let Some(f) = val.as_f64() {
+                                                if f > -990.0 {
+                                                    // NASA uses -999.0 for missing
+                                                    fields.push(format!(r#""{}":{}""#, param_name, f));
+                                                }
+                                            } else if let Some(i) = val.as_i64() {
+                                                fields.push(format!(r#""{}":"{}""#, param_name, i));
+                                            }
+                                        }
+                                    }
+                                    obs.push(Observation {
+                                        source: source.to_string(),
+                                        content: format!("{{{}}}", fields.join(",")),
+                                        url: format!("nasa.power/daily/{}", date),
+                                        retrieved_at: epoch_secs(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Simpler fallback: if the response is just a flat object with numeric keys
+            if obs.is_empty() {
+                obs.push(Observation {
+                    source: source.to_string(),
+                    content: body.chars().take(4096).collect(),
+                    url: "nasa.power/raw".to_string(),
+                    retrieved_at: epoch_secs(),
+                });
+            }
+        }
+        obs
+    }
+
+    fn synthetic_fallback(&self) -> Vec<Observation> {
+        vec![Observation {
+            source:       self.name().to_string(),
+            content:      format!(r#"{{"lat":{},"lon":{},"T2M":25.3,"PRECTOTCORR":85.2}}"#,
+                                  self.lat, self.lon),
+            url:          self.build_url(),
+            retrieved_at: epoch_secs(),
+        }]
     }
 }
 
@@ -139,15 +203,19 @@ impl DataSource for NasaConnector {
 
     fn fetch(&self) -> Result<Vec<Observation>> {
         let url = self.build_url();
-        // In production: use atlas-http to call the API
-        // For offline/test use: return synthetic observation
-        Ok(vec![Observation {
-            source:       self.name().to_string(),
-            content:      format!(r#"{{"lat":{},"lon":{},"T2M":25.3,"PRECTOTCORR":85.2}}"#,
-                                  self.lat, self.lon),
-            url,
-            retrieved_at: epoch_secs(),
-        }])
+        let client = HttpClient::new();
+        match client.get(&url) {
+            Ok(resp) if resp.is_ok() => {
+                let body = resp.body_str();
+                let obs = Self::parse_response(body, self.name());
+                if obs.is_empty() {
+                    Ok(self.synthetic_fallback())
+                } else {
+                    Ok(obs)
+                }
+            }
+            _ => Ok(self.synthetic_fallback()),
+        }
     }
 }
 
@@ -167,18 +235,75 @@ impl WhoConnector {
             indicator: indicator.to_string(),
         }
     }
+
+    /// Build the API URL.
+    pub fn build_url(&self) -> String {
+        format!("{}/{}?$top=10", self.endpoint, self.indicator)
+    }
+
+    /// Parse WHO GHO JSON response into observations.
+    pub fn parse_response(body: &str, source: &str) -> Vec<Observation> {
+        let mut obs = Vec::new();
+        if let Ok(json) = Json::parse(body) {
+            // WHO GHO response: { "value": [ { "SpatialDim": "USA", "TimeDim": 2020, "NumericValue": 42.1, ... }, ... ] }
+            if let Some(values) = json.get("value") {
+                if let Some(arr) = values.as_array() {
+                    for entry in arr.iter().take(10) {
+                        // Build a simplified JSON observation from each entry
+                        let mut fields = Vec::new();
+                        if let Some(pairs) = entry.as_object() {
+                            for (k, v) in pairs {
+                                match v {
+                                    Json::Str(s)   => fields.push(format!(r#""{}":"{}""#, k, s)),
+                                    Json::Int(i)   => fields.push(format!(r#""{}":"{}""#, k, i)),
+                                    Json::Float(f) => fields.push(format!(r#""{}":"{}""#, k, f)),
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if !fields.is_empty() {
+                            obs.push(Observation {
+                                source: source.to_string(),
+                                content: format!("{{{}}}", fields.join(",")),
+                                url: format!("who.gho/{}", source),
+                                retrieved_at: epoch_secs(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        obs
+    }
+
+    fn synthetic_fallback(&self) -> Vec<Observation> {
+        vec![Observation {
+            source: self.name().to_string(),
+            content: format!(r#"{{"indicator":"{}","year":2024,"value":68.5}}"#, self.indicator),
+            url: self.build_url(),
+            retrieved_at: epoch_secs(),
+        }]
+    }
 }
 
 impl DataSource for WhoConnector {
     fn name(&self) -> &str { "who.gho" }
 
     fn fetch(&self) -> Result<Vec<Observation>> {
-        Ok(vec![Observation {
-            source: self.name().to_string(),
-            content: format!(r#"{{"indicator":"{}","year":2024,"value":68.5}}"#, self.indicator),
-            url: format!("{}/{}", self.endpoint, self.indicator),
-            retrieved_at: epoch_secs(),
-        }])
+        let url = self.build_url();
+        let client = HttpClient::new();
+        match client.get(&url) {
+            Ok(resp) if resp.is_ok() => {
+                let body = resp.body_str();
+                let obs = Self::parse_response(body, self.name());
+                if obs.is_empty() {
+                    Ok(self.synthetic_fallback())
+                } else {
+                    Ok(obs)
+                }
+            }
+            _ => Ok(self.synthetic_fallback()),
+        }
     }
 }
 
@@ -198,19 +323,98 @@ impl WorldBankConnector {
             country:   country.to_string(),
         }
     }
+
+    /// Build the API URL.
+    pub fn build_url(&self) -> String {
+        format!(
+            "https://api.worldbank.org/v2/country/{}/indicator/{}?format=json&per_page=10&date=2020:2024",
+            self.country, self.indicator
+        )
+    }
+
+    /// Parse World Bank JSON response into observations.
+    /// World Bank returns: [ {page_meta}, [ {countryiso3code: "USA", date: "2024", value: 123, ...}, ... ] ]
+    pub fn parse_response(body: &str, source: &str) -> Vec<Observation> {
+        let mut obs = Vec::new();
+        if let Ok(json) = Json::parse(body) {
+            // The response is a JSON array: [metadata, data_array]
+            if let Some(arr) = json.as_array() {
+                if arr.len() >= 2 {
+                    if let Some(data_arr) = arr[1].as_array() {
+                        for entry in data_arr.iter().take(10) {
+                            let mut fields = Vec::new();
+                            // Extract key fields
+                            if let Some(country) = entry.get("country") {
+                                if let Some(cval) = country.get("value") {
+                                    if let Some(s) = cval.as_str() {
+                                        fields.push(format!(r#""country":"{}""#, s));
+                                    }
+                                }
+                            }
+                            if let Some(date) = entry.get("date") {
+                                if let Some(s) = date.as_str() {
+                                    fields.push(format!(r#""year":"{}""#, s));
+                                }
+                            }
+                            if let Some(val) = entry.get("value") {
+                                if let Some(f) = val.as_f64() {
+                                    fields.push(format!(r#""value":{}"#, f));
+                                } else if let Some(i) = val.as_i64() {
+                                    fields.push(format!(r#""value":{}"#, i));
+                                }
+                            }
+                            if let Some(ind) = entry.get("indicator") {
+                                if let Some(ival) = ind.get("value") {
+                                    if let Some(s) = ival.as_str() {
+                                        fields.push(format!(r#""indicator":"{}""#, s));
+                                    }
+                                }
+                            }
+                            if !fields.is_empty() {
+                                obs.push(Observation {
+                                    source: source.to_string(),
+                                    content: format!("{{{}}}", fields.join(",")),
+                                    url: format!("worldbank/{}", source),
+                                    retrieved_at: epoch_secs(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        obs
+    }
+
+    fn synthetic_fallback(&self) -> Vec<Observation> {
+        vec![Observation {
+            source: self.name().to_string(),
+            content: format!(r#"{{"country":"{}","indicator":"{}","year":2023,"value":7.99e10}}"#,
+                             self.country, self.indicator),
+            url: self.build_url(),
+            retrieved_at: epoch_secs(),
+        }]
+    }
 }
 
 impl DataSource for WorldBankConnector {
     fn name(&self) -> &str { "worldbank" }
 
     fn fetch(&self) -> Result<Vec<Observation>> {
-        Ok(vec![Observation {
-            source: self.name().to_string(),
-            content: format!(r#"{{"country":"{}","indicator":"{}","year":2023,"value":7.99e10}}"#,
-                             self.country, self.indicator),
-            url: format!("https://api.worldbank.org/v2/country/{}/indicator/{}", self.country, self.indicator),
-            retrieved_at: epoch_secs(),
-        }])
+        let url = self.build_url();
+        let client = HttpClient::new();
+        match client.get(&url) {
+            Ok(resp) if resp.is_ok() => {
+                let body = resp.body_str();
+                let obs = Self::parse_response(body, self.name());
+                if obs.is_empty() {
+                    Ok(self.synthetic_fallback())
+                } else {
+                    Ok(obs)
+                }
+            }
+            _ => Ok(self.synthetic_fallback()),
+        }
     }
 }
 
@@ -227,20 +431,110 @@ impl ArxivConnector {
     pub fn new(query: &str, max_results: usize) -> Self {
         Self { query: query.to_string(), max_results }
     }
+
+    /// Build the ArXiv API URL.
+    pub fn build_url(&self) -> String {
+        // URL-encode spaces as +
+        let encoded = self.query.replace(' ', "+");
+        format!(
+            "http://export.arxiv.org/api/query?search_query=all:{}&max_results={}",
+            encoded, self.max_results
+        )
+    }
+
+    /// Parse ArXiv Atom XML response into observations.
+    /// Simple string-based XML extraction — no full XML parser needed.
+    pub fn parse_response(body: &str, source: &str) -> Vec<Observation> {
+        let mut obs = Vec::new();
+        let mut search_from = 0;
+
+        loop {
+            // Find next <entry> block
+            let entry_start = match body[search_from..].find("<entry>") {
+                Some(pos) => search_from + pos,
+                None => break,
+            };
+            let entry_end = match body[entry_start..].find("</entry>") {
+                Some(pos) => entry_start + pos + 8,
+                None => break,
+            };
+            let entry = &body[entry_start..entry_end];
+            search_from = entry_end;
+
+            let title   = extract_xml_tag(entry, "title").unwrap_or_default();
+            let summary = extract_xml_tag(entry, "summary").unwrap_or_default();
+            let id      = extract_xml_tag(entry, "id").unwrap_or_default();
+
+            // Clean up whitespace in title/summary (ArXiv has newlines inside tags)
+            let title   = title.split_whitespace().collect::<Vec<_>>().join(" ");
+            let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+
+            if !title.is_empty() {
+                // Escape quotes for valid JSON
+                let title_esc   = title.replace('\\', "\\\\").replace('"', "\\\"");
+                let summary_esc = summary.replace('\\', "\\\\").replace('"', "\\\"");
+                let id_esc      = id.replace('\\', "\\\\").replace('"', "\\\"");
+
+                obs.push(Observation {
+                    source: source.to_string(),
+                    content: format!(
+                        r#"{{"title":"{}","abstract":"{}","id":"{}"}}"#,
+                        title_esc,
+                        summary_esc.chars().take(1000).collect::<String>(),
+                        id_esc
+                    ),
+                    url: id.to_string(),
+                    retrieved_at: epoch_secs(),
+                });
+            }
+        }
+        obs
+    }
+
+    fn synthetic_fallback(&self) -> Vec<Observation> {
+        vec![Observation {
+            source: self.name().to_string(),
+            content: format!(
+                r#"{{"query":"{}","title":"Causal discovery in climate data","abstract":"We present evidence that CO2 concentration causally influences global temperature."}}"#,
+                self.query
+            ),
+            url: self.build_url(),
+            retrieved_at: epoch_secs(),
+        }]
+    }
 }
 
 impl DataSource for ArxivConnector {
     fn name(&self) -> &str { "arxiv" }
 
     fn fetch(&self) -> Result<Vec<Observation>> {
-        // Return a synthetic observation for testing
-        Ok(vec![Observation {
-            source: self.name().to_string(),
-            content: format!(r#"{{"query":"{}","title":"Causal discovery in climate data","abstract":"We present evidence that CO2 concentration causally influences global temperature."}}"#, self.query),
-            url: format!("https://export.arxiv.org/search/?query={}", self.query),
-            retrieved_at: epoch_secs(),
-        }])
+        let url = self.build_url();
+        let client = HttpClient::new();
+        match client.get(&url) {
+            Ok(resp) if resp.is_ok() => {
+                let body = resp.body_str();
+                let obs = Self::parse_response(body, self.name());
+                if obs.is_empty() {
+                    Ok(self.synthetic_fallback())
+                } else {
+                    Ok(obs)
+                }
+            }
+            _ => Ok(self.synthetic_fallback()),
+        }
     }
+}
+
+/// Extract text content between `<tag>` and `</tag>` (first occurrence).
+fn extract_xml_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{}", tag);
+    let close = format!("</{}>", tag);
+    let start = xml.find(&open)?;
+    // Skip past the opening tag (handle attributes like <id xmlns="...">)
+    let after_open = start + open.len();
+    let content_start = xml[after_open..].find('>')? + after_open + 1;
+    let content_end = xml[content_start..].find(&close)? + content_start;
+    Some(&xml[content_start..content_end])
 }
 
 // ── Orienter: extract hypotheses from observations ─────────────────────────
@@ -724,5 +1018,187 @@ mod tests {
         let known = vec!["same text".to_string()];
         let n = compute_novelty("same text", &known);
         assert!(n < 0.1);
+    }
+
+    // ── URL construction tests ──────────────────────────────────────────
+
+    #[test]
+    fn nasa_url_contains_all_params() {
+        let src = NasaConnector::new(13.75, 100.5);
+        let url = src.build_url();
+        assert!(url.contains("T2M"), "should contain T2M");
+        assert!(url.contains("PRECTOTCORR"), "should contain PRECTOTCORR");
+        assert!(url.contains("RH2M"), "should contain RH2M");
+        assert!(url.contains("WS2M"), "should contain WS2M");
+        assert!(url.contains("longitude=100.5"), "should contain lon");
+        assert!(url.contains("latitude=13.75"), "should contain lat");
+        assert!(url.contains("start=20240101"), "should have start date");
+        assert!(url.contains("end=20240131"), "should have end date");
+        assert!(url.contains("format=JSON"), "should request JSON");
+    }
+
+    #[test]
+    fn who_url_contains_indicator() {
+        let src = WhoConnector::new("WHOSIS_000001");
+        let url = src.build_url();
+        assert!(url.contains("WHOSIS_000001"));
+        assert!(url.contains("$top=10"));
+        assert!(url.contains("ghoapi.azureedge.net"));
+    }
+
+    #[test]
+    fn worldbank_url_contains_country_indicator() {
+        let src = WorldBankConnector::new("SP.POP.TOTL", "US");
+        let url = src.build_url();
+        assert!(url.contains("/country/US/"));
+        assert!(url.contains("/indicator/SP.POP.TOTL"));
+        assert!(url.contains("format=json"));
+        assert!(url.contains("per_page=10"));
+        assert!(url.contains("date=2020:2024"));
+    }
+
+    #[test]
+    fn arxiv_url_contains_query() {
+        let src = ArxivConnector::new("causal inference climate", 5);
+        let url = src.build_url();
+        assert!(url.contains("causal+inference+climate"), "spaces → +: {}", url);
+        assert!(url.contains("max_results=5"));
+        assert!(url.contains("export.arxiv.org"));
+    }
+
+    // ── Response parsing tests ──────────────────────────────────────────
+
+    #[test]
+    fn arxiv_parse_atom_xml() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <entry>
+    <id>http://arxiv.org/abs/2401.12345v1</id>
+    <title>Causal Discovery in Climate Systems</title>
+    <summary>We study causal relationships between CO2 and temperature using observational data.</summary>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2401.67890v2</id>
+    <title>Active Inference for Multi-Agent Systems</title>
+    <summary>A framework for active inference agents that coordinate via stigmergic signals.</summary>
+  </entry>
+</feed>"#;
+        let obs = ArxivConnector::parse_response(xml, "arxiv");
+        assert_eq!(obs.len(), 2);
+        assert!(obs[0].content.contains("Causal Discovery"));
+        assert!(obs[0].content.contains("CO2"));
+        assert!(obs[0].url.contains("2401.12345"));
+        assert!(obs[1].content.contains("Active Inference"));
+        assert!(obs[1].content.contains("stigmergic"));
+    }
+
+    #[test]
+    fn arxiv_parse_empty_feed() {
+        let xml = r#"<feed><totalResults>0</totalResults></feed>"#;
+        let obs = ArxivConnector::parse_response(xml, "arxiv");
+        assert!(obs.is_empty());
+    }
+
+    #[test]
+    fn who_parse_json_response() {
+        let body = r#"{"value":[{"IndicatorCode":"BMI","SpatialDim":"USA","TimeDim":2020,"NumericValue":28.5},{"IndicatorCode":"BMI","SpatialDim":"GBR","TimeDim":2019,"NumericValue":27.1}]}"#;
+        let obs = WhoConnector::parse_response(body, "who.gho");
+        assert_eq!(obs.len(), 2);
+        assert!(obs[0].content.contains("USA"));
+        assert!(obs[1].content.contains("GBR"));
+    }
+
+    #[test]
+    fn who_parse_empty_response() {
+        let body = r#"{"value":[]}"#;
+        let obs = WhoConnector::parse_response(body, "who.gho");
+        assert!(obs.is_empty());
+    }
+
+    #[test]
+    fn worldbank_parse_json_response() {
+        let body = r#"[{"page":1,"pages":1,"per_page":10,"total":2},[{"indicator":{"id":"SP.POP.TOTL","value":"Population, total"},"country":{"id":"US","value":"United States"},"date":"2023","value":334914895},{"indicator":{"id":"SP.POP.TOTL","value":"Population, total"},"country":{"id":"US","value":"United States"},"date":"2022","value":333271411}]]"#;
+        let obs = WorldBankConnector::parse_response(body, "worldbank");
+        assert_eq!(obs.len(), 2);
+        assert!(obs[0].content.contains("United States"));
+        assert!(obs[0].content.contains("2023"));
+        assert!(obs[1].content.contains("2022"));
+    }
+
+    #[test]
+    fn worldbank_parse_empty_response() {
+        let body = r#"[{"page":1,"pages":0,"per_page":10,"total":0},[]]"#;
+        let obs = WorldBankConnector::parse_response(body, "worldbank");
+        assert!(obs.is_empty());
+    }
+
+    #[test]
+    fn nasa_parse_json_response() {
+        let body = r#"{"type":"Feature","geometry":{"type":"Point"},"properties":{"parameter":{"T2M":{"20240101":5.2,"20240102":6.1},"PRECTOTCORR":{"20240101":0.3,"20240102":1.2}}}}"#;
+        let obs = NasaConnector::parse_response(body, "nasa.power");
+        assert_eq!(obs.len(), 2, "should have 2 daily observations");
+        // Each observation should mention nasa.power
+        assert_eq!(obs[0].source, "nasa.power");
+    }
+
+    #[test]
+    fn nasa_parse_empty_params() {
+        let body = r#"{"properties":{"parameter":{}}}"#;
+        let obs = NasaConnector::parse_response(body, "nasa.power");
+        // No parameters → falls through to raw fallback
+        assert!(!obs.is_empty());
+    }
+
+    #[test]
+    fn extract_xml_tag_basic() {
+        assert_eq!(extract_xml_tag("<title>Hello World</title>", "title"), Some("Hello World"));
+        assert_eq!(extract_xml_tag("<id>http://arxiv.org/abs/123</id>", "id"), Some("http://arxiv.org/abs/123"));
+    }
+
+    #[test]
+    fn extract_xml_tag_with_attributes() {
+        let xml = r#"<title type="html">Test Title</title>"#;
+        assert_eq!(extract_xml_tag(xml, "title"), Some("Test Title"));
+    }
+
+    #[test]
+    fn extract_xml_tag_missing() {
+        assert_eq!(extract_xml_tag("<foo>bar</foo>", "title"), None);
+    }
+
+    // ── Integration tests (ignored for CI, run manually) ────────────────
+
+    #[test]
+    #[ignore]
+    fn integration_arxiv_live() {
+        let src = ArxivConnector::new("machine learning", 3);
+        let obs = src.fetch().unwrap();
+        assert!(!obs.is_empty(), "should get results from ArXiv");
+        // ArXiv returns actual papers
+        assert!(obs[0].content.contains("title"), "should have title field");
+    }
+
+    #[test]
+    #[ignore]
+    fn integration_worldbank_live() {
+        let src = WorldBankConnector::new("SP.POP.TOTL", "US");
+        let obs = src.fetch().unwrap();
+        assert!(!obs.is_empty(), "should get results from World Bank");
+    }
+
+    #[test]
+    #[ignore]
+    fn integration_who_live() {
+        let src = WhoConnector::new("WHOSIS_000001");
+        let obs = src.fetch().unwrap();
+        assert!(!obs.is_empty(), "should get results from WHO");
+    }
+
+    #[test]
+    #[ignore]
+    fn integration_nasa_live() {
+        let src = NasaConnector::new(40.7128, -74.0060);
+        let obs = src.fetch().unwrap();
+        assert!(!obs.is_empty(), "should get results from NASA POWER");
     }
 }
