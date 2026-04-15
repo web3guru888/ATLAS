@@ -17,6 +17,7 @@ members = [
     "crates/atlas-http",
     "crates/atlas-json",
     "crates/atlas-cli",
+    "crates/atlas-mcp",
 ]
 resolver = "2"
 

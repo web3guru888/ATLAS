@@ -82,6 +82,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-mcp"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-json",
+ "atlas-palace",
+]
+
+[[package]]
 name = "atlas-model"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,13 @@
+[package]
+name = "atlas-mcp"
+description = "ATLAS MCP server: expose palace tools via Model Context Protocol (stdio)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }
+atlas-json = { path = "../atlas-json" }
+atlas-palace = { path = "../atlas-palace" }
