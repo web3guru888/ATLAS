@@ -103,7 +103,7 @@ name = "atlas-palace"
 version = "0.1.0"
 dependencies = [
  "atlas-core",
- "atlas-tensor",
+ "atlas-json",
 ]
 
 [[package]]
