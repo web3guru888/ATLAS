@@ -52,6 +52,7 @@ version = "0.1.0"
 dependencies = [
  "atlas-astra",
  "atlas-core",
+ "atlas-json",
  "atlas-palace",
  "atlas-trm",
 ]
