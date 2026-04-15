@@ -69,6 +69,11 @@ mod gpu {
     }
     unsafe impl Send for GpuBuf {}
     unsafe impl Sync for GpuBuf {}
+    impl std::fmt::Debug for GpuBuf {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GpuBuf {{ ptr: {:?}, len: {} }}", self.ptr, self.len)
+        }
+    }
 
     impl GpuBuf {
         pub fn alloc(len: usize) -> Option<Self> {
