@@ -23,6 +23,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas-bridge"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-zk",
+]
+
+[[package]]
 name = "atlas-causal"
 version = "0.1.0"
 dependencies = [
@@ -127,6 +135,13 @@ version = "0.1.0"
 dependencies = [
  "atlas-core",
  "atlas-tensor",
+]
+
+[[package]]
+name = "atlas-safety"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
 ]
 
 [[package]]

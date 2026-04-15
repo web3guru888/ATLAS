@@ -1,0 +1,11 @@
+[package]
+name        = "atlas-safety"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "5-state safety FSM, circuit breakers, audit trail for ATLAS."
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }

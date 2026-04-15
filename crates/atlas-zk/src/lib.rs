@@ -597,6 +597,155 @@ fn json_escape_provenance(s: &str) -> String {
     out
 }
 
+// ── Groth16 stub (interface-compatible, HMAC-SHA256 based) ────────────────
+
+/// A Groth16-style claim binding a statement to a witness.
+///
+/// # Note
+/// This is a stub implementation using HMAC-SHA256 as the proof primitive.
+/// The full BLS12-381 Groth16 implementation will be ported from asi-build
+/// in a future release. The interface is intentionally identical to the
+/// real system.
+#[derive(Debug, Clone)]
+pub struct Groth16Claim {
+    /// Human-readable claim statement.
+    pub statement: String,
+    /// SHA-256 of the witness data.
+    pub witness_hash: [u8; 32],
+    /// Proof bytes (HMAC-SHA256 of statement + witness_hash under key).
+    pub proof_bytes: Vec<u8>,
+    /// Verifying key fingerprint (SHA-256 of key).
+    pub vk_hash: [u8; 32],
+}
+
+/// Produce a Groth16-style claim for `statement` with `witness` data, under `key`.
+pub fn groth16_prove(statement: &str, witness: &[u8], key: &[u8; 32]) -> Groth16Claim {
+    let witness_hash = sha256(witness);
+    let vk_hash = sha256(key);
+
+    // proof = HMAC-SHA256(key, statement_bytes || witness_hash)
+    let mut msg = statement.as_bytes().to_vec();
+    msg.extend_from_slice(&witness_hash);
+    let proof_bytes = hmac_sha256(key, &msg);
+
+    Groth16Claim {
+        statement: statement.to_string(),
+        witness_hash,
+        proof_bytes,
+        vk_hash,
+    }
+}
+
+/// Verify a Groth16 claim.
+pub fn groth16_verify(claim: &Groth16Claim, key: &[u8; 32]) -> bool {
+    let vk_hash = sha256(key);
+    if vk_hash != claim.vk_hash {
+        return false;
+    }
+    let mut msg = claim.statement.as_bytes().to_vec();
+    msg.extend_from_slice(&claim.witness_hash);
+    let expected = hmac_sha256(key, &msg);
+    expected == claim.proof_bytes
+}
+
+/// Public wrapper around the internal SHA-256 implementation.
+/// Used by atlas-bridge for transaction hashing.
+pub fn sha256_pub(data: &[u8]) -> [u8; 32] { sha256(data) }
+
+/// Minimal SHA-256 implementation (FIPS 180-4).
+fn sha256(data: &[u8]) -> [u8; 32] {
+    // Initial hash values (first 32 bits of fractional parts of sqrt of primes 2..19)
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+    // Round constants (first 32 bits of fractional parts of cbrt of primes 2..311)
+    let k: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    // Pre-processing: padding
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 { padded.push(0); }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    // Process each 512-bit (64-byte) chunk
+    for chunk in padded.chunks(64) {
+        let mut w = [0u32; 64];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([chunk[i*4], chunk[i*4+1], chunk[i*4+2], chunk[i*4+3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i-15].rotate_right(7) ^ w[i-15].rotate_right(18) ^ (w[i-15] >> 3);
+            let s1 = w[i-2].rotate_right(17) ^ w[i-2].rotate_right(19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16].wrapping_add(s0).wrapping_add(w[i-7]).wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let temp1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(k[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g; g = f; f = e;
+            e = d.wrapping_add(temp1);
+            d = c; c = b; b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a); h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c); h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e); h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g); h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = [0u8; 32];
+    for (i, &word) in h.iter().enumerate() {
+        out[i*4..i*4+4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+/// HMAC-SHA256.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 64;
+    let mut k_pad = [0u8; BLOCK];
+    if key.len() <= BLOCK {
+        k_pad[..key.len()].copy_from_slice(key);
+    } else {
+        let hk = sha256(key);
+        k_pad[..32].copy_from_slice(&hk);
+    }
+    let ipad: Vec<u8> = k_pad.iter().map(|&b| b ^ 0x36).collect();
+    let opad: Vec<u8> = k_pad.iter().map(|&b| b ^ 0x5c).collect();
+
+    let mut inner = ipad.clone();
+    inner.extend_from_slice(msg);
+    let inner_hash = sha256(&inner);
+
+    let mut outer = opad.clone();
+    outer.extend_from_slice(&inner_hash);
+    sha256(&outer).to_vec()
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -780,5 +929,55 @@ mod tests {
     fn provenance_from_json_malformed_errors() {
         assert!(ProvenanceChain::from_json("not json at all").is_err());
         assert!(ProvenanceChain::from_json(r#"{"links":[]}"#).is_err()); // missing public_key
+    }
+
+    // ── Groth16 stub tests ──────────────────────────────────────────────
+
+    #[test]
+    fn groth16_prove_verify_roundtrip() {
+        let key = [42u8; 32];
+        let claim = groth16_prove("planet mass > 1.5 Mjup", b"dataset:nasa_exoplanet", &key);
+        assert!(groth16_verify(&claim, &key));
+    }
+
+    #[test]
+    fn groth16_invalid_key_fails() {
+        let key = [42u8; 32];
+        let bad_key = [99u8; 32];
+        let claim = groth16_prove("test", b"witness", &key);
+        assert!(!groth16_verify(&claim, &bad_key));
+    }
+
+    #[test]
+    fn groth16_tampered_statement_fails() {
+        let key = [1u8; 32];
+        let mut claim = groth16_prove("original", b"w", &key);
+        claim.statement = "tampered".into();
+        assert!(!groth16_verify(&claim, &key));
+    }
+
+    #[test]
+    fn groth16_witness_hash_deterministic() {
+        let key = [0u8; 32];
+        let c1 = groth16_prove("s", b"same witness", &key);
+        let c2 = groth16_prove("s", b"same witness", &key);
+        assert_eq!(c1.witness_hash, c2.witness_hash);
+        assert_eq!(c1.proof_bytes, c2.proof_bytes);
+    }
+
+    #[test]
+    fn groth16_proof_bytes_nonzero() {
+        let key = [7u8; 32];
+        let claim = groth16_prove("star metallicity correlation", b"gaia_dr3_sample", &key);
+        assert!(claim.proof_bytes.iter().any(|&b| b != 0));
+        assert_eq!(claim.proof_bytes.len(), 32);
+    }
+
+    #[test]
+    fn sha256_empty_known_hash() {
+        let h = sha256(b"");
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assert_eq!(h[0], 0xe3);
+        assert_eq!(h[1], 0xb0);
     }
 }

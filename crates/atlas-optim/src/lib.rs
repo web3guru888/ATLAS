@@ -326,6 +326,27 @@ mod tests {
     }
 
     #[test]
+    fn clip_grad_norm_no_op_when_below_max() {
+        // norm = 5, max = 10 → should NOT clip
+        let mut grads = vec![vec![3.0f32, 4.0]];
+        let actual_norm = clip_grad_norm(&mut grads, 10.0);
+        assert!((actual_norm - 5.0).abs() < 1e-5);
+        // Grads should be unchanged
+        assert!((grads[0][0] - 3.0).abs() < 1e-6);
+        assert!((grads[0][1] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn clip_grad_norm_multi_param() {
+        // Two param groups: [3,4] norm=5, [0,0] norm=0 → global norm = 5
+        let mut grads = vec![vec![3.0f32, 4.0], vec![0.0f32, 0.0]];
+        let norm = clip_grad_norm(&mut grads, 1.0);
+        assert!((norm - 5.0).abs() < 1e-5);
+        let new_norm = global_grad_norm(&grads);
+        assert!((new_norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
     fn multi_param_step() {
         let cfg = AdamWConfig::default();
         let mut opt = AdamW::new(cfg);

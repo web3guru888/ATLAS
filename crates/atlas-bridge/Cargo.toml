@@ -1,0 +1,12 @@
+[package]
+name        = "atlas-bridge"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+repository.workspace  = true
+description = "Rings↔Ethereum ZK bridge interface for ATLAS agent payments."
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }
+atlas-zk   = { path = "../atlas-zk" }

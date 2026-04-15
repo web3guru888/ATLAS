@@ -18,6 +18,8 @@ members = [
     "crates/atlas-json",
     "crates/atlas-cli",
     "crates/atlas-mcp",
+    "crates/atlas-safety",
+    "crates/atlas-bridge",
 ]
 resolver = "2"
 

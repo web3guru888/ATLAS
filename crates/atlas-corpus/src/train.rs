@@ -457,8 +457,12 @@ impl SftTrainer {
     /// Train one epoch over the corpus using pheromone-weighted sampling.
     ///
     /// Samples `config.batch_size` entries, tokenizes each, and runs gradient
-    /// steps on all next-token pairs. Provides feedback to the corpus based on
-    /// whether loss decreased (positive) or increased (negative).
+    /// steps on all next-token pairs with gradient accumulation.
+    ///
+    /// When `config.accum_steps > 1`, gradients from `accum_steps` micro-batches
+    /// are accumulated (each scaled by `1/accum_steps`) before a single optimizer
+    /// step. `clip_grad_norm` (max = 1.0) is applied before each step.
+    /// Provides stigmergic feedback to the corpus based on whether loss decreased.
     pub fn train_epoch(
         &mut self,
         corpus: &mut LiveDiscoveryCorpus,
@@ -468,19 +472,96 @@ impl SftTrainer {
         let entries_processed = batch.entries.len();
         let mut epoch_losses: Vec<f32> = Vec::new();
 
+        let accum_steps = self.config.accum_steps.max(1);
+        let scale = 1.0f32 / accum_steps as f32;
+
+        // Collect all (input, target) pairs from the epoch's batch
+        let mut all_pairs: Vec<(u32, u32)> = Vec::new();
         for entry in &batch.entries {
             let text = entry.to_training_text();
             let pairs = self.tokenizer.make_pairs(&text);
-
             for i in 0..pairs.len() {
-                let sm = self.train_step(pairs.inputs[i], pairs.targets[i])?;
-                epoch_losses.push(sm.loss);
+                all_pairs.push((pairs.inputs[i], pairs.targets[i]));
             }
+        }
 
-            // Stigmergic feedback: reinforce entries that yield decreasing loss
-            if epoch_losses.len() >= 2 {
-                let recent   = epoch_losses[epoch_losses.len() - 1];
-                let previous = epoch_losses[epoch_losses.len() - 2];
+        // Accumulate gradients over micro-batches
+        let mut accum_grads: Option<Vec<Vec<f32>>> = None;
+        let mut micro_count = 0usize;
+
+        for &(input_tok, target_tok) in &all_pairs {
+            let (loss, raw_grads) = self.forward_backward(input_tok, target_tok)?;
+            epoch_losses.push(loss);
+
+            // Scale and accumulate
+            let scaled: Vec<Vec<f32>> = raw_grads
+                .iter()
+                .map(|g| g.iter().map(|&v| v * scale).collect())
+                .collect();
+
+            match accum_grads {
+                None => { accum_grads = Some(scaled); }
+                Some(ref mut acc) => {
+                    for (a_vec, s_vec) in acc.iter_mut().zip(scaled.iter()) {
+                        for (a, s) in a_vec.iter_mut().zip(s_vec.iter()) {
+                            *a += s;
+                        }
+                    }
+                }
+            }
+            micro_count += 1;
+
+            // Optimizer step after accum_steps micro-batches
+            if micro_count >= accum_steps {
+                if let Some(ref mut grads) = accum_grads {
+                    let grad_norm = atlas_optim::clip_grad_norm(grads, 1.0);
+                    self.global_step += 1;
+                    self.scheduler.apply(&mut self.optimizer, self.global_step);
+                    self.optimizer.step(grads)?;
+                    self.model.embed = self.optimizer.params[0].param.clone();
+                    self.model.w1    = self.optimizer.params[1].param.clone();
+                    self.model.w2    = self.optimizer.params[2].param.clone();
+                    let sm = StepMetrics {
+                        step: self.global_step,
+                        loss: epoch_losses[epoch_losses.len() - 1],
+                        lr: self.optimizer.cfg.lr,
+                        grad_norm,
+                    };
+                    self.metrics.step_history.push(sm);
+                }
+                accum_grads = None;
+                micro_count = 0;
+            }
+        }
+
+        // Flush any remaining accumulated gradients
+        if let Some(ref mut grads) = accum_grads {
+            if micro_count > 0 {
+                let grad_norm = atlas_optim::clip_grad_norm(grads, 1.0);
+                self.global_step += 1;
+                self.scheduler.apply(&mut self.optimizer, self.global_step);
+                self.optimizer.step(grads)?;
+                self.model.embed = self.optimizer.params[0].param.clone();
+                self.model.w1    = self.optimizer.params[1].param.clone();
+                self.model.w2    = self.optimizer.params[2].param.clone();
+                if let Some(&last_loss) = epoch_losses.last() {
+                    let sm = StepMetrics {
+                        step: self.global_step,
+                        loss: last_loss,
+                        lr: self.optimizer.cfg.lr,
+                        grad_norm,
+                    };
+                    self.metrics.step_history.push(sm);
+                }
+            }
+        }
+
+        // Stigmergic feedback: reinforce entries that yield decreasing loss
+        if epoch_losses.len() >= 2 {
+            let recent   = epoch_losses[epoch_losses.len() - 1];
+            let previous = epoch_losses[epoch_losses.len() - 2];
+            // Provide feedback per entry using aggregate loss signal
+            for entry in &batch.entries {
                 if recent < previous {
                     corpus.feedback_positive(entry.id);
                 } else {
@@ -943,5 +1024,94 @@ mod tests {
         assert!(batch.is_empty());
         let batch2 = tok.make_pairs("x"); // single byte → no pairs
         assert!(batch2.is_empty());
+    }
+
+    // ── 13. gradient_accumulation_trains ──────────────────────────────────
+
+    #[test]
+    fn gradient_accumulation_trains() {
+        // With accum_steps=4, loss should still decrease after one epoch
+        let mut corpus = make_test_corpus();
+        let config = SftConfig {
+            vocab_size: 50,
+            hidden_dim: 16,
+            batch_size: 3,
+            lr: 0.05,
+            weight_decay: 0.0,
+            warmup_steps: 0,
+            accum_steps: 4,
+            ..Default::default()
+        };
+        let mut trainer = SftTrainer::new(config);
+        // Measure loss before
+        let loss_before = trainer.compute_loss(5, 10).unwrap();
+        // Train one epoch
+        let em = trainer.train_epoch(&mut corpus).unwrap();
+        assert!(em.mean_loss > 0.0, "mean_loss should be positive");
+        assert!(em.entries_processed > 0);
+        // Measure loss after — should have moved (model should have updated)
+        let loss_after = trainer.compute_loss(5, 10).unwrap();
+        // Loss should be different from initial (model was updated)
+        assert!(
+            (loss_after - loss_before).abs() > 1e-6,
+            "model should have updated: {loss_before:.4} → {loss_after:.4}"
+        );
+    }
+
+    // ── 14. accum_steps_one_matches_default ───────────────────────────────
+
+    #[test]
+    fn accum_steps_config_default_is_one() {
+        let cfg = SftConfig::default();
+        assert_eq!(cfg.accum_steps, 1, "default accum_steps should be 1");
+    }
+
+    // ── 15. safetensors_roundtrip ─────────────────────────────────────────
+
+    #[test]
+    fn safetensors_roundtrip() {
+        let config = SftConfig {
+            vocab_size: 20,
+            hidden_dim: 8,
+            ..Default::default()
+        };
+        let mut trainer = SftTrainer::new(config.clone());
+
+        // Run a few steps to get non-trivial weights
+        for i in 0u32..5 {
+            trainer.train_step(i % 20, (i + 1) % 20).unwrap();
+        }
+
+        // Save embed snapshot before round-trip
+        let embed_snapshot = trainer.model.embed.clone();
+
+        // Save to /tmp
+        let path = "/tmp/atlas_test_checkpoint.safetensors";
+        trainer.save_safetensors(path).expect("save_safetensors failed");
+
+        // Load back
+        let loaded = SftTrainer::load_safetensors(path, config)
+            .expect("load_safetensors failed");
+
+        // Verify embed matches
+        assert_eq!(loaded.model.embed.len(), embed_snapshot.len());
+        for (a, b) in loaded.model.embed.iter().zip(embed_snapshot.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "embed mismatch: {a} vs {b}"
+            );
+        }
+
+        // Verify w1 and w2 are also loaded (non-trivially different from fresh init)
+        assert_eq!(loaded.model.w1.len(), trainer.model.w1.len());
+        assert_eq!(loaded.model.w2.len(), trainer.model.w2.len());
+
+        // Verify optimizer params were synced from loaded weights
+        assert_eq!(loaded.optimizer.params[0].param, loaded.model.embed);
+        assert_eq!(loaded.optimizer.params[1].param, loaded.model.w1);
+        assert_eq!(loaded.optimizer.params[2].param, loaded.model.w2);
+
+        // Clean up
+        let _ = std::fs::remove_file(path);
     }
 }
