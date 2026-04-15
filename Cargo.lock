@@ -45,6 +45,7 @@ dependencies = [
  "atlas-astra",
  "atlas-core",
  "atlas-corpus",
+ "atlas-mcp",
  "atlas-model",
  "atlas-palace",
  "atlas-zk",
