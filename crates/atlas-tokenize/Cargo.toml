@@ -9,3 +9,4 @@ repository.workspace = true
 
 [dependencies]
 atlas-core = { path = "../atlas-core" }
+atlas-json = { path = "../atlas-json" }
