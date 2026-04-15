@@ -215,6 +215,19 @@ impl Palace {
         );
     }
 
+    /// Average pheromone value across all drawers (for CAS calibration).
+    /// Returns 0.0 for an empty palace.
+    pub fn avg_pheromone(&self) -> f32 {
+        let mut total = 0.0f32;
+        let mut count = 0u32;
+        for d in self.drawers.values() {
+            let max_ph = d.pheromones.iter().map(|p| p.value).fold(0.0f32, f32::max);
+            total += max_ph;
+            count += 1;
+        }
+        if count == 0 { 0.0 } else { total / count as f32 }
+    }
+
     /// Return the hottest KG edges by composite pheromone factor.
     pub fn hot_edges(&self, top_k: usize) -> Vec<(String, String, f32)> {
         let mut edges: Vec<_> = self.kg.iter()
@@ -224,6 +237,73 @@ impl Palace {
         edges.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         edges.truncate(top_k);
         edges
+    }
+}
+
+// ── CAS Decay Calibration ────────────────────────────────────────────────
+
+/// CAS = Corpus-Aware Stigmergy. Dynamically tunes pheromone decay rates
+/// based on corpus statistics to prevent saturation or signal loss.
+pub struct CasDecayCalibrator {
+    /// Base decay rate ∈ [0, 1]. Default 0.05.
+    pub base_rate: f32,
+    /// Number of calibration ticks performed.
+    pub calibrations: u32,
+    /// Last computed rate.
+    pub last_rate: f32,
+}
+
+impl CasDecayCalibrator {
+    /// Create a new calibrator with the given base rate.
+    pub fn new(base_rate: f32) -> Self {
+        Self {
+            base_rate: base_rate.clamp(0.001, 1.0),
+            calibrations: 0,
+            last_rate: base_rate,
+        }
+    }
+
+    /// Compute optimal decay rate given corpus statistics.
+    ///
+    /// Rules:
+    /// - `source_diversity < 0.3` → boost exploration decay: base × 2.0
+    /// - `avg_pheromone > 0.7` → increase decay (prevent saturation): base × 1.5
+    /// - `avg_pheromone < 0.1` → decrease decay (preserve signals): base × 0.5
+    /// - Otherwise → base_rate
+    ///
+    /// `source_diversity` ∈ [0, 1] measures how spread sources are (1 = maximally diverse).
+    pub fn calibrate(&mut self, avg_pheromone: f32, source_diversity: f32) -> f32 {
+        self.calibrations += 1;
+        let rate = if source_diversity < 0.3 {
+            // Low diversity: aggressively decay to encourage exploration
+            (self.base_rate * 2.0).min(1.0)
+        } else if avg_pheromone > 0.7 {
+            // Near saturation: increase decay
+            (self.base_rate * 1.5).min(1.0)
+        } else if avg_pheromone < 0.1 {
+            // Signals fading: decrease decay
+            self.base_rate * 0.5
+        } else {
+            self.base_rate
+        };
+        self.last_rate = rate;
+        rate
+    }
+
+    /// Calibrate and immediately apply multiplicative decay to all palace
+    /// drawer pheromones. Returns the rate that was applied.
+    ///
+    /// Each pheromone value is multiplied by `(1 - rate)`, and values
+    /// falling below `PHEROMONE_FLOOR` are removed.
+    pub fn apply(&mut self, palace: &mut Palace, avg_pheromone: f32, source_diversity: f32) -> f32 {
+        let rate = self.calibrate(avg_pheromone, source_diversity);
+        for d in palace.drawers.values_mut() {
+            for p in &mut d.pheromones {
+                p.value *= 1.0 - rate;
+            }
+            d.pheromones.retain(|p| p.value > PHEROMONE_FLOOR);
+        }
+        rate
     }
 }
 
@@ -419,5 +499,74 @@ mod tests {
             "pheromone {} exceeded ceiling {}", val, PHEROMONE_CEILING);
         assert!(val >= PHEROMONE_CEILING - f32::EPSILON,
             "pheromone should have reached ceiling");
+    }
+
+    // ── CAS Decay Calibration tests ──────────────────────────────────────
+
+    #[test]
+    fn cas_calibrator_increases_decay_on_high_avg() {
+        let mut cal = CasDecayCalibrator::new(0.05);
+        let rate = cal.calibrate(0.8, 0.5); // high avg, decent diversity
+        assert!((rate - 0.075).abs() < 1e-6); // 0.05 * 1.5
+        assert_eq!(cal.calibrations, 1);
+    }
+
+    #[test]
+    fn cas_calibrator_decreases_decay_on_low_avg() {
+        let mut cal = CasDecayCalibrator::new(0.10);
+        let rate = cal.calibrate(0.05, 0.5); // low avg
+        assert!((rate - 0.05).abs() < 1e-6); // 0.10 * 0.5
+    }
+
+    #[test]
+    fn cas_calibrator_boosts_on_low_diversity() {
+        let mut cal = CasDecayCalibrator::new(0.05);
+        let rate = cal.calibrate(0.5, 0.2); // low diversity takes priority
+        assert!((rate - 0.10).abs() < 1e-6); // 0.05 * 2.0
+    }
+
+    #[test]
+    fn cas_calibrator_normal_range() {
+        let mut cal = CasDecayCalibrator::new(0.05);
+        let rate = cal.calibrate(0.4, 0.6); // normal range
+        assert!((rate - 0.05).abs() < 1e-6); // unchanged
+    }
+
+    #[test]
+    fn cas_calibrator_apply_modifies_palace() {
+        let mut p = test_palace();
+        let id: String = p.drawers.keys().next().unwrap().clone();
+        // Deposit pheromone first
+        p.deposit_pheromones(&id, 0.8, 0.05, "test");
+        let before = p.avg_pheromone();
+        assert!(before > 0.0);
+
+        let mut cal = CasDecayCalibrator::new(0.10);
+        let rate = cal.apply(&mut p, 0.8, 0.5);
+        assert!(rate > 0.10); // should be 0.15 (high avg)
+        let after = p.avg_pheromone();
+        assert!(after < before);
+    }
+
+    #[test]
+    fn cas_calibrator_rate_clamped() {
+        let mut cal = CasDecayCalibrator::new(0.9);
+        let rate = cal.calibrate(0.5, 0.1); // low diversity → 0.9 * 2.0 = 1.8 → clamped to 1.0
+        assert!((rate - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn avg_pheromone_empty_palace_is_zero() {
+        let p = Palace::new("empty_test", "/tmp/test_cas_empty");
+        assert!((p.avg_pheromone()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn avg_pheromone_after_deposit() {
+        let mut p = test_palace();
+        let id: String = p.drawers.keys().next().unwrap().clone();
+        p.deposit_pheromones(&id, 0.6, 0.05, "test");
+        let avg = p.avg_pheromone();
+        assert!(avg > 0.0);
     }
 }

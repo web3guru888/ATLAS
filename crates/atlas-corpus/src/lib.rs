@@ -147,7 +147,7 @@ pub struct TrainingBatch {
 }
 
 /// Sampling strategy for batch construction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SampleStrategy {
     /// Pure pheromone-weighted (exploitation).
     Pheromone,
@@ -157,6 +157,9 @@ pub enum SampleStrategy {
     Uniform,
     /// Mix: 60% pheromone + 40% uniform.
     Mixed,
+    /// Stigmergic: temperature-controlled pheromone sampling.
+    /// temperature > 1.0 = more exploration, < 1.0 = more exploitation.
+    Stigmergic { temperature: f64 },
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -380,6 +383,7 @@ impl LiveDiscoveryCorpus {
                 idx.truncate(k);
                 idx
             }
+            SampleStrategy::Stigmergic { temperature } => self.sample_stigmergic(k, temperature),
         };
 
         // Increment sample counts
@@ -661,6 +665,41 @@ impl LiveDiscoveryCorpus {
             }
         }
         result
+    }
+
+    /// Temperature-controlled pheromone sampling (stigmergic).
+    /// - temperature = 1.0: standard pheromone-proportional
+    /// - temperature > 1.0: flatter distribution (more exploration)
+    /// - temperature < 1.0: sharper distribution (more exploitation / greedy-like)
+    fn sample_stigmergic(&mut self, k: usize, temperature: f64) -> Vec<usize> {
+        if self.entries.is_empty() { return vec![]; }
+        let temp = temperature.max(0.01); // avoid division by zero
+
+        // Apply temperature to pheromone weights via softmax-style transform
+        let weights: Vec<f64> = self.entries.iter()
+            .map(|e| (e.pheromone / temp).exp())
+            .collect();
+        let total: f64 = weights.iter().sum();
+        if total == 0.0 || !total.is_finite() { return self.sample_uniform(k); }
+
+        // Weighted sampling without replacement
+        let mut chosen = Vec::with_capacity(k);
+        let mut remaining: Vec<(usize, f64)> = weights.into_iter().enumerate().collect();
+        for _ in 0..k {
+            if remaining.is_empty() { break; }
+            let sum: f64 = remaining.iter().map(|(_, w)| w).sum();
+            if sum == 0.0 || !sum.is_finite() { break; }
+            let r = (self.lcg_next() as f64 / u64::MAX as f64) * sum;
+            let mut acc = 0.0;
+            let mut sel = 0;
+            for (idx, (_, w)) in remaining.iter().enumerate() {
+                acc += w;
+                if r <= acc { sel = idx; break; }
+            }
+            let (chosen_i, _) = remaining.remove(sel);
+            chosen.push(chosen_i);
+        }
+        chosen
     }
 }
 
@@ -1351,5 +1390,80 @@ mod tests {
         assert_eq!(chain2.len(), 3);
         assert_eq!(chain2.public_key, chain.public_key);
         assert!(chain2.verify_all());
+    }
+
+    // ── Stigmergic sampling tests ────────────────────────────────────────
+
+    #[test]
+    fn stigmergic_sample_returns_correct_count() {
+        let mut c = LiveDiscoveryCorpus::new(GateConfig::default());
+        // Add entries with very different titles to pass novelty gate
+        let titles = [
+            "Quantum entanglement breaks locality assumptions",
+            "Ocean currents drive atmospheric temperature patterns",
+            "Mitochondrial DNA reveals ancient migration routes",
+            "Solar panel efficiency exceeds theoretical Shockley limit",
+            "Bacterial quorum sensing coordinates biofilm formation",
+            "Tectonic plate subduction generates volcanic activity",
+            "Neural oscillations synchronize during memory consolidation",
+            "CRISPR modifications propagate through wild populations",
+            "Dark matter halos influence galactic rotation curves",
+            "Ribosome stalling triggers mRNA quality control pathways",
+        ];
+        for (i, title) in titles.iter().enumerate() {
+            let src = &format!("src{i}"); // different sources to avoid diversity gate
+            let d = make_discovery(src, title, 0.8);
+            c.add_discovery(d);
+            c.feedback_positive(i); // give some pheromone
+        }
+        let batch = c.sample_batch(5, SampleStrategy::Stigmergic { temperature: 1.0 });
+        assert_eq!(batch.entries.len(), 5);
+    }
+
+    #[test]
+    fn stigmergic_sample_empty_corpus() {
+        let mut c = LiveDiscoveryCorpus::new(GateConfig::default());
+        let batch = c.sample_batch(5, SampleStrategy::Stigmergic { temperature: 1.0 });
+        assert_eq!(batch.entries.len(), 0);
+    }
+
+    #[test]
+    fn stigmergic_low_temp_favors_high_pheromone() {
+        let mut c = LiveDiscoveryCorpus::new(GateConfig::default());
+        // Entry id=0: low pheromone (no feedback)
+        let d0 = make_discovery("src", "Low pheromone entry stays weak", 0.8);
+        c.add_discovery(d0);
+        // Entry id=1: high pheromone (via repeated feedback)
+        let d1 = make_discovery("other", "High pheromone entry boosted strongly here", 0.8);
+        c.add_discovery(d1);
+        // Boost entry 1's pheromone to cap (1.0)
+        for _ in 0..20 {
+            c.feedback_positive(1);
+        }
+
+        // Low temperature (exploitation) — should strongly favor entry 1 (id=1)
+        let mut high_count = 0;
+        for _ in 0..10 {
+            let batch = c.sample_batch(1, SampleStrategy::Stigmergic { temperature: 0.1 });
+            if !batch.entries.is_empty() && batch.entries[0].id == 1 {
+                high_count += 1;
+            }
+        }
+        // With very low temp, high-pheromone entry should dominate
+        assert!(high_count >= 7, "Expected mostly entry 1 (high pheromone), got {high_count}/10");
+    }
+
+    #[test]
+    fn stigmergic_batch_integration() {
+        let mut c = LiveDiscoveryCorpus::new(GateConfig::default());
+        for i in 0..5 {
+            let d = make_discovery("src", &format!("Stigmergic discovery number {i} content here"), 0.8);
+            c.add_discovery(d);
+        }
+        // Various temperatures should all return valid batches
+        for temp in [0.1, 0.5, 1.0, 2.0, 10.0] {
+            let batch = c.sample_batch(3, SampleStrategy::Stigmergic { temperature: temp });
+            assert!(batch.entries.len() <= 3);
+        }
     }
 }

@@ -100,6 +100,76 @@ impl Discovery {
     }
 }
 
+// ── OODA Feedback Loop ───────────────────────────────────────────────────
+
+/// Tracks cycle-over-cycle learning for adaptive OODA loop closure.
+#[derive(Debug, Clone)]
+pub struct OodaFeedback {
+    /// Discoveries per cycle history.
+    pub cycle_yields: Vec<usize>,
+    /// Quality score trend (avg per cycle).
+    pub quality_trend: Vec<f64>,
+    /// Explore ratio ∈ [0.1, 0.9]. Higher = prefer cold spots over hot paths.
+    pub explore_ratio: f64,
+}
+
+impl OodaFeedback {
+    /// Create with default exploration ratio.
+    pub fn new() -> Self {
+        Self {
+            cycle_yields: Vec::new(),
+            quality_trend: Vec::new(),
+            explore_ratio: 0.5,
+        }
+    }
+
+    /// Record results of a cycle and adjust exploration.
+    pub fn record_cycle(&mut self, discoveries: &[Discovery]) {
+        let yield_count = discoveries.len();
+        let avg_quality = if yield_count > 0 {
+            discoveries.iter().map(|d| d.quality_score).sum::<f64>() / yield_count as f64
+        } else {
+            0.0
+        };
+
+        self.cycle_yields.push(yield_count);
+        self.quality_trend.push(avg_quality);
+
+        // Adaptive exploration: if yields declining for 3+ cycles, increase exploration
+        if self.cycle_yields.len() >= 3 {
+            let n = self.cycle_yields.len();
+            let (a, b, c) = (
+                self.cycle_yields[n - 3],
+                self.cycle_yields[n - 2],
+                self.cycle_yields[n - 1],
+            );
+            if c <= b && b <= a && a > 0 {
+                // Declining: explore more
+                self.explore_ratio = (self.explore_ratio + 0.1).min(0.9);
+            } else if c > a {
+                // Improving: exploit more
+                self.explore_ratio = (self.explore_ratio - 0.05).max(0.1);
+            }
+        }
+    }
+
+    /// Total discoveries across all recorded cycles.
+    pub fn total_discoveries(&self) -> usize {
+        self.cycle_yields.iter().sum()
+    }
+
+    /// Number of cycles recorded.
+    pub fn cycles_recorded(&self) -> usize {
+        self.cycle_yields.len()
+    }
+}
+
+impl Default for OodaFeedback {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── API connectors ─────────────────────────────────────────────────────────
 
 /// ASTRA data source connector.
@@ -750,6 +820,8 @@ pub struct AstraEngine {
     pub cycle_count: u64,
     /// Secret key used to create ZK provenance chains.
     provenance_secret: Vec<u8>,
+    /// OODA feedback tracker for adaptive loop closure.
+    feedback: OodaFeedback,
 }
 
 impl AstraEngine {
@@ -768,6 +840,7 @@ impl AstraEngine {
             discoveries: Vec::new(),
             cycle_count: 0,
             provenance_secret: secret.into_bytes(),
+            feedback: OodaFeedback::new(),
         }
     }
 
@@ -827,6 +900,8 @@ impl AstraEngine {
         self.discoveries.extend(new_discoveries.clone());
         self.cycle_count += 1;
 
+        self.feedback.record_cycle(&new_discoveries);
+
         Ok(new_discoveries)
     }
 
@@ -842,6 +917,11 @@ impl AstraEngine {
     /// Return corpus entries for all validated discoveries.
     pub fn corpus_entries(&self) -> Vec<String> {
         self.discoveries.iter().map(|d| d.to_corpus_entry()).collect()
+    }
+
+    /// Get a reference to the OODA feedback tracker.
+    pub fn feedback(&self) -> &OodaFeedback {
+        &self.feedback
     }
 
     /// Summary statistics.
@@ -1268,5 +1348,130 @@ mod tests {
             assert!(prov.verify_all(), "provenance chain should verify");
             assert!(prov.len() >= 2, "provenance chain should have at least 2 links");
         }
+    }
+
+    #[test]
+    fn ooda_feedback_tracks_yields() {
+        let mut fb = OodaFeedback::new();
+        assert_eq!(fb.cycles_recorded(), 0);
+        assert_eq!(fb.total_discoveries(), 0);
+
+        let discoveries = vec![Discovery {
+            id: "test".into(),
+            title: "Test".into(),
+            description: "Test discovery".into(),
+            causal_claims: vec![],
+            quality_score: 0.8,
+            proof_commitment: 0,
+            source: "test".into(),
+            timestamp: 0,
+            tags: vec![],
+            provenance: None,
+        }];
+        fb.record_cycle(&discoveries);
+        assert_eq!(fb.cycles_recorded(), 1);
+        assert_eq!(fb.total_discoveries(), 1);
+        assert!((fb.quality_trend[0] - 0.8).abs() < 1e-10);
+    }
+
+    #[test]
+    fn ooda_feedback_increases_exploration_on_decline() {
+        let mut fb = OodaFeedback::new();
+        let initial = fb.explore_ratio;
+
+        // Simulate declining yields: 5, 3, 1
+        let make_n = |n: usize| -> Vec<Discovery> {
+            (0..n).map(|i| Discovery {
+                id: format!("d{i}"),
+                title: format!("D{i}"),
+                description: "x".into(),
+                causal_claims: vec![],
+                quality_score: 0.7,
+                proof_commitment: 0,
+                source: "s".into(),
+                timestamp: 0,
+                tags: vec![],
+                provenance: None,
+            }).collect()
+        };
+
+        fb.record_cycle(&make_n(5));
+        fb.record_cycle(&make_n(3));
+        fb.record_cycle(&make_n(1)); // declining: 5 >= 3 >= 1
+
+        assert!(fb.explore_ratio > initial); // should have increased
+    }
+
+    #[test]
+    fn ooda_feedback_decreases_exploration_on_improvement() {
+        let mut fb = OodaFeedback::new();
+
+        let make_n = |n: usize| -> Vec<Discovery> {
+            (0..n).map(|i| Discovery {
+                id: format!("d{i}"),
+                title: format!("D{i}"),
+                description: "x".into(),
+                causal_claims: vec![],
+                quality_score: 0.7,
+                proof_commitment: 0,
+                source: "s".into(),
+                timestamp: 0,
+                tags: vec![],
+                provenance: None,
+            }).collect()
+        };
+
+        fb.record_cycle(&make_n(1));
+        fb.record_cycle(&make_n(3));
+        fb.record_cycle(&make_n(5)); // improving: 5 > 1
+
+        assert!(fb.explore_ratio < 0.5); // should have decreased from 0.5
+    }
+
+    #[test]
+    fn ooda_explore_ratio_bounded() {
+        let mut fb = OodaFeedback::new();
+        fb.explore_ratio = 0.85;
+
+        let make_n = |n: usize| -> Vec<Discovery> {
+            (0..n).map(|i| Discovery {
+                id: format!("d{i}"),
+                title: format!("D{i}"),
+                description: "x".into(),
+                causal_claims: vec![],
+                quality_score: 0.7,
+                proof_commitment: 0,
+                source: "s".into(),
+                timestamp: 0,
+                tags: vec![],
+                provenance: None,
+            }).collect()
+        };
+
+        // Push it up repeatedly
+        for _ in 0..10 {
+            fb.record_cycle(&make_n(5));
+            fb.record_cycle(&make_n(3));
+            fb.record_cycle(&make_n(1));
+        }
+        assert!(fb.explore_ratio <= 0.9);
+
+        // Push it down repeatedly
+        for _ in 0..50 {
+            fb.record_cycle(&make_n(1));
+            fb.record_cycle(&make_n(3));
+            fb.record_cycle(&make_n(10));
+        }
+        assert!(fb.explore_ratio >= 0.1);
+    }
+
+    #[test]
+    fn ooda_close_loop_called_in_run_cycle() {
+        // Run a cycle and verify feedback was recorded
+        let cfg = AstraConfig::default();
+        let mut engine = AstraEngine::new(cfg);
+        assert_eq!(engine.feedback().cycles_recorded(), 0);
+        let _ = engine.run_cycle();
+        assert_eq!(engine.feedback().cycles_recorded(), 1);
     }
 }
