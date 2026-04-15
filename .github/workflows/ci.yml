@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── CPU-only tests (all crates except atlas-tensor) ─────────────────────
+  test:
+    name: Test (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build (exclude atlas-tensor — needs CUDA)
+        run: cargo build --workspace --exclude atlas-tensor
+
+      - name: Test (exclude atlas-tensor)
+        run: cargo test --workspace --exclude atlas-tensor
+
+      - name: Clippy (exclude atlas-tensor)
+        run: cargo clippy --workspace --exclude atlas-tensor -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ── GPU tests (all crates including atlas-tensor with CUDA) ─────────────
+  gpu-test:
+    name: Test (GPU)
+    runs-on: ubuntu-latest
+    if: false  # Enable when self-hosted GPU runner is available
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check CUDA
+        run: nvidia-smi
+
+      - name: Build all crates
+        run: cargo build --workspace
+
+      - name: Test all crates (including GPU)
+        run: cargo test --workspace
+
+  # ── Benchmarks (on-demand, not blocking CI) ─────────────────────────────
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run benchmarks
+        run: |
+          cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture 2>&1 | tee benchmark-results.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: benchmark-results.txt
+          retention-days: 30

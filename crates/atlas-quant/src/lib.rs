@@ -22,6 +22,9 @@
 use atlas_core::{AtlasError, Result};
 use atlas_tensor::Tensor;
 
+pub mod lora;
+pub use lora::LoraConfig;
+
 // ── INT8 ──────────────────────────────────────────────────────────────────
 
 /// A row-wise INT8-quantized weight matrix.

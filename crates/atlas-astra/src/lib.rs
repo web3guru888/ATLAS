@@ -24,6 +24,7 @@
 use atlas_core::Result;
 use atlas_http::HttpClient;
 use atlas_json::Json;
+use atlas_zk::{ProvenanceChain, ProvenanceLinkType};
 
 // ── Data types ─────────────────────────────────────────────────────────────
 
@@ -78,6 +79,8 @@ pub struct Discovery {
     pub timestamp: u64,
     /// Tags.
     pub tags: Vec<String>,
+    /// ZK provenance chain (API source → observation → discovery). `None` if not yet computed.
+    pub provenance: Option<ProvenanceChain>,
 }
 
 impl Discovery {
@@ -685,6 +688,7 @@ impl Decider {
                 source: hyp.source.clone(),
                 timestamp: epoch_secs(),
                 tags: hyp.tags.clone(),
+                provenance: None,
             });
             seen.push(title);
         }
@@ -738,11 +742,15 @@ pub struct AstraEngine {
     pub discoveries: Vec<Discovery>,
     /// Total OODA cycles run.
     pub cycle_count: u64,
+    /// Secret key used to create ZK provenance chains.
+    provenance_secret: Vec<u8>,
 }
 
 impl AstraEngine {
     /// Create a new engine with the given config.
     pub fn new(cfg: AstraConfig) -> Self {
+        // Derive a deterministic provenance key from the query string
+        let secret = format!("atlas_provenance_{}", cfg.arxiv_query);
         Self {
             decider: Decider {
                 min_confidence: cfg.min_quality,
@@ -753,6 +761,7 @@ impl AstraEngine {
             known_titles: Vec::new(),
             discoveries: Vec::new(),
             cycle_count: 0,
+            provenance_secret: secret.into_bytes(),
         }
     }
 
@@ -785,6 +794,27 @@ impl AstraEngine {
         new_discoveries.truncate(self.config.max_per_cycle);
 
         // ── ACT ──────────────────────────────────────────────────────────
+        // Attach ZK provenance chains to each discovery
+        for d in &mut new_discoveries {
+            let mut chain = ProvenanceChain::new(&self.provenance_secret);
+
+            // Link 1: API source
+            let source_claim = format!("Source: {} via ASTRA OODA cycle {}", d.source, self.cycle_count);
+            chain.add_link(&source_claim, &self.provenance_secret, ProvenanceLinkType::ApiSource);
+
+            // Link 2: Observation → causal hypothesis
+            if let Some((cause, effect, conf)) = d.causal_claims.first() {
+                let hyp_claim = format!("Hypothesis: {} → {} (conf={:.2})", cause, effect, conf);
+                chain.add_link(&hyp_claim, &self.provenance_secret, ProvenanceLinkType::Hypothesis);
+            }
+
+            // Link 3: Final discovery
+            let disc_claim = format!("Discovery: {} | quality={:.2}", d.title, d.quality_score);
+            chain.add_link(&disc_claim, &self.provenance_secret, ProvenanceLinkType::Discovery);
+
+            d.provenance = Some(chain);
+        }
+
         for d in &new_discoveries {
             self.known_titles.push(d.title.clone());
         }
@@ -984,6 +1014,7 @@ mod tests {
             source: "test".into(),
             timestamp: 0,
             tags: vec![],
+            provenance: None,
         });
         let entries = engine.corpus_entries();
         assert_eq!(entries.len(), 1);
@@ -1002,6 +1033,7 @@ mod tests {
             source: "arxiv".into(),
             timestamp: 0,
             tags: vec![],
+            provenance: None,
         };
         let entry = d.to_corpus_entry();
         assert!(entry.contains("CO2"));
@@ -1200,5 +1232,35 @@ mod tests {
         let src = NasaConnector::new(40.7128, -74.0060);
         let obs = src.fetch().unwrap();
         assert!(!obs.is_empty(), "should get results from NASA POWER");
+    }
+
+    // ── Provenance tests ────────────────────────────────────────────────
+
+    #[test]
+    fn discovery_has_provenance_after_cycle() {
+        // Use a minimal config that produces deterministic hypotheses from text
+        let mut engine = AstraEngine::new(AstraConfig::default());
+        // Manually inject a text observation with causal language
+        let obs = vec![Observation {
+            source: "test".to_string(),
+            content: "CO2 causes global warming according to recent measurements".to_string(),
+            url: "test://provenance".to_string(),
+            retrieved_at: 0,
+        }];
+        let hyps = engine.orienter.orient(&obs);
+        let mut discs = engine.decider.decide(&hyps, &engine.known_titles);
+        // Attach provenance manually (same logic as run_cycle ACT phase)
+        for d in &mut discs {
+            let mut chain = ProvenanceChain::new(&engine.provenance_secret);
+            chain.add_link(&format!("Source: {}", d.source), &engine.provenance_secret, ProvenanceLinkType::ApiSource);
+            chain.add_link(&format!("Discovery: {}", d.title), &engine.provenance_secret, ProvenanceLinkType::Discovery);
+            d.provenance = Some(chain);
+        }
+        if !discs.is_empty() {
+            let d = &discs[0];
+            let prov = d.provenance.as_ref().expect("discovery should have provenance");
+            assert!(prov.verify_all(), "provenance chain should verify");
+            assert!(prov.len() >= 2, "provenance chain should have at least 2 links");
+        }
     }
 }

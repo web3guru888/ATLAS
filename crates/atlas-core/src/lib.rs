@@ -6,6 +6,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod bench;
+
 /// ATLAS error type.
 #[derive(Debug)]
 pub enum AtlasError {

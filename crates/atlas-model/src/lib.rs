@@ -1343,6 +1343,64 @@ mod tests {
         let _ = std::fs::remove_file(tmp);
     }
 
+    // ── Benchmarks (run with: cargo test -p atlas-model -- --ignored --nocapture)
+
+    #[test]
+    #[ignore]
+    fn bench_rms_norm_2048() {
+        use atlas_core::bench::Bench;
+        let w = vec![1.0f32; 2048];
+        let b = Bench::run("rmsnorm_2048", 10_000, || {
+            let mut x: Vec<f32> = (0..2048).map(|i| (i as f32) * 0.001).collect();
+            rmsnorm_inplace(&mut x, &w, 1e-5);
+            std::hint::black_box(&x);
+        });
+        eprintln!("{}", b.report());
+        assert!(b.ns_per_op() > 0.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_rope_2048() {
+        use atlas_core::bench::Bench;
+        let head_dim = 128; // typical head dim for 2048-dim model with 16 heads
+        let cache = RopeCache::new(head_dim, 4096, 500_000.0);
+        let b = Bench::run("rope_128dim_apply", 50_000, || {
+            let mut x: Vec<f32> = (0..head_dim).map(|i| (i as f32) * 0.01).collect();
+            cache.apply(&mut x, 42);
+            std::hint::black_box(&x);
+        });
+        eprintln!("{}", b.report());
+        assert!(b.ns_per_op() > 0.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_softmax_4096() {
+        use atlas_core::bench::Bench;
+        let b = Bench::run("softmax_4096", 10_000, || {
+            let mut x: Vec<f32> = (0..4096).map(|i| (i as f32) * 0.001 - 2.0).collect();
+            softmax_inplace(&mut x);
+            std::hint::black_box(&x);
+        });
+        eprintln!("{}", b.report());
+        assert!(b.ns_per_op() > 0.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_forward_tiny_model() {
+        use atlas_core::bench::Bench;
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+        let b = Bench::run("forward_tiny_3tok", 100, || {
+            model.pos = 0; // reset position
+            std::hint::black_box(model.forward(&[0u32, 1, 2], 0));
+        });
+        eprintln!("{}", b.report());
+        assert!(b.ns_per_op() > 0.0);
+    }
+
     /// Helper: compute the expected shape and numel for a tensor name given a config.
     fn tensor_shape_for_config(cfg: &ModelConfig, name: &str) -> (Vec<usize>, usize) {
         let d = cfg.d_model;

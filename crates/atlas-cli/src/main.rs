@@ -300,7 +300,7 @@ fn cmd_corpus(args: &[String]) -> i32 {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn cmd_train(args: &[String]) -> i32 {
-    use atlas_corpus::{LiveDiscoveryCorpus, GateConfig, SampleStrategy};
+    use atlas_corpus::{LiveDiscoveryCorpus, GateConfig, SftTrainer, SftConfig};
 
     let corpus_path = match opt(args, "--corpus") {
         Some(p) => p,
@@ -308,7 +308,7 @@ fn cmd_train(args: &[String]) -> i32 {
     };
     let epochs   = opt_usize(args, "--epochs", 1);
     let batch_sz = opt_usize(args, "--batch", 8);
-    let lr       = opt_f64(args, "--lr", 2e-5);
+    let lr       = opt_f64(args, "--lr", 0.01) as f32;
     let output   = opt(args, "--output").unwrap_or("./atlas-ckpt");
 
     println!("┌─ ATLAS train ─────────────────────────────────────────────────");
@@ -327,53 +327,52 @@ fn cmd_train(args: &[String]) -> i32 {
         return 1;
     }
 
-    println!("\n  Corpus: {} entries loaded", corpus.len());
-    println!("  Starting training loop…\n");
+    let sft_cfg = SftConfig {
+        batch_size: batch_sz,
+        lr,
+        max_epochs: epochs,
+        ..Default::default()
+    };
 
-    let batches_per_epoch = (corpus.len() + batch_sz - 1) / batch_sz;
-    let mut step = 0usize;
-    let mut sim_loss = 2.3f64;
+    let mut trainer = SftTrainer::new(sft_cfg);
+
+    println!("\n  Model: {} params (vocab={}, hidden={})",
+        trainer.model.param_count(), trainer.config.vocab_size, trainer.config.hidden_dim);
+    println!("  Corpus: {} entries loaded", corpus.len());
+    println!("  Starting real SFT training (GradTape + AdamW)…\n");
 
     for epoch in 1..=epochs {
-        println!("  Epoch {epoch}/{epochs}  ({batches_per_epoch} batches)");
-        for batch_idx in 0..batches_per_epoch {
-            let batch = corpus.sample_batch(batch_sz, SampleStrategy::Mixed);
-            step += 1;
-
-            // Deterministic loss simulation: decaying + LCG noise
-            let noise = ((step as f64 * 0.3718).sin().abs()) * 0.01;
-            sim_loss = (sim_loss * 0.998 + noise).max(0.5);
-
-            // Positive feedback → reinforce pheromone
-            for e in &batch.entries {
-                corpus.feedback_positive(e.id);
+        match trainer.train_epoch(&mut corpus) {
+            Ok(em) => {
+                println!("  Epoch {epoch}/{epochs}: loss={:.4}  lr={:.2e}  steps={}  entries={}",
+                    em.mean_loss, em.final_lr, em.steps, em.entries_processed);
             }
-
-            let log_every = batches_per_epoch.max(10) / 10;
-            if batch_idx % log_every == 0 {
-                let pct = (batch_idx + 1) as f64 / batches_per_epoch as f64 * 100.0;
-                println!("    step={step:6}  batch={batch_idx:4}/{batches_per_epoch}  \
-                    {pct:5.1}%  loss={sim_loss:.4}  ph={:.3}",
-                    batch.mean_pheromone);
+            Err(e) => {
+                eprintln!("  ✗ Training error at epoch {epoch}: {e}");
+                return 1;
             }
         }
-
-        corpus.decay_pheromones(0.97);
-        let cs = corpus.stats();
-        println!("  → epoch {epoch} done  loss={sim_loss:.4}  mean_ph={:.3}", cs.mean_pheromone);
     }
 
+    // Decay pheromones after training
+    corpus.decay_pheromones(0.97);
+
+    // Save corpus with updated pheromones
     if let Err(e) = corpus.save(corpus_path) {
         eprintln!("  Warning: could not save corpus: {e}");
     } else {
-        println!("\n  Corpus pheromones saved.");
+        println!("\n  ✓ Corpus pheromones saved.");
     }
 
+    // Save checkpoint
     std::fs::create_dir_all(output).ok();
+    let step = trainer.global_step;
+    let metrics = trainer.metrics();
+    let final_loss = metrics.epoch_history.last().map(|e| e.mean_loss).unwrap_or(0.0);
     let ckpt = format!("{output}/atlas-step{step}.json");
     let ckpt_json = format!(
-        r#"{{"step":{},"loss":{:.6},"lr":{:.2e},"epochs":{},"corpus_entries":{}}}"#,
-        step, sim_loss, lr, epochs, corpus.len()
+        r#"{{"step":{},"loss":{:.6},"lr":{:.2e},"epochs":{},"corpus_entries":{},"params":{}}}"#,
+        step, final_loss, trainer.optimizer.cfg.lr, epochs, corpus.len(), trainer.model.param_count()
     );
     match std::fs::write(&ckpt, &ckpt_json) {
         Ok(()) => println!("  ✓ Checkpoint: {ckpt}"),
@@ -381,7 +380,7 @@ fn cmd_train(args: &[String]) -> i32 {
     }
 
     println!("\n  ┌── Training complete ───────────────────────────────────────");
-    println!("  │  steps: {step}  final loss: {sim_loss:.4}  ckpt: {ckpt}");
+    println!("  │  steps: {step}  final loss: {final_loss:.4}  ckpt: {ckpt}");
     println!("  └────────────────────────────────────────────────────────────");
     0
 }

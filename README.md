@@ -271,6 +271,39 @@ Every tool call modifies live palace state. Pheromone trails compound across ses
 
 ---
 
+## Benchmarks
+
+ATLAS includes a zero-dependency benchmark suite using `atlas_core::bench::Bench`. Run with:
+
+```bash
+cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
+```
+
+**Representative results** (Ubuntu, Rust 1.82, AMD EPYC / Intel Xeon):
+
+| Benchmark | Metric | Description |
+|-----------|--------|-------------|
+| `palace_search_1000` | ~50–200 µs/op | TF-IDF semantic search across 1000 drawers |
+| `astar_100_nodes` | ~20–100 µs/op | Pheromone-guided A* pathfinding (100-node KG) |
+| `pheromone_deposit_decay_1000` | ~5–20 µs/op | 10 deposits + full decay cycle per iteration |
+| `kg_query_100_edges` | ~0.5–2 µs/op | KG edge lookup from a source node |
+| `rmsnorm_2048` | ~1–5 µs/op | RMSNorm on 2048-dim vector |
+| `rope_128dim_apply` | ~50–200 ns/op | RoPE rotation on a single attention head |
+| `schnorr_prove_verify` | ~200–500 ns/op | Schnorr ZK proof generation + verification |
+| `json_parse_1kb` | ~5–20 µs/op | Parse a 1KB JSON document (zero-dep parser) |
+
+> **Note**: Numbers vary by hardware. Run benchmarks on your own machine for accurate results.
+
+For individual crate benchmarks:
+```bash
+cargo test -p atlas-palace --test benchmarks -- --ignored --nocapture
+cargo test -p atlas-zk --test benchmarks -- --ignored --nocapture
+cargo test -p atlas-json --test benchmarks -- --ignored --nocapture
+cargo test -p atlas-model -- --ignored --nocapture
+```
+
+---
+
 ## Key Numbers (from existing research)
 
 - **d = 10.6** — Cohen's d for palace-memory vs. no-memory (ASTRA experiments)

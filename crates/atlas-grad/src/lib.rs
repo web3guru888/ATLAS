@@ -70,14 +70,32 @@ impl GradTape {
         out
     }
 
-    /// Run backward pass from `loss_idx`, accumulating gradients.
+    /// Run backward pass from `loss_idx`, seeding with all-ones gradient.
     ///
-    /// TODO Stage 1: implement VJP rules for each Op variant.
+    /// This is the standard backward pass for a scalar loss.
     pub fn backward(&mut self, loss_idx: usize) -> Result<()> {
-        // Seed the loss gradient with 1.0
         let loss_shape = self.tensors[loss_idx].shape().to_vec();
-        self.grads[loss_idx] = Some(Tensor::full(&loss_shape, 1.0));
-        // Traverse ops in reverse
+        let seed = Tensor::full(&loss_shape, 1.0);
+        self.backward_with_grad(loss_idx, seed)
+    }
+
+    /// Run backward pass from `idx` with a caller-supplied initial gradient.
+    ///
+    /// Use this when the loss is computed externally (e.g., cross-entropy on
+    /// logits) and you already know the gradient at this point in the graph.
+    ///
+    /// # Example
+    /// ```rust
+    /// use atlas_grad::GradTape;
+    /// use atlas_tensor::Tensor;
+    /// let mut tape = GradTape::new();
+    /// let x = tape.push(Tensor::from_vec(vec![1.0, 2.0], vec![1, 2]).unwrap());
+    /// let y = tape.relu(x);
+    /// let custom = Tensor::from_vec(vec![0.5, 3.0], vec![1, 2]).unwrap();
+    /// tape.backward_with_grad(y, custom).unwrap();
+    /// ```
+    pub fn backward_with_grad(&mut self, idx: usize, grad: Tensor) -> Result<()> {
+        self.grads[idx] = Some(grad);
         for op in self.ops.iter().rev() {
             match op {
                 Op::Matmul { left, right, out } => {
@@ -134,5 +152,39 @@ mod tests {
         let grad = tape.grads[x].as_ref().unwrap().as_slice().unwrap().to_vec();
         // gradient through relu: 0 for -1, 1 for 2
         assert_eq!(grad, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn backward_with_custom_grad() {
+        let mut tape = GradTape::new();
+        let x = tape.push(Tensor::from_vec(vec![1.0, 2.0], vec![1, 2]).unwrap());
+        let y = tape.relu(x);
+        // Custom gradient instead of all-ones
+        let custom = Tensor::from_vec(vec![0.5, 3.0], vec![1, 2]).unwrap();
+        tape.backward_with_grad(y, custom).unwrap();
+        let grad = tape.grads[x].as_ref().unwrap().as_slice().unwrap().to_vec();
+        // Both inputs positive → mask = [1,1], gradient = custom * mask
+        assert_eq!(grad, vec![0.5, 3.0]);
+    }
+
+    #[test]
+    fn backward_with_grad_through_matmul() {
+        let mut tape = GradTape::new();
+        // x=[1,2], W=[[1,0],[0,1]] (identity) → y = x×W = [1,2]
+        let x = tape.push(Tensor::from_vec(vec![1.0, 2.0], vec![1, 2]).unwrap());
+        let w = tape.push(Tensor::from_vec(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2]).unwrap());
+        let y = tape.matmul(x, w).unwrap();
+        let d_y = Tensor::from_vec(vec![0.5, -0.5], vec![1, 2]).unwrap();
+        tape.backward_with_grad(y, d_y).unwrap();
+        // d_x = d_y × W^T = [0.5, -0.5] × I = [0.5, -0.5]
+        let dx = tape.grads[x].as_ref().unwrap().as_slice().unwrap();
+        assert!((dx[0] - 0.5).abs() < 1e-6);
+        assert!((dx[1] - (-0.5)).abs() < 1e-6);
+        // d_W = x^T × d_y = [[1],[2]] × [[0.5,-0.5]] = [[0.5,-0.5],[1.0,-1.0]]
+        let dw = tape.grads[w].as_ref().unwrap().as_slice().unwrap();
+        assert!((dw[0] - 0.5).abs() < 1e-6);
+        assert!((dw[1] - (-0.5)).abs() < 1e-6);
+        assert!((dw[2] - 1.0).abs() < 1e-6);
+        assert!((dw[3] - (-1.0)).abs() < 1e-6);
     }
 }

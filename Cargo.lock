@@ -52,9 +52,14 @@ version = "0.1.0"
 dependencies = [
  "atlas-astra",
  "atlas-core",
+ "atlas-grad",
  "atlas-json",
+ "atlas-model",
+ "atlas-optim",
  "atlas-palace",
+ "atlas-tensor",
  "atlas-trm",
+ "atlas-zk",
 ]
 
 [[package]]

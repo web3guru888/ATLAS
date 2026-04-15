@@ -506,12 +506,13 @@ pub struct InferenceDiaryEntry {
 ///
 /// # Usage
 ///
-/// ```ignore
+/// ```no_run
+/// # use atlas_palace::inference::*;
 /// let mut agent = InferenceAgent::new("agent-1", "Scout", AgentArchetype::Explorer, 42);
-/// agent.set_goal_embedding(goal_vec);
+/// // agent.set_goal_embedding(goal_vec);
 ///
 /// // Evaluate candidates and navigate
-/// let selection = agent.select_navigation(&candidates);
+/// // let selection = agent.select_navigation(&candidates);
 ///
 /// // Observe the result and update beliefs
 /// agent.observe_belief("drawer-17", 0.85, 2.0);

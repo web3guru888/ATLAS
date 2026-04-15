@@ -18,12 +18,19 @@
 
 #![warn(missing_docs)]
 
+pub mod train;
+pub use train::{
+    SftTrainer, SftConfig, TrainableMlp, SimpleTokenizer, TokenBatch,
+    StepMetrics, EpochMetrics, TrainingMetrics, cross_entropy,
+};
+
 use std::collections::HashMap;
 
-use atlas_astra::Discovery;
+use atlas_astra::{Discovery, Observation};
 use atlas_core::Result;
 use atlas_json::Json;
 use atlas_palace::Palace;
+use atlas_zk::{ProvenanceChain, ProvenanceLinkType};
 
 // ────────────────────────────────────────────────────────────────────────────
 //  Quality gates
@@ -543,6 +550,7 @@ impl LiveDiscoveryCorpus {
                     proof_commitment: 0,
                     timestamp: ingested,
                     tags: vec![],
+                    provenance: None,
                 };
                 *corpus.source_counts.entry(source).or_insert(0) += 1;
                 corpus.entries.push(CorpusEntry {
@@ -678,13 +686,226 @@ fn json_string_escape(s: &str) -> String {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+//  Safety: configurable pre-corpus safety filter
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Configuration for the safety filter applied before corpus insertion.
+#[derive(Debug, Clone)]
+pub struct SafetyConfig {
+    /// Minimum confidence score (0–1) to pass safety check. Default 0.50.
+    pub min_confidence: f64,
+    /// Maximum number of discoveries accepted per OODA cycle. Default 50.
+    pub max_per_cycle: usize,
+    /// Blocklist: discoveries whose title contains any of these phrases are rejected.
+    pub known_falsehoods: Vec<String>,
+    /// If true, discoveries without supporting observations are flagged as hallucinations.
+    pub require_observations: bool,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            min_confidence: 0.50,
+            max_per_cycle: 50,
+            known_falsehoods: vec![
+                "flat earth".to_string(),
+                "perpetual motion".to_string(),
+                "5g causes".to_string(),
+            ],
+            require_observations: true,
+        }
+    }
+}
+
+/// Result of running the safety filter on one discovery.
+#[derive(Debug, Clone)]
+pub struct SafetyReport {
+    /// Whether the discovery passed all safety checks.
+    pub passed: bool,
+    /// Human-readable reasons for pass or fail.
+    pub reasons: Vec<String>,
+    /// Number of checks that passed.
+    pub checks_passed: usize,
+    /// Number of checks that failed.
+    pub checks_failed: usize,
+}
+
+impl SafetyReport {
+    fn pass(reasons: Vec<String>) -> Self {
+        let n = reasons.len();
+        Self { passed: true, reasons, checks_passed: n, checks_failed: 0 }
+    }
+    fn fail(passed_reasons: Vec<String>, failed_reasons: Vec<String>) -> Self {
+        let p = passed_reasons.len();
+        let f = failed_reasons.len();
+        let mut all = passed_reasons;
+        all.extend(failed_reasons);
+        Self { passed: false, reasons: all, checks_passed: p, checks_failed: f }
+    }
+}
+
+/// Configurable safety filter for pre-corpus validation.
+///
+/// Checks:
+/// 1. Minimum confidence threshold
+/// 2. Known falsehoods blocklist (case-insensitive substring match)
+/// 3. Rate limiting (max discoveries per cycle)
+/// 4. Hallucination detection (claims without supporting observations)
+///
+/// # Example
+/// ```
+/// use atlas_corpus::{SafetyFilter, SafetyConfig};
+/// let filter = SafetyFilter::new(SafetyConfig::default());
+/// assert_eq!(filter.cycle_accepted(), 0);
+/// ```
+pub struct SafetyFilter {
+    config: SafetyConfig,
+    /// How many discoveries have been accepted this cycle.
+    accepted_this_cycle: usize,
+}
+
+impl SafetyFilter {
+    /// Create a new safety filter.
+    pub fn new(config: SafetyConfig) -> Self {
+        Self { config, accepted_this_cycle: 0 }
+    }
+
+    /// Reset the per-cycle counter (call at the start of each OODA cycle).
+    pub fn reset_cycle(&mut self) {
+        self.accepted_this_cycle = 0;
+    }
+
+    /// How many discoveries accepted in the current cycle.
+    pub fn cycle_accepted(&self) -> usize {
+        self.accepted_this_cycle
+    }
+
+    /// Run all safety checks on a discovery.
+    ///
+    /// `observations` should be the raw observations that support this discovery.
+    /// If `require_observations` is true and `observations` is empty, the discovery
+    /// is flagged as a potential hallucination.
+    pub fn check(&mut self, discovery: &Discovery, observations: &[Observation]) -> SafetyReport {
+        let mut passed = Vec::new();
+        let mut failed = Vec::new();
+
+        // 1. Confidence threshold
+        if discovery.quality_score >= self.config.min_confidence {
+            passed.push(format!("confidence {:.2} ≥ {:.2}", discovery.quality_score, self.config.min_confidence));
+        } else {
+            failed.push(format!("FAIL: confidence {:.2} < {:.2}", discovery.quality_score, self.config.min_confidence));
+        }
+
+        // 2. Known falsehoods blocklist
+        let title_lower = discovery.title.to_lowercase();
+        let mut blocked = false;
+        for phrase in &self.config.known_falsehoods {
+            if title_lower.contains(&phrase.to_lowercase()) {
+                failed.push(format!("FAIL: matches known falsehood pattern \"{}\"", phrase));
+                blocked = true;
+                break;
+            }
+        }
+        if !blocked {
+            passed.push("no known falsehood match".to_string());
+        }
+
+        // 3. Rate limiting
+        if self.accepted_this_cycle < self.config.max_per_cycle {
+            passed.push(format!("rate limit {}/{}", self.accepted_this_cycle + 1, self.config.max_per_cycle));
+        } else {
+            failed.push(format!("FAIL: rate limit exceeded ({}/{})", self.accepted_this_cycle, self.config.max_per_cycle));
+        }
+
+        // 4. Hallucination detection
+        if self.config.require_observations {
+            if observations.is_empty() {
+                failed.push("FAIL: no supporting observations (possible hallucination)".to_string());
+            } else {
+                passed.push(format!("{} supporting observation(s)", observations.len()));
+            }
+        } else {
+            passed.push("observation check disabled".to_string());
+        }
+
+        if failed.is_empty() {
+            self.accepted_this_cycle += 1;
+            SafetyReport::pass(passed)
+        } else {
+            SafetyReport::fail(passed, failed)
+        }
+    }
+
+    /// Convenience: check a batch, returning (passed, failed) lists.
+    pub fn check_batch(&mut self, discoveries: &[Discovery], observations: &[Observation]) -> (Vec<usize>, Vec<usize>) {
+        let mut pass_ids = Vec::new();
+        let mut fail_ids = Vec::new();
+        for (i, d) in discoveries.iter().enumerate() {
+            let report = self.check(d, observations);
+            if report.passed {
+                pass_ids.push(i);
+            } else {
+                fail_ids.push(i);
+            }
+        }
+        (pass_ids, fail_ids)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  Provenance-augmented corpus insertion
+// ────────────────────────────────────────────────────────────────────────────
+
+impl LiveDiscoveryCorpus {
+    /// Ingest a discovery with provenance chain and safety checks.
+    ///
+    /// 1. Runs safety filter (if provided)
+    /// 2. Runs 5 quality gates
+    /// 3. Attaches provenance chain
+    /// 4. Inserts into corpus
+    ///
+    /// Returns `Some(entry_id)` on success, `None` if rejected.
+    pub fn add_discovery_safe(
+        &mut self,
+        mut discovery: Discovery,
+        observations: &[Observation],
+        safety: &mut SafetyFilter,
+        provenance_secret: &[u8],
+    ) -> Option<usize> {
+        // Safety check
+        let report = safety.check(&discovery, observations);
+        if !report.passed {
+            self.total_rejected += 1;
+            return None;
+        }
+
+        // Build provenance chain if discovery doesn't already have one
+        if discovery.provenance.is_none() {
+            let mut chain = ProvenanceChain::new(provenance_secret);
+            // Link each supporting observation
+            for obs in observations.iter().take(3) {
+                let claim = format!("Observation from {}: {}", obs.source, &obs.content[..obs.content.len().min(100)]);
+                chain.add_link(&claim, provenance_secret, ProvenanceLinkType::Observation);
+            }
+            // Link the discovery itself
+            let disc_claim = format!("Discovery: {} | quality={:.2}", discovery.title, discovery.quality_score);
+            chain.add_link(&disc_claim, provenance_secret, ProvenanceLinkType::Discovery);
+            discovery.provenance = Some(chain);
+        }
+
+        // Existing quality-gate path
+        self.add_discovery(discovery)
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 //  Tests
 // ────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atlas_astra::Discovery;
+    use atlas_astra::{Discovery, Observation};
 
     fn make_discovery(source: &str, title: &str, quality_score: f64) -> Discovery {
         Discovery {
@@ -697,6 +918,7 @@ mod tests {
             proof_commitment: 0,
             timestamp: 0,
             tags: vec![],
+            provenance: None,
         }
     }
 
@@ -900,5 +1122,231 @@ mod tests {
         let sources = c.sources();
         assert_eq!(sources.len(), 2);
         assert!(sources.contains(&"arxiv".to_string()) || sources.contains(&"nasa_power".to_string()));
+    }
+
+    // ── Safety filter tests ─────────────────────────────────────────────
+
+    fn make_observation(source: &str, content: &str) -> Observation {
+        Observation {
+            source: source.to_string(),
+            content: content.to_string(),
+            url: format!("test://{}", source),
+            retrieved_at: 0,
+        }
+    }
+
+    #[test]
+    fn safety_filter_passes_high_confidence() {
+        let mut sf = SafetyFilter::new(SafetyConfig::default());
+        let d = make_discovery("arxiv", "Graph neural networks achieve state of the art on causal benchmarks", 0.80);
+        let obs = vec![make_observation("arxiv", "GNN paper data")];
+        let report = sf.check(&d, &obs);
+        assert!(report.passed, "high confidence should pass: {:?}", report.reasons);
+        assert!(report.checks_failed == 0);
+    }
+
+    #[test]
+    fn safety_filter_blocks_low_confidence() {
+        let mut sf = SafetyFilter::new(SafetyConfig { min_confidence: 0.70, ..SafetyConfig::default() });
+        let d = make_discovery("arxiv", "Weak hypothesis about something with low evidence score", 0.40);
+        let obs = vec![make_observation("arxiv", "some data")];
+        let report = sf.check(&d, &obs);
+        assert!(!report.passed, "low confidence should fail: {:?}", report.reasons);
+        assert!(report.checks_failed > 0);
+    }
+
+    #[test]
+    fn safety_filter_blocks_known_falsehood() {
+        let mut sf = SafetyFilter::new(SafetyConfig::default());
+        let d = make_discovery("unknown", "Study shows flat earth predictions match observations with high accuracy", 0.90);
+        let obs = vec![make_observation("unknown", "flat earth data")];
+        let report = sf.check(&d, &obs);
+        assert!(!report.passed, "known falsehood should be blocked: {:?}", report.reasons);
+        assert!(report.reasons.iter().any(|r| r.contains("falsehood")));
+    }
+
+    #[test]
+    fn safety_filter_rate_limit() {
+        let cfg = SafetyConfig { max_per_cycle: 2, ..SafetyConfig::default() };
+        let mut sf = SafetyFilter::new(cfg);
+        let obs = vec![make_observation("arxiv", "data")];
+        // First 2 should pass
+        let d1 = make_discovery("arxiv", "First valid discovery about causal inference in neural networks", 0.80);
+        assert!(sf.check(&d1, &obs).passed);
+        let d2 = make_discovery("arxiv", "Second valid discovery about reinforcement learning agents exploring", 0.85);
+        assert!(sf.check(&d2, &obs).passed);
+        // Third should fail rate limit
+        let d3 = make_discovery("arxiv", "Third valid discovery about transformer attention mechanism patterns", 0.90);
+        let report = sf.check(&d3, &obs);
+        assert!(!report.passed, "rate limit should block 3rd: {:?}", report.reasons);
+        assert!(report.reasons.iter().any(|r| r.contains("rate limit")));
+    }
+
+    #[test]
+    fn safety_filter_rate_limit_resets() {
+        let cfg = SafetyConfig { max_per_cycle: 1, ..SafetyConfig::default() };
+        let mut sf = SafetyFilter::new(cfg);
+        let obs = vec![make_observation("arxiv", "data")];
+        let d1 = make_discovery("arxiv", "Valid discovery about causal inference in neural network models", 0.80);
+        assert!(sf.check(&d1, &obs).passed);
+        // Should fail
+        let d2 = make_discovery("arxiv", "Another discovery about reinforcement learning exploration strategies", 0.80);
+        assert!(!sf.check(&d2, &obs).passed);
+        // Reset cycle
+        sf.reset_cycle();
+        // Now should pass again
+        let d3 = make_discovery("arxiv", "Post-reset discovery about Bayesian optimization for hyperparameters", 0.80);
+        assert!(sf.check(&d3, &obs).passed);
+    }
+
+    #[test]
+    fn safety_hallucination_detection() {
+        let mut sf = SafetyFilter::new(SafetyConfig {
+            require_observations: true,
+            ..SafetyConfig::default()
+        });
+        let d = make_discovery("arxiv", "Discovery claims causal link without any supporting observation data", 0.80);
+        // No observations → hallucination
+        let report = sf.check(&d, &[]);
+        assert!(!report.passed, "no observations should flag hallucination: {:?}", report.reasons);
+        assert!(report.reasons.iter().any(|r| r.contains("hallucination")));
+    }
+
+    #[test]
+    fn safety_hallucination_with_observations_passes() {
+        let mut sf = SafetyFilter::new(SafetyConfig {
+            require_observations: true,
+            ..SafetyConfig::default()
+        });
+        let d = make_discovery("arxiv", "Causal inference algorithms recover ground truth graphs from real data", 0.80);
+        let obs = vec![make_observation("arxiv", "supporting evidence data from experiment")];
+        let report = sf.check(&d, &obs);
+        assert!(report.passed, "with observations should pass: {:?}", report.reasons);
+    }
+
+    #[test]
+    fn safety_batch_check() {
+        let mut sf = SafetyFilter::new(SafetyConfig::default());
+        let obs = vec![make_observation("arxiv", "data")];
+        let discoveries = vec![
+            make_discovery("arxiv", "Valid causal discovery about neural network weight initialization", 0.80),
+            make_discovery("unknown", "Flat earth predictions confirmed by satellite measurements analysis", 0.90),
+            make_discovery("arxiv", "Another valid discovery about attention mechanism sparse patterns", 0.75),
+        ];
+        let (passed, failed) = sf.check_batch(&discoveries, &obs);
+        assert!(passed.contains(&0), "first should pass");
+        assert!(failed.contains(&1), "second should fail (falsehood)");
+        assert!(passed.contains(&2), "third should pass");
+    }
+
+    // ── Provenance integration tests ────────────────────────────────────
+
+    #[test]
+    fn discovery_provenance_chain_verifies() {
+        use atlas_zk::{ProvenanceChain, ProvenanceLinkType};
+        let secret = b"test_provenance_secret";
+        let mut chain = ProvenanceChain::new(secret);
+        chain.add_link("NASA POWER: T2M=25.3", secret, ProvenanceLinkType::ApiSource);
+        chain.add_link("Temperature observed at NYC", secret, ProvenanceLinkType::Observation);
+        chain.add_link("Temperature → CO2", secret, ProvenanceLinkType::Discovery);
+
+        let mut d = make_discovery("nasa_power", "Temperature causes CO2 concentration changes according to measurements", 0.80);
+        d.provenance = Some(chain);
+
+        let prov = d.provenance.as_ref().unwrap();
+        assert!(prov.verify_all());
+        assert_eq!(prov.len(), 3);
+    }
+
+    #[test]
+    fn add_discovery_safe_attaches_provenance() {
+        let mut corpus = LiveDiscoveryCorpus::new(GateConfig::default());
+        let mut safety = SafetyFilter::new(SafetyConfig::default());
+        let secret = b"corpus_provenance_key";
+        let d = make_discovery("arxiv", "Causal discovery algorithms learn directed acyclic graph structures", 0.80);
+        let obs = vec![make_observation("arxiv", "paper data about causal graphs")];
+
+        let id = corpus.add_discovery_safe(d, &obs, &mut safety, secret);
+        assert!(id.is_some(), "should be accepted");
+
+        let entry = corpus.get(id.unwrap()).unwrap();
+        let prov = entry.discovery.provenance.as_ref().expect("should have provenance");
+        assert!(prov.verify_all(), "provenance should verify");
+        assert!(prov.len() >= 2, "should have at least observation + discovery links");
+    }
+
+    #[test]
+    fn add_discovery_safe_rejected_by_safety() {
+        let mut corpus = LiveDiscoveryCorpus::new(GateConfig::default());
+        let mut safety = SafetyFilter::new(SafetyConfig::default());
+        let secret = b"key";
+        // Low confidence → safety rejects
+        let d = make_discovery("arxiv", "Weak unsupported claim about something without evidence backing", 0.20);
+        let obs = vec![make_observation("arxiv", "data")];
+        let id = corpus.add_discovery_safe(d, &obs, &mut safety, secret);
+        assert!(id.is_none(), "should be rejected by safety");
+    }
+
+    #[test]
+    fn end_to_end_discovery_safety_provenance() {
+        // Full pipeline: create discovery → safety check → provenance → corpus
+        let mut corpus = LiveDiscoveryCorpus::new(GateConfig::default());
+        let mut safety = SafetyFilter::new(SafetyConfig::default());
+        let secret = b"e2e_secret";
+
+        let observations = vec![
+            make_observation("nasa_power", r#"{"T2M":25.3,"CO2":415.0}"#),
+            make_observation("arxiv", "Causal model linking temperature and CO2"),
+        ];
+
+        let discovery = Discovery {
+            id: "e2e-test-1".to_string(),
+            source: "nasa_power".to_string(),
+            title: "Temperature anomaly correlates strongly with atmospheric CO2 level".to_string(),
+            description: "Multi-source evidence of causal link".to_string(),
+            causal_claims: vec![("CO2".into(), "temperature".into(), 0.85)],
+            quality_score: 0.82,
+            proof_commitment: 0,
+            timestamp: 0,
+            tags: vec!["climate".to_string()],
+            provenance: None,
+        };
+
+        let id = corpus.add_discovery_safe(discovery, &observations, &mut safety, secret);
+        assert!(id.is_some(), "e2e: should be accepted");
+
+        let entry = corpus.get(id.unwrap()).unwrap();
+        assert!(entry.discovery.provenance.is_some(), "e2e: should have provenance");
+
+        let prov = entry.discovery.provenance.as_ref().unwrap();
+        assert!(prov.verify_all(), "e2e: provenance chain should verify");
+        assert!(prov.len() >= 3, "e2e: should have obs + obs + discovery links, got {}", prov.len());
+
+        // Verify the chain serializes and deserializes
+        let json = prov.to_json();
+        let prov2 = atlas_zk::ProvenanceChain::from_json(&json).unwrap();
+        assert_eq!(prov2.len(), prov.len());
+        assert!(prov2.verify_all(), "e2e: roundtripped provenance should verify");
+
+        // Corpus stats should reflect the accepted entry
+        let stats = corpus.stats();
+        assert_eq!(stats.total_entries, 1);
+        assert!(stats.mean_confidence > 0.5);
+    }
+
+    #[test]
+    fn provenance_to_json_roundtrip_in_corpus() {
+        use atlas_zk::{ProvenanceChain, ProvenanceLinkType};
+        let secret = b"json_rt_key";
+        let mut chain = ProvenanceChain::new(secret);
+        chain.add_link("raw API response", secret, ProvenanceLinkType::ApiSource);
+        chain.add_link("observed pattern", secret, ProvenanceLinkType::Observation);
+        chain.add_link("validated discovery", secret, ProvenanceLinkType::Discovery);
+
+        let json = chain.to_json();
+        let chain2 = ProvenanceChain::from_json(&json).expect("should parse");
+        assert_eq!(chain2.len(), 3);
+        assert_eq!(chain2.public_key, chain.public_key);
+        assert!(chain2.verify_all());
     }
 }
