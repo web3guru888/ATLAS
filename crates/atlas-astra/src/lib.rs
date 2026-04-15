@@ -158,10 +158,11 @@ impl NasaConnector {
                                             if let Some(f) = val.as_f64() {
                                                 if f > -990.0 {
                                                     // NASA uses -999.0 for missing
-                                                    fields.push(format!(r#""{}":{}""#, param_name, f));
+                                                    // Note: no trailing quote — produces valid JSON
+                                                    fields.push(format!(r#""{}":{}"#, param_name, f));
                                                 }
                                             } else if let Some(i) = val.as_i64() {
-                                                fields.push(format!(r#""{}":"{}""#, param_name, i));
+                                                fields.push(format!(r#""{}":{}"#, param_name, i));
                                             }
                                         }
                                     }
@@ -257,9 +258,10 @@ impl WhoConnector {
                         if let Some(pairs) = entry.as_object() {
                             for (k, v) in pairs {
                                 match v {
+                                    // Strings get quoted; numbers stay bare so as_f64() works later
                                     Json::Str(s)   => fields.push(format!(r#""{}":"{}""#, k, s)),
-                                    Json::Int(i)   => fields.push(format!(r#""{}":"{}""#, k, i)),
-                                    Json::Float(f) => fields.push(format!(r#""{}":"{}""#, k, f)),
+                                    Json::Int(i)   => fields.push(format!(r#""{}":{}"#, k, i)),
+                                    Json::Float(f) => fields.push(format!(r#""{}":{}"#, k, f)),
                                     _ => {}
                                 }
                             }

@@ -84,11 +84,14 @@ pub struct GateConfig {
 impl Default for GateConfig {
     fn default() -> Self {
         Self {
-            min_confidence: 0.55,
+            // 0.40: calibrated for live-API data (NASA/WHO/WorldBank/ArXiv) which
+            // produces raw confidence in the 0.45–0.90 range after causal extraction.
+            min_confidence: 0.40,
             min_novelty: 0.25,
             min_source_reliability: 0.4,
             max_source_fraction: 0.5,
-            min_summary_words: 6,
+            // 3: causal titles like "A → B" are inherently 3 tokens; 6 was too strict.
+            min_summary_words: 3,
         }
     }
 }
