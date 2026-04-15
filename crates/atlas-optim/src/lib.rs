@@ -200,11 +200,11 @@ impl AdamW {
 
 /// Cosine annealing with optional linear warm-up.
 ///
-/// ```
+/// ```text
 /// lr(t) = lr_min + 0.5·(lr_max - lr_min)·(1 + cos(π · (t - warmup) / (T - warmup)))
 /// ```
 /// During warm-up (t < warmup_steps):
-/// ```
+/// ```text
 /// lr(t) = lr_max · t / warmup_steps
 /// ```
 #[derive(Debug, Clone)]
