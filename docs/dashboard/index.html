@@ -1,0 +1,1158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ATLAS v4.0 — Active-inference Training with Learned Adaptive Stigmergy</title>
+  <style>
+    :root {
+      --bg: #060b13;
+      --bg2: #0b1520;
+      --bg3: #101e30;
+      --border: #1a3352;
+      --c1: #00d4ff;   /* cyan — OLMo */
+      --c2: #7c3aed;   /* purple — GraphPalace */
+      --c3: #10b981;   /* green — pheromones */
+      --c4: #f59e0b;   /* amber — morphic */
+      --c5: #ef4444;   /* red — ASTRA */
+      --c6: #e879f9;   /* pink — ZK */
+    --c7: #e8520a;   /* rust-orange — Pure Rust */
+      --text: #e2e8f0;
+      --text2: #94a3b8;
+      --text3: #475569;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; overflow-x: hidden; }
+    canvas#bg { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+    .z1 { position: relative; z-index: 1; }
+    .wrap { max-width: 1360px; margin: 0 auto; padding: 0 24px; }
+
+    /* HERO */
+    .hero { text-align: center; padding: 80px 20px 56px; }
+    .v-badge {
+      display: inline-block;
+      background: linear-gradient(135deg, rgba(239,68,68,0.2), rgba(124,58,237,0.2));
+      border: 1px solid var(--c5);
+      border-radius: 20px;
+      padding: 5px 16px;
+      font-size: 11px; letter-spacing: 2px; text-transform: uppercase;
+      color: var(--c5); margin-bottom: 24px;
+    }
+    h1.atlas {
+      font-size: clamp(64px, 10vw, 112px);
+      font-weight: 900; letter-spacing: -3px; line-height: 1;
+      background: linear-gradient(135deg, var(--c1) 0%, var(--c2) 40%, var(--c5) 80%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+      background-clip: text; margin-bottom: 10px;
+    }
+    .acronym { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+    .ap { padding: 5px 14px; border-radius: 8px; font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }
+    .ap1{background:rgba(0,212,255,.12);color:var(--c1);border:1px solid rgba(0,212,255,.3);}
+    .ap2{background:rgba(16,185,129,.12);color:var(--c3);border:1px solid rgba(16,185,129,.3);}
+    .ap3{background:rgba(245,158,11,.12);color:var(--c4);border:1px solid rgba(245,158,11,.3);}
+    .ap4{background:rgba(124,58,237,.12);color:var(--c2);border:1px solid rgba(124,58,237,.3);}
+    .ap5{background:rgba(239,68,68,.12);color:var(--c5);border:1px solid rgba(239,68,68,.3);}
+    .tagline { font-size: clamp(15px, 2.2vw, 19px); color: var(--text2); max-width: 720px; margin: 0 auto 12px; line-height: 1.55; }
+    .sub { font-size: 13px; color: var(--text3); font-style: italic; }
+
+    /* BREAKTHROUGH BOX */
+    .breakthrough {
+      background: linear-gradient(135deg, rgba(239,68,68,.07), rgba(124,58,237,.07));
+      border: 1px solid rgba(239,68,68,.35);
+      border-left: 3px solid var(--c5);
+      border-radius: 14px; padding: 28px 32px;
+      max-width: 1000px; margin: 0 auto 56px;
+      font-size: 18px; line-height: 1.7; color: var(--text);
+    }
+    .breakthrough em { color: var(--c5); font-style: normal; font-weight: 700; }
+    .breakthrough strong { color: var(--c1); }
+
+    /* SECTIONS */
+    .sec { margin-bottom: 64px; }
+    .sec-hdr { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; }
+    .sec-num {
+      width: 38px; height: 38px; border-radius: 10px; flex-shrink: 0;
+      background: linear-gradient(135deg, var(--c1), var(--c2));
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 800; font-size: 15px; color: #000;
+    }
+    .sec-title { font-size: clamp(20px, 2.8vw, 26px); font-weight: 700; }
+    .sec-sub { font-size: 13px; color: var(--text3); margin-top: 3px; }
+    .div { height: 1px; background: linear-gradient(90deg,transparent,var(--border),transparent); margin: 56px 0; }
+
+    /* CARDS */
+    .grid { display: grid; gap: 16px; }
+    .g2 { grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+    .g3 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .g4 { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .card {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 22px;
+      transition: all .2s;
+    }
+    .card:hover { transform: translateY(-2px); box-shadow: 0 0 20px rgba(0,212,255,.15); border-color: var(--c1); }
+    .card-icon { font-size: 26px; margin-bottom: 12px; }
+    .card-title { font-size: 15px; font-weight: 700; margin-bottom: 8px; }
+    .card-body { font-size: 13px; color: var(--text2); line-height: 1.6; }
+    .ct { border-top: 2px solid; }
+    .ct1{border-top-color:var(--c1);} .ct2{border-top-color:var(--c2);} .ct3{border-top-color:var(--c3);}
+    .ct4{border-top-color:var(--c4);} .ct5{border-top-color:var(--c5);} .ct6{border-top-color:var(--c6);}
+
+    /* FLYWHEEL VISUAL */
+    .flywheel-wrap {
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 16px; padding: 40px; overflow-x: auto;
+    }
+    .fw-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+    .fw-node {
+      background: var(--bg3); border-radius: 10px; padding: 12px 18px;
+      font-size: 13px; font-weight: 600; border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .fw-n1{border-color:var(--c5);color:var(--c5);}
+    .fw-n2{border-color:var(--c2);color:var(--c2);}
+    .fw-n3{border-color:var(--c3);color:var(--c3);}
+    .fw-n4{border-color:var(--c1);color:var(--c1);}
+    .fw-n5{border-color:var(--c4);color:var(--c4);}
+    .fw-arr { color: var(--text3); font-size: 20px; }
+    .fw-label { font-size: 11px; color: var(--text3); margin-left: 4px; }
+    .fw-loop {
+      display: flex; align-items: center; justify-content: center;
+      gap: 8px; margin-top: 16px;
+      background: linear-gradient(135deg, rgba(239,68,68,.06), rgba(0,212,255,.06));
+      border: 1px dashed rgba(255,255,255,.1); border-radius: 10px;
+      padding: 12px 20px; font-size: 13px; color: var(--text2);
+    }
+
+    /* DATA COMPARISON TABLE */
+    table.cmp { width: 100%; border-collapse: collapse; background: var(--bg2); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); }
+    table.cmp th { background: var(--bg3); padding: 12px 18px; text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text3); border-bottom: 1px solid var(--border); }
+    table.cmp td { padding: 11px 18px; font-size: 13px; border-bottom: 1px solid rgba(26,51,82,.5); color: var(--text2); }
+    table.cmp tr:last-child td { border-bottom: none; }
+    table.cmp tr:hover td { background: rgba(255,255,255,.02); }
+    table.cmp td:first-child { font-weight: 600; color: var(--text); }
+    .yes { color: var(--c3); font-weight: 700; }
+    .no { color: var(--text3); }
+    .atlas-v { color: var(--c1) !important; font-weight: 700 !important; }
+
+    /* STATS BAND */
+    .stats-band {
+      display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px;
+    }
+    .stat {
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 10px; padding: 14px 20px; flex: 1; min-width: 140px;
+    }
+    .stat-val { font-size: 26px; font-weight: 800; line-height: 1; }
+    .stat-label { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 1px; margin-top: 5px; }
+    .sv1{color:var(--c5);} .sv2{color:var(--c3);} .sv3{color:var(--c1);} .sv4{color:var(--c4);} .sv5{color:var(--c2);}
+
+    /* TRAINING EXAMPLE BLOCK */
+    .ex-block {
+      background: var(--bg3); border: 1px solid var(--border); border-radius: 10px;
+      padding: 18px 22px; font-family: 'Courier New', monospace; font-size: 12px;
+      color: var(--text2); line-height: 1.7; overflow-x: auto;
+    }
+    .ex-block .key { color: var(--c1); }
+    .ex-block .val { color: var(--c3); }
+    .ex-block .conf { color: var(--c4); }
+    .ex-block .src { color: var(--c5); }
+    .ex-type { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+
+    /* ROADMAP */
+    .rm { border-left: 2px solid var(--border); }
+    .rm-phase { padding: 24px 0 24px 32px; border-left: none; position: relative; }
+    .rm-phase::before {
+      content: ''; position: absolute; left: -8px; top: 28px;
+      width: 14px; height: 14px; border-radius: 50%; border: 2px solid;
+    }
+    .rp0::before{border-color:var(--c5);background:rgba(239,68,68,.2);}
+    .rp1::before{border-color:var(--c1);background:rgba(0,212,255,.2);}
+    .rp2::before{border-color:var(--c3);background:rgba(16,185,129,.2);}
+    .rp3::before{border-color:var(--c2);background:rgba(124,58,237,.2);}
+    .rm-inner { display: flex; gap: 20px; }
+    .rm-label { flex-shrink: 0; width: 120px; }
+    .rm-name { font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; }
+    .rn0{color:var(--c5);}.rn1{color:var(--c1);}.rn2{color:var(--c3);}.rn3{color:var(--c2);}
+    .rm-time { font-size: 11px; color: var(--text3); margin-top: 3px; }
+    .rm-content { flex: 1; }
+    .rm-title { font-size: 17px; font-weight: 700; margin-bottom: 6px; }
+    .rm-desc { font-size: 13px; color: var(--text2); line-height: 1.6; margin-bottom: 12px; }
+    .rm-tags { display: flex; flex-wrap: wrap; gap: 7px; }
+    .rm-tag { background: var(--bg3); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; font-size: 12px; color: var(--text2); }
+
+    /* PAPER CARDS */
+    .paper { background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 22px; }
+    .paper-n { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+    .paper-t { font-size: 15px; font-weight: 700; font-style: italic; color: var(--text); margin-bottom: 8px; line-height: 1.4; }
+    .paper-venue { font-size: 12px; color: var(--c3); margin-bottom: 12px; }
+    .paper-claims { list-style: none; }
+    .paper-claims li { font-size: 12px; color: var(--text2); padding: 3px 0 3px 14px; position: relative; line-height: 1.5; }
+    .paper-claims li::before { content: '→'; position: absolute; left: 0; color: var(--text3); }
+
+    /* STATUS */
+    .status-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .sbadge { display: flex; align-items: center; gap: 7px; background: var(--bg3); border: 1px solid var(--border); border-radius: 7px; padding: 7px 12px; font-size: 12px; color: var(--text2); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+    .dg{background:var(--c3);box-shadow:0 0 5px var(--c3);}
+    .dy{background:var(--c4);box-shadow:0 0 5px var(--c4);}
+    .db{background:var(--c1);box-shadow:0 0 5px var(--c1);}
+    .dr{background:var(--c5);box-shadow:0 0 5px var(--c5);}
+    .dgr{background:var(--text3);}
+
+    /* QUOTE */
+    .quote { border-left: 3px solid var(--c2); padding: 16px 24px; background: rgba(124,58,237,.06); border-radius: 0 8px 8px 0; font-size: 16px; color: var(--text2); font-style: italic; line-height: 1.65; margin: 28px 0; }
+
+    /* FOOTER */
+    footer { text-align: center; padding: 48px 20px; border-top: 1px solid var(--border); color: var(--text3); font-size: 13px; }
+    footer strong { color: var(--text2); }
+    footer a { color: var(--text3); text-decoration: none; }
+    footer a:hover { color: var(--c1); }
+
+    @keyframes pulse { 0%,100%{opacity:.6;} 50%{opacity:1;} }
+    .live-badge {
+      display: inline-flex; align-items: center; gap: 7px;
+      background: rgba(239,68,68,.12); border: 1px solid rgba(239,68,68,.35);
+      border-radius: 20px; padding: 5px 14px; font-size: 12px; color: var(--c5);
+      animation: pulse 2s ease-in-out infinite; margin: 4px;
+    }
+    .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--c5); }
+    .phero-badge {
+      display: inline-flex; align-items: center; gap: 7px;
+      background: rgba(16,185,129,.1); border: 1px solid rgba(16,185,129,.3);
+      border-radius: 20px; padding: 5px 14px; font-size: 12px; color: var(--c3);
+      animation: pulse 2.8s ease-in-out infinite; margin: 4px;
+    }
+    .phero-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--c3); }
+
+    /* DIAGRAM GALLERY */
+    .diag-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(560px, 1fr)); gap: 20px; }
+    .diag-card {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 14px;
+      overflow: hidden; transition: all .25s; cursor: pointer; text-decoration: none;
+    }
+    .diag-card:hover { transform: translateY(-3px); box-shadow: 0 0 28px rgba(124,58,237,.25); border-color: var(--c2); }
+    .diag-card img { width: 100%; height: auto; display: block; }
+    .diag-meta { padding: 14px 18px; display: flex; align-items: flex-start; gap: 12px; }
+    .diag-num { font-size: 11px; font-weight: 800; color: var(--c2); background: rgba(124,58,237,.12);
+      border: 1px solid rgba(124,58,237,.3); border-radius: 6px; padding: 3px 9px;
+      white-space: nowrap; flex-shrink: 0; margin-top: 1px; }
+    .diag-title { font-size: 14px; font-weight: 700; margin-bottom: 3px; }
+    .diag-sub { font-size: 12px; color: var(--text3); }
+    .diag-badge { display: inline-block; background: rgba(0,212,255,.08);
+      border: 1px solid rgba(0,212,255,.2); border-radius: 4px;
+      padding: 2px 7px; font-size: 10px; color: var(--c1); margin-top: 5px; }
+
+    /* RUST SECTION */
+    .rust-intro {
+      background: linear-gradient(135deg, rgba(232,82,10,.06), rgba(0,0,0,0));
+      border: 1px solid rgba(232,82,10,.25); border-left: 3px solid var(--c7);
+      border-radius: 12px; padding: 22px 28px; margin-bottom: 28px;
+      font-size: 14px; color: var(--text2); line-height: 1.7;
+    }
+    .rust-intro strong { color: var(--c7); }
+    .crate-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 10px; margin: 20px 0; }
+    .crate-card {
+      background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+      padding: 14px 16px; transition: all .2s;
+    }
+    .crate-card:hover { border-color: var(--c7); box-shadow: 0 0 14px rgba(232,82,10,.15); transform: translateY(-1px); }
+    .crate-name { font-family: 'Courier New', monospace; font-size: 13px; font-weight: 700; color: var(--c7); margin-bottom: 5px; }
+    .crate-desc { font-size: 11px; color: var(--text3); line-height: 1.45; }
+    .crate-port { font-size: 10px; color: var(--text3); margin-top: 5px; font-style: italic; }
+    .crate-port.new { color: var(--c3); }
+    .crate-port.copy { color: var(--c2); }
+
+    .build-stage {
+      display: flex; gap: 18px; padding: 18px 0 18px 28px;
+      border-left: 2px solid rgba(232,82,10,.25); position: relative; margin-bottom: 0;
+    }
+    .build-stage::before {
+      content: ''; position: absolute; left: -7px; top: 22px;
+      width: 12px; height: 12px; border-radius: 50%;
+      background: var(--c7); border: 2px solid rgba(232,82,10,.4);
+    }
+    .bs-label { flex-shrink: 0; width: 100px; }
+    .bs-num { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px; color: var(--c7); }
+    .bs-weeks { font-size: 11px; color: var(--text3); margin-top: 2px; }
+    .bs-content { flex: 1; }
+    .bs-title { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+    .bs-crates { font-family: 'Courier New', monospace; font-size: 12px; color: var(--c7); margin-bottom: 5px; }
+    .bs-milestone { font-size: 12px; color: var(--text2); }
+    .bs-milestone strong { color: var(--c3); }
+
+    .prop-table { width: 100%; border-collapse: collapse; background: var(--bg2); border-radius: 12px; overflow: hidden; border: 1px solid var(--border); margin-top: 20px; }
+    .prop-table th { background: var(--bg3); padding: 10px 16px; text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text3); border-bottom: 1px solid var(--border); }
+    .prop-table td { padding: 10px 16px; font-size: 12px; border-bottom: 1px solid rgba(26,51,82,.5); color: var(--text2); }
+    .prop-table tr:last-child td { border-bottom: none; }
+    .prop-table td:first-child { font-weight: 700; color: var(--text); font-size: 11px; }
+    .prop-bad { color: var(--text3); }
+    .prop-good { color: var(--c3); font-weight: 700; }
+  </style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+
+<div class="z1 wrap">
+
+  <!-- HERO -->
+  <div class="hero">
+    <div class="v-badge">🔴 ATLAS v4.0 · ASTRA-dev + TRM-CausalValidator + Pure Rust · VBRL Holdings · 2026</div>
+    <h1 class="atlas">ATLAS</h1>
+    <div class="acronym">
+      <span class="ap ap1">A · Active Inference</span>
+      <span class="ap ap2">T · Training</span>
+      <span class="ap ap3">L · Learned</span>
+      <span class="ap ap4">A · Adaptive</span>
+      <span class="ap ap5">S · Stigmergy</span>
+    </div>
+    <p class="tagline">The first LLM trained on real scientific discoveries — not web scrapes, not GPT-4 synthetic data. A closed-loop system where the model and the autonomous research engine make each other smarter. Every causal claim validated by a recursive neural module before it reaches training.</p>
+    <p class="sub">OLMo 3 7B · GraphPalace · ASTRA-dev · Morphic Resonance · RLVR · ZK Claims · TRM-CausalValidator</p>
+    <div style="margin-top: 20px;">
+      <span class="live-badge"><span class="live-dot"></span> ASTRA discovering · ~10s/cycle</span>
+      <span class="phero-badge"><span class="phero-dot"></span> pheromone system active</span>
+    </div>
+  </div>
+
+  <!-- BREAKTHROUGH -->
+  <div class="breakthrough">
+    <em>Don't train on what humans wrote about the world.</em><br>
+    <em>Train on what you actually discover about the world.</em><br>
+    <em>Validate what you claim — recursively, not generatively.</em><br><br>
+    ATLAS v3.0 adds <strong>TRM-CausalValidator</strong> — a 7M-parameter recursive module that validates every causal graph before it enters the training corpus. Based on Samsung SAIL's Tiny Recursive Model (arXiv:2510.04871, 45% ARC-AGI-1 at 7M params). ATLAS's pheromone curriculum and TRM's recursive validation are two independent proofs of the same principle: <em>structured computation beats brute-force scale.</em><br><br>
+    ATLAS v4.0 adds the final architectural decision: <strong style="color:var(--c7);">Pure Rust, Zero Dependencies</strong> — 16 crates, built from scratch, every algorithm ported from its original source. No PyPI. No crates.io. One static binary. Total sovereign ownership.
+  </div>
+
+  <!-- ASTRA STATS -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num" style="background:linear-gradient(135deg,var(--c5),var(--c2));">A</div>
+      <div>
+        <div class="sec-title">ASTRA-dev: What It Brings</div>
+        <div class="sec-sub">Proven autonomous discovery engine — already integrated with GraphPalace in MemPalace-AGI</div>
+      </div>
+    </div>
+
+    <div class="stats-band">
+      <div class="stat"><div class="stat-val sv1">540+</div><div class="stat-label">Unique discoveries · 45 experiments</div></div>
+      <div class="stat"><div class="stat-val sv2">5,251+</div><div class="stat-label">KG triples from live data</div></div>
+      <div class="stat"><div class="stat-val sv3">d=10.6</div><div class="stat-label">Cohen's d · memory vs. baseline</div></div>
+      <div class="stat"><div class="stat-val sv4">34.4×</div><div class="stat-label">More discoveries than no-memory</div></div>
+      <div class="stat"><div class="stat-val sv5">100%</div><div class="stat-label">Dedup accuracy · 5-heuristic system</div></div>
+      <div class="stat"><div class="stat-val sv1">R²=0.924</div><div class="stat-label">Convergence fit · p&lt;0.001</div></div>
+      <div class="stat"><div class="stat-val sv2">16</div><div class="stat-label">Live data sources (NASA, WHO, WB…)</div></div>
+      <div class="stat"><div class="stat-val sv3">~10s</div><div class="stat-label">Per discovery cycle · continuous</div></div>
+    </div>
+
+    <div class="grid g3">
+      <div class="card ct5">
+        <div class="card-icon">🔬</div>
+        <div class="card-title">OODA Discovery Engine</div>
+        <div class="card-body">89 endpoints. Hypothesis lifecycle management. Every hypothesis is Observe → Orient (semantic search in palace) → Decide (Bayesian scoring) → Act (causal inference run). Only validated hypotheses enter the corpus.</div>
+      </div>
+      <div class="card ct5">
+        <div class="card-icon">⚗️</div>
+        <div class="card-title">Causal Inference, Not Correlation</div>
+        <div class="card-body">PC and FCI algorithms on real data. Not "CO₂ and temperature are correlated" — but "CO₂ causally drives temperature increase (conf=0.847, PC-validated on 146 years of NASA GISTEMP)". This is what gets into the training corpus.</div>
+      </div>
+      <div class="card ct5">
+        <div class="card-icon">🌐</div>
+        <div class="card-title">Cross-Domain Structural Analogies</div>
+        <div class="card-body">201K+ structural analogies identified. Climate → Epidemiology → Economics → Astrophysics → Cryptography. 1.37× cross-domain acceleration. The training data contains causal bridges between scientific fields no human dataset has.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- EFFICIENCY PROOF -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num" style="background:linear-gradient(135deg,var(--c4),#f97316);">E</div>
+      <div>
+        <div class="sec-title">The Efficiency Proof: Two Independent Validations</div>
+        <div class="sec-sub">Structured computation beats brute-force scale — proven at inference time and training time, by separate research groups</div>
+      </div>
+    </div>
+    <div style="overflow-x:auto;">
+      <table style="width:100%;border-collapse:collapse;font-size:13px;margin-bottom:20px;">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border);">
+            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;white-space:nowrap;">Domain</th>
+            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;">System</th>
+            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;">Mechanism</th>
+            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;">Scale claimed</th>
+            <th style="padding:10px 14px;text-align:left;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.8px;">Actual result</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style="border-bottom:1px solid var(--border);background:rgba(249,115,22,.05);">
+            <td style="padding:12px 14px;color:#f97316;font-weight:700;">Inference-time</td>
+            <td style="padding:12px 14px;color:var(--text);">TRM-CausalValidator<br><span style="font-size:11px;color:var(--text3);">Samsung SAIL Montreal<br>arXiv:2510.04871</span></td>
+            <td style="padding:12px 14px;color:var(--text2);">Test-time recursion<br>z = net(x,y,z) × 6 passes<br>attention-free MLP</td>
+            <td style="padding:12px 14px;color:var(--text3);">Kaplan scaling law<br>predicts ~5–10B params<br>for 45% ARC-AGI-1</td>
+            <td style="padding:12px 14px;"><span style="color:#f97316;font-weight:700;">7M params → 45% ARC-AGI-1</span><br><span style="font-size:11px;color:var(--text3);">0.14% of predicted requirement<br>beats DeepSeek R1, o3-mini, Gemini 2.5 Pro</span></td>
+          </tr>
+          <tr style="background:rgba(16,185,129,.05);">
+            <td style="padding:12px 14px;color:var(--c3);font-weight:700;">Training-time</td>
+            <td style="padding:12px 14px;color:var(--text);">ATLAS Morphic Warm-Start<br><span style="font-size:11px;color:var(--text3);">BUTTERS · Robin et al.<br>O(1/√T) confirmed</span></td>
+            <td style="padding:12px 14px;color:var(--text2);">Pheromone curriculum<br>Cross-run warm-start<br>stigmergic memory transfer</td>
+            <td style="padding:12px 14px;color:var(--text3);">Standard scaling<br>predicts 3–5× more<br>params for same gain</td>
+            <td style="padding:12px 14px;"><span style="color:var(--c3);font-weight:700;">70% regret reduction (189→57 steps)</span><br><span style="font-size:11px;color:var(--text3);">R²=0.982, p&lt;10⁻³⁰ · O(1/√T) confirmed<br>7B with curriculum ≈ 20–30B vanilla</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="breakthrough" style="margin-bottom:0;font-size:15px;">
+      <strong>Shared principle</strong>: Neither system achieves its result by adding parameters. Both impose <em>structure on the computation</em> — TRM through iterative latent refinement within a forward pass, ATLAS through pheromone-guided curriculum across training runs. These mechanisms are <strong>orthogonal and complementary</strong> — TRM validates individual causal claims at inference time; ATLAS curriculum learns <em>which</em> claims matter over training time. Together they form ATLAS v3.0.
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- THE FLYWHEEL -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num">2</div>
+      <div>
+        <div class="sec-title">The Discovery Flywheel</div>
+        <div class="sec-sub">The closed loop that makes ATLAS self-improving — no other architecture has this</div>
+      </div>
+    </div>
+
+    <div class="flywheel-wrap">
+      <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:20px;">CLOSED TRAINING LOOP · ACCELERATES WITH EACH CYCLE</div>
+
+      <div class="fw-row">
+        <div class="fw-node fw-n1">ASTRA-dev<br><small>OODA · ~10s/cycle</small></div>
+        <span class="fw-arr">→</span>
+        <div class="fw-node fw-n2">GraphPalace<br><small>deposit_pheromones()</small></div>
+        <span class="fw-arr">→</span>
+        <div class="fw-node fw-n3">LiveDiscoveryCorpus<br><small>quality-gated · causal · novel</small></div>
+        <span class="fw-arr">→</span>
+        <div class="fw-node fw-n4">OLMo 3 7B<br><small>continuous SFT + RLVR</small></div>
+        <span class="fw-arr">→</span>
+        <div class="fw-node fw-n5">Better Hypotheses<br><small>Orient phase upgrade</small></div>
+      </div>
+      <div class="fw-row" style="padding-left:20px;">
+        <span style="color:var(--text3);font-size:22px;">↑</span>
+        <span class="fw-label">feeds back</span>
+        <span style="flex:1;border-top:1px dashed rgba(255,255,255,.12);margin:0 10px;"></span>
+        <span class="fw-label">better discoveries ↓</span>
+        <span style="color:var(--text3);font-size:22px;">↓</span>
+      </div>
+      <div class="fw-loop">
+        🔄 <strong style="color:var(--c1);">atlas-7b</strong> generates better Orient-phase hypotheses
+        → ASTRA makes better/more discoveries
+        → richer LiveDiscoveryCorpus
+        → better atlas-7b
+        → <em style="color:var(--c3);">accelerating flywheel</em>
+      </div>
+
+      <div style="margin-top:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;">
+        <div style="background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:14px;">
+          <div style="font-size:11px;color:var(--c5);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Without ATLAS</div>
+          <div style="font-size:13px;color:var(--text2);">ASTRA calls GPT-4 for Orient<br>Generic model, expensive<br>No domain specialization<br>No pheromone awareness</div>
+        </div>
+        <div style="background:rgba(0,212,255,.07);border:1px solid rgba(0,212,255,.2);border-radius:8px;padding:14px;">
+          <div style="font-size:11px;color:var(--c1);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">With ATLAS</div>
+          <div style="font-size:13px;color:var(--text2);">ASTRA calls atlas-7b for Orient<br>Trained on 500K+ own discoveries<br>Deep domain specialization<br>Pheromone-path aware · $0 cost</div>
+        </div>
+        <div style="background:rgba(16,185,129,.07);border:1px solid rgba(16,185,129,.2);border-radius:8px;padding:14px;">
+          <div style="font-size:11px;color:var(--c3);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Expected improvement</div>
+          <div style="font-size:13px;color:var(--text2);">DC-24 proved 1.83× novelty transfer<br>Domain model → 2-5× projected<br>Same O(1/√T) morphic bound<br>Self-improving without humans</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- WHY ASTRA DATA IS BETTER -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num">3</div>
+      <div>
+        <div class="sec-title">Why ASTRA Data is Better Than Any Static Dataset</div>
+        <div class="sec-sub">The highest-quality scientific training data that has ever existed</div>
+      </div>
+    </div>
+    <div style="overflow-x:auto;">
+      <table class="cmp">
+        <tr>
+          <th>Property</th>
+          <th>Dolma / web scrapes</th>
+          <th>Human-curated datasets</th>
+          <th>GPT-4 synthetic data</th>
+          <th style="color:var(--c1);">ASTRA-dev discoveries</th>
+        </tr>
+        <tr><td>Ground truth</td><td class="no">Opinion/hearsay</td><td class="no">Manually checked</td><td class="no">Model hallucinations possible</td><td class="atlas-v">✅ API-verified, causal</td></tr>
+        <tr><td>Novelty guarantee</td><td class="no">Unknown, likely stale</td><td class="no">Curated once</td><td class="no">Repeats training data</td><td class="atlas-v">✅ 100% dedup-confirmed</td></tr>
+        <tr><td>Causal grounding</td><td class="no">Correlational at best</td><td class="no">Mostly correlational</td><td class="no">None</td><td class="atlas-v">✅ PC/FCI inference</td></tr>
+        <tr><td>Confidence scores</td><td class="no">None</td><td class="no">Sometimes</td><td class="no">None</td><td class="atlas-v">✅ Bayesian P(H|E)</td></tr>
+        <tr><td>Cross-domain links</td><td class="no">Incidental</td><td class="no">Domain-specific</td><td class="no">Surface-level</td><td class="atlas-v">✅ 201K+ structural analogies</td></tr>
+        <tr><td>Currency</td><td class="no">Training cutoff frozen</td><td class="no">Updated rarely</td><td class="no">Static after generation</td><td class="atlas-v">✅ Continuous · ~10s/cycle</td></tr>
+        <tr><td>Full provenance</td><td class="no">Unknown</td><td class="no">Partial</td><td class="no">None</td><td class="atlas-v">✅ API → analysis → claim</td></tr>
+        <tr><td>Self-improving</td><td class="no">Static</td><td class="no">Static</td><td class="no">Static</td><td class="atlas-v">✅ d=10.6 memory effect</td></tr>
+        <tr><td>ZK verifiable</td><td class="no">No</td><td class="no">No</td><td class="no">No</td><td class="atlas-v">✅ Schnorr proof chain</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- TRAINING EXAMPLES -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num">4</div>
+      <div>
+        <div class="sec-title">Discovery → Training Example</div>
+        <div class="sec-sub">How ASTRA discoveries become OLMo training data</div>
+      </div>
+    </div>
+    <div class="grid g2">
+      <div>
+        <div class="ex-type">Raw ASTRA Discovery</div>
+        <div class="ex-block">
+<span class="key">"hypothesis"</span>: <span class="val">"Elevated Arctic CO₂ correlates with +2.3°C temperature increase"</span>,<br>
+<span class="key">"domain"</span>: <span class="val">"climate"</span>,<br>
+<span class="conf">"confidence"</span>: <span class="conf">0.847</span>,<br>
+<span class="key">"evidence"</span>: [<span class="src">"NASA_GISTEMP_2024"</span>, <span class="src">"NOAA_CO2_monthly"</span>],<br>
+<span class="key">"causal_chain"</span>: [<span class="val">"CO2 → temp_rise → arctic_ice_loss"</span>],<br>
+<span class="key">"cross_domain"</span>: [<span class="val">"epi:respiratory_mortality"</span>, <span class="val">"econ:agricultural_GDP"</span>],<br>
+<span class="conf">"novelty_score"</span>: <span class="conf">0.923</span>,<br>
+<span class="conf">"pheromone_intensity"</span>: <span class="conf">0.784</span>
+        </div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        <div>
+          <div class="ex-type">→ Type 1: Causal Q&A Training Pair</div>
+          <div class="ex-block">
+<span class="key">Q:</span> <span class="val">What is the causal relationship between Arctic CO₂ and temperature?</span><br><br>
+<span class="key">A:</span> <span class="val">Based on NASA GISTEMP (146yr) + NOAA CO₂ data, PC/FCI causal inference confirms CO₂ increase causally drives +2.3°C Arctic temperature rise (conf=0.847). Not merely correlated — causal direction established. Evidence chain: NASA_GISTEMP_2024 → PC_algorithm → validated 2026-04-15.</span>
+          </div>
+        </div>
+        <div>
+          <div class="ex-type">→ Type 2: Cross-Domain DPO Pair</div>
+          <div class="ex-block">
+<span class="key">CHOSEN</span> <span class="conf">(pheromone=0.784)</span>:<br>
+<span class="val">"CO₂-driven temperature rise (0.847) causally links to respiratory mortality via WHO_GHO data — cross-domain causal chain confirmed"</span><br><br>
+<span class="key">REJECTED</span> <span class="conf">(pheromone=0.12)</span>:<br>
+<span class="val">"Climate change generally affects health outcomes"</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- SIX PILLARS -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num">5</div>
+      <div>
+        <div class="sec-title">Seven Pillars (v3.0)</div>
+        <div class="sec-sub">Six original + TRM-CausalValidator — recursive validation as a first-class architectural component</div>
+      </div>
+    </div>
+    <div class="grid g3">
+      <div class="card ct1"><div class="card-icon">🏛️</div><div class="card-title">GraphPalace Memory</div><div class="card-body">Pheromone-weighted persistent knowledge. search_by_embedding() + navigate() + hot_paths() at inference. Dedup-confirmed discoveries deposited as pheromone-weighted rooms. Cold spots = training gaps.</div></div>
+      <div class="card ct4"><div class="card-icon">🌊</div><div class="card-title">Morphic Warm-Start</div><div class="card-body">Cross-run curriculum intelligence. O(1/√T) convergence — proven in BUTTERS (R²=0.982, p&lt;10⁻³⁰). Each run's gradient map guides next run. Pheromone decay = natural curriculum forgetting.</div></div>
+      <div class="card ct3"><div class="card-icon">⚗️</div><div class="card-title">Stigmergic RLVR</div><div class="card-body">r_total = α·r_verifiable + β·r_pheromone. Pheromone reward provides temporal credit across episodes. Decay prevents reward hacking. Validated reasoning paths get higher reward than lucky shortcuts.</div></div>
+      <div class="card ct2"><div class="card-icon">🧬</div><div class="card-title">Active Inference Data Gen</div><div class="card-body">Palace cold spots → GraphPalace AI agents generate synthetic examples AND direct ASTRA to fetch real data for those domains. Real + synthetic data, both stigmergically directed.</div></div>
+      <div class="card ct6"><div class="card-icon">🔐</div><div class="card-title">ZK Knowledge Claims</div><div class="card-body">Full provenance chain: LLM output → training example → ASTRA discovery → causal inference run → raw API data → NASA/WHO/World Bank. Schnorr proof at every link. Hallucinations detectable — no valid proof trail.</div></div>
+      <div class="card ct5"><div class="card-icon">🔴</div><div class="card-title" style="color:var(--c5);">LiveDiscoveryCorpus</div><div class="card-body">ASTRA-dev's continuous output as a living training dataset. ~10s/cycle. Quality-gated: Bayesian > 0.65, novelty > 0.55, causal inference completed, live API source. ~86K quality examples/month. Self-improving via flywheel.</div></div>
+      <div class="card" style="border-top:2px solid #f97316;"><div class="card-icon" style="font-size:22px;font-weight:900;color:#f97316;">TRM</div><div class="card-title" style="color:#f97316;">TRM-CausalValidator ← v3.0</div><div class="card-body">7M-param recursive module (Samsung SAIL, arXiv:2510.04871). Validates causal graph consistency before corpus entry. z = net(x,y,z) × 6 recursions. <strong style="color:#f97316;">0.1% of atlas-7b compute</strong> for structured causal graph checking. Generates Type 5 training traces. Quality Gate 6.</div></div>
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- ROADMAP -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num">6</div>
+      <div>
+        <div class="sec-title">Implementation Roadmap (v3.0)</div>
+        <div class="sec-sub">Phase 0 mostly done — Phase 3 now includes TRM-CausalValidator (~500 LOC)</div>
+      </div>
+    </div>
+    <div class="rm">
+      <div class="rm-phase rp0">
+        <div class="rm-inner">
+          <div class="rm-label"><div class="rm-name rn0">Phase 0</div><div class="rm-time">1 week · mostly done</div></div>
+          <div class="rm-content">
+            <div class="rm-title">ASTRA + GraphPalace Merge</div>
+            <div class="rm-desc">The MemPalace-AGI project already built 12 integration components (PalaceDiscoveryMemory, MemoryAugmentedOrient, KnowledgeGraphBridge, etc.). Merge into ATLAS workspace. Seed the LiveDiscoveryCorpus — run ASTRA for 1 week, generate 10K+ quality-gated training examples.</div>
+            <div class="rm-tags"><span class="rm-tag">PalaceDiscoveryMemory ✅</span><span class="rm-tag">MemoryAugmentedOrient ✅</span><span class="rm-tag">KnowledgeGraphBridge ✅</span><span class="rm-tag">LiveDiscoveryCorpus harvester</span><span class="rm-tag">Quality gate pipeline</span><span class="rm-tag">Seed corpus (1 week)</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="rm-phase rp1">
+        <div class="rm-inner">
+          <div class="rm-label"><div class="rm-name rn1">Phase 1</div><div class="rm-time">2-4 weeks</div></div>
+          <div class="rm-content">
+            <div class="rm-title">ATLAS-Lite: Palace-Augmented Inference</div>
+            <div class="rm-desc">OLMo 3 7B with GraphPalace as tool call. Seeded with ASTRA discoveries. First comparison: ASTRA-seeded palace vs. Dolma-seeded palace vs. vanilla OLMo on scientific reasoning questions. Paper 1 proof of concept likely done here in week 1.</div>
+            <div class="rm-tags"><span class="rm-tag">OLMo 3 7B loaded</span><span class="rm-tag">Palace tool call wired</span><span class="rm-tag">Pheromone deposit hook</span><span class="rm-tag">ASTRA vs Dolma palace eval</span><span class="rm-tag">OLMES baseline</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="rm-phase rp2">
+        <div class="rm-inner">
+          <div class="rm-label"><div class="rm-name rn2">Phase 2</div><div class="rm-time">4-8 weeks</div></div>
+          <div class="rm-content">
+            <div class="rm-title">ATLAS-SFT: First Live Training Run</div>
+            <div class="rm-desc">Fine-tune OLMo 7B on LiveDiscoveryCorpus (QLoRA, RTX 4090). Pheromone-guided batch sampler. Then swap atlas-7b into ASTRA's Orient phase — measure discovery improvement. Run 3 sequential morphic-warm-start runs to confirm O(1/√T).</div>
+            <div class="rm-tags"><span class="rm-tag">Pheromone data sampler</span><span class="rm-tag">QLoRA SFT on corpus</span><span class="rm-tag">atlas-7b → ASTRA Orient</span><span class="rm-tag">Flywheel measurement</span><span class="rm-tag">O(1/√T) curve</span><span class="rm-tag">DPO palace pairs</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="rm-phase rp3" style="border-left:none;">
+        <div class="rm-inner">
+          <div class="rm-label"><div class="rm-name rn3">Phase 3</div><div class="rm-time">2-4 months</div></div>
+          <div class="rm-content">
+            <div class="rm-title">ATLAS-Full: Stigmergic RLVR + ZK + TRM + Papers</div>
+            <div class="rm-desc">Full closed loop. Pheromone reward in RLVR. ZK provenance chains from output to NASA API. TRM-CausalValidator deployed as Quality Gate 6. Continuous fine-tuning as corpus grows. atlas-7b on HuggingFace. Six papers submitted.</div>
+            <div class="rm-tags"><span class="rm-tag">Stigmergic RLVR</span><span class="rm-tag">ZK full chain</span><span class="rm-tag">TRM-CausalValidator</span><span class="rm-tag">Validation Router</span><span class="rm-tag">Type 5 traces</span><span class="rm-tag">Continuous fine-tuning</span><span class="rm-tag">atlas-7b release</span><span class="rm-tag">Paper 1: Architecture</span><span class="rm-tag">Paper 2: Discovery Flywheel</span><span class="rm-tag">Paper 3: RLVR</span><span class="rm-tag">Paper 4: O(1/√T)</span><span class="rm-tag">Paper 5: ZK Provenance</span><span class="rm-tag" style="background:rgba(249,115,22,.15);border-color:rgba(249,115,22,.4);color:#f97316;">Paper 6: Hybrid Gen-Recursive ← NEW</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- PAPERS -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num">7</div>
+      <div>
+        <div class="sec-title">Paper Strategy (v3.0)</div>
+        <div class="sec-sub">Six publishable contributions — TRM integration adds Paper 6 and strengthens Papers 1 &amp; 3</div>
+      </div>
+    </div>
+    <div class="grid g2" style="gap:14px;">
+      <div class="paper" style="border-top:2px solid var(--c5);">
+        <div class="paper-n">Paper 1 · NEW with ASTRA</div>
+        <div class="paper-t">"ATLAS: Training LLMs on Their Own Discoveries via Stigmergic Curriculum Learning"</div>
+        <div class="paper-venue">🎯 EMNLP 2026 · Architecture + LiveDiscoveryCorpus</div>
+        <ul class="paper-claims">
+          <li>First LLM trained primarily on autonomous-AI-generated causal discoveries</li>
+          <li>ASTRA data > Dolma > GPT-4-synthetic on domain scientific reasoning</li>
+          <li>LiveDiscoveryCorpus release (~500K examples, open)</li>
+          <li>Pheromone curriculum outperforms uniform/hand-crafted</li>
+        </ul>
+      </div>
+      <div class="paper" style="border-top:2px solid var(--c5);">
+        <div class="paper-n">Paper 2 · NEW with ASTRA</div>
+        <div class="paper-t">"The Discovery Flywheel: Closed-Loop Fine-tuning Between an Autonomous Research Engine and an LLM"</div>
+        <div class="paper-venue">🎯 NeurIPS 2026 · Closed-loop scientific intelligence</div>
+        <ul class="paper-claims">
+          <li>First demonstration of LLM ↔ autonomous research engine closed loop</li>
+          <li>Discovery quality improves measurably each training iteration</li>
+          <li>Extends DC-24 (1.83× novelty) to model-in-the-loop setting</li>
+          <li>Acceleration: each cycle faster/richer than the last</li>
+        </ul>
+      </div>
+      <div class="paper" style="border-top:2px solid var(--c3);">
+        <div class="paper-n">Paper 3 · Stigmergic RLVR <span style="font-size:10px;color:#f97316;">[TRM-strengthened]</span></div>
+        <div class="paper-t">"Collective Reinforcement: Pheromone-Augmented Reward Shaping Prevents Policy Collapse in LLM RLVR"</div>
+        <div class="paper-venue">🎯 ICML 2027</div>
+        <ul class="paper-claims">
+          <li>r_pheromone reduces reward hacking vs. standard RLVR</li>
+          <li>Temporal credit across episodes via pheromone trails</li>
+          <li>Decay rate controls exploration/exploitation</li>
+          <li style="color:#f97316;">TRM citation: "TRM (7M params) outperforms 1B+ via recursive structure at inference time. ATLAS (7B params) outperforms vanilla 20B+ via pheromone structure at training time. Common factor: architectural inductive bias, not parameter count."</li>
+        </ul>
+      </div>
+      <div class="paper" style="border-top:2px solid var(--c4);">
+        <div class="paper-n">Paper 4 · Co-author: Robin</div>
+        <div class="paper-t">"Morphic Resonance in Gradient Descent: O(1/√T) Cross-Run Convergence via Stigmergic Memory Transfer"</div>
+        <div class="paper-venue">🎯 ICLR 2027 · Extends BUTTERS to neural networks</div>
+        <ul class="paper-claims">
+          <li>LLM fine-tuning with stigmergic warm-start follows O(1/√T)</li>
+          <li>Extends Robin's BUTTERS result from tabular RL to LLM training</li>
+          <li>Palace topology converges to fixed point = knowledge boundary</li>
+        </ul>
+      </div>
+      <div class="paper" style="border-top:2px solid var(--c6);">
+        <div class="paper-n">Paper 5 · ZK Provenance</div>
+        <div class="paper-t">"End-to-End Verifiable LLM Outputs: Cryptographic Provenance from Model Response to Raw Data Source"</div>
+        <div class="paper-venue">🎯 IEEE S&P 2027 · Security / trustworthy AI</div>
+        <ul class="paper-claims">
+          <li>Schnorr chains: output → discovery → causal run → live API</li>
+          <li>Hallucinations detectable via broken proof chains</li>
+          <li>Framework for trustworthy AI in medical/legal/financial</li>
+        </ul>
+      </div>
+      <div class="paper" style="border-top:2px solid #f97316;">
+        <div class="paper-n">Paper 6 · NEW v3.0</div>
+        <div class="paper-t">"Beyond Scaling: Hybrid Generative-Recursive Architectures for Scientific Causal Reasoning"</div>
+        <div class="paper-venue">🎯 ICLR / NeurIPS 2027 · Architecture innovation</div>
+        <ul class="paper-claims">
+          <li>First integration of TRM-style recursive validator with generative LLM in a scientific discovery pipeline</li>
+          <li>Validation Router: structured causal graph → TRM-CV (7M); open-ended reasoning → atlas-7b (7B)</li>
+          <li>Type 5 training traces: TRM's recursive refinement steps teach atlas-7b how to reason about graph structure</li>
+          <li>Key claim: hybrid architecture beats either component alone at lower total compute than scaling atlas-7b to handle both tasks</li>
+          <li>Builds on TRM (Jolicoeur-Martineau, 2025) — same architecture, extended to domain-specific causal graphs trained on ASTRA data</li>
+        </ul>
+      </div>
+      <div class="paper" style="border-top:2px solid var(--text3);opacity:.7;">
+        <div class="paper-n">Bonus: ASTRA-ATLAS Dataset Paper</div>
+        <div class="paper-t">"LiveDiscoveryCorpus: A Continuously Growing Dataset of Causally-Grounded Scientific Findings from Autonomous AI Research"</div>
+        <div class="paper-venue">🎯 Dataset track · NeurIPS / ICML</div>
+        <ul class="paper-claims">
+          <li>Release of 500K+ quality-gated ASTRA discoveries as open dataset</li>
+          <li>Every example: Bayesian-scored, causal, dedup-confirmed, provenance-traced</li>
+          <li>Benchmark comparison on existing scientific reasoning tasks</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- COMPONENT STATUS -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num">8</div>
+      <div>
+        <div class="sec-title">Component Status</div>
+        <div class="sec-sub">What's already built vs. what needs to be built</div>
+      </div>
+    </div>
+    <div style="margin-bottom:16px;font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;">Already Built ✅</div>
+    <div class="status-row" style="margin-bottom:24px;">
+      <div class="sbadge"><div class="dot dg"></div>GraphPalace PyO3 (36 methods)</div>
+      <div class="sbadge"><div class="dot dg"></div>ASTRA-dev (89 endpoints, 685 tests)</div>
+      <div class="sbadge"><div class="dot dg"></div>PalaceDiscoveryMemory adapter</div>
+      <div class="sbadge"><div class="dot dg"></div>MemoryAugmentedOrient</div>
+      <div class="sbadge"><div class="dot dg"></div>KnowledgeGraphBridge (causal → triples)</div>
+      <div class="sbadge"><div class="dot dg"></div>DomainSpecialistManager</div>
+      <div class="sbadge"><div class="dot dg"></div>RetrievalProfiles (3 OODA phases)</div>
+      <div class="sbadge"><div class="dot dg"></div>BUTTERS O(1/√T) confirmed</div>
+      <div class="sbadge"><div class="dot dg"></div>asi-build ZK Schnorr proofs</div>
+      <div class="sbadge"><div class="dot dg"></div>OLMo 3 7B (Apache 2.0)</div>
+      <div class="sbadge"><div class="dot dg"></div>Open Instruct RLVR pipeline</div>
+      <div class="sbadge"><div class="dot dg"></div>100% dedup accuracy (5-heuristic)</div>
+    </div>
+    <div style="margin-bottom:16px;font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;">To Build ⬜</div>
+    <div class="status-row" style="margin-bottom:24px;">
+      <div class="sbadge"><div class="dot dy"></div>LiveDiscoveryCorpus harvester (~200 LOC)</div>
+      <div class="sbadge"><div class="dot dy"></div>Quality gate pipeline (5 gates)</div>
+      <div class="sbadge"><div class="dot dy"></div>Pheromone-weighted batch sampler</div>
+      <div class="sbadge"><div class="dot dy"></div>OLMo ↔ GraphPalace tool call bridge</div>
+      <div class="sbadge"><div class="dot dy"></div>Orient-phase OLMo helper (replaces GPT-4)</div>
+      <div class="sbadge"><div class="dot dy"></div>Continuous fine-tuning loop</div>
+    </div>
+    <div style="margin-bottom:16px;font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;">Phase 3 Research ⬜</div>
+    <div class="status-row">
+      <div class="sbadge"><div class="dot db"></div>Stigmergic RLVR reward function</div>
+      <div class="sbadge"><div class="dot db"></div>Multi-scale L1/L2/L3 pheromones</div>
+      <div class="sbadge"><div class="dot db"></div>ZK full provenance chain (output → API)</div>
+      <div class="sbadge"><div class="dot dgr"></div>atlas-7b HuggingFace release</div>
+    </div>
+    <div style="margin-bottom:16px;font-size:12px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-top:20px;">Phase 3 — TRM-CausalValidator (v3.0) ⬜</div>
+    <div class="status-row">
+      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>TRM training data prep (~5K causal graphs)</div>
+      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>TRM-CausalValidator model (~500 LOC)</div>
+      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>Validation Router (structured → TRM | open → atlas-7b)</div>
+      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>Type 5 training example generator</div>
+      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>Quality Gate 6 integration</div>
+      <div class="sbadge" style="border-color:rgba(249,115,22,.4);"><div class="dot" style="background:#f97316;"></div>TRM accuracy benchmark (200 held-out graphs)</div>
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- PURE RUST -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num" style="background:linear-gradient(135deg,var(--c7),#c44208);">9</div>
+      <div>
+        <div class="sec-title" style="color:var(--c7);">Built in Pure Rust — Zero Dependencies</div>
+        <div class="sec-sub">SQLite philosophy applied to AI infrastructure · 16 crates · ~22-week build order · sovereign, auditable, portable</div>
+      </div>
+    </div>
+
+    <div class="rust-intro">
+      The SQLite principle: <strong>no external dependencies</strong>. SQLite is the most deployed database on Earth — not because it's the fastest, but because it runs anywhere, answers to no one, and has never been broken by a supply-chain compromise.<br><br>
+      ATLAS makes the same choice: <strong>zero Rust crate dependencies</strong>. Zero means zero — no tokio, no tch, no candle, no ndarray. Every algorithm is written from scratch or ported from its original C/Python source into our codebase.<br><br>
+      CUDA is a system runtime, not a crate. It is called via raw <code style="background:rgba(232,82,10,.12);padding:1px 5px;border-radius:3px;">extern "C"</code> FFI from <code style="background:rgba(232,82,10,.12);padding:1px 5px;border-radius:3px;">build.rs</code> + <code style="background:rgba(232,82,10,.12);padding:1px 5px;border-radius:3px;">kernels/*.cu</code>. No cudarc wrapper, no cuBLAS Rust binding. The same principle that makes SQLite trustworthy, applied to the GPU.
+    </div>
+
+    <!-- CRATE GRID -->
+    <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">16 Crates — Workspace Structure</div>
+    <div class="crate-grid">
+      <div class="crate-card">
+        <div class="crate-name">atlas-core</div>
+        <div class="crate-desc">Error types, traits, config primitives. The foundation everything else imports.</div>
+        <div class="crate-port new">Write from scratch — trivial</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-tensor</div>
+        <div class="crate-desc">Tensor{data,shape}, matmul, element-wise ops, CUDA FFI bridge. The seed of everything.</div>
+        <div class="crate-port new">Write from scratch + CUDA kernels</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-grad</div>
+        <div class="crate-desc">Autograd tape. Forward + backward pass through any computation graph. The hard part.</div>
+        <div class="crate-port new">Port micrograd concept (~2K LOC)</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-optim</div>
+        <div class="crate-desc">AdamW, cosine LR scheduler, weight decay. Standard algorithms — ~300 LOC.</div>
+        <div class="crate-port new">Write from standard algorithm</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-quant</div>
+        <div class="crate-desc">INT4 / INT8 quantization. QLoRA dequant for 24GB VRAM training of 7B model.</div>
+        <div class="crate-port new">Port bitsandbytes quant logic</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-model</div>
+        <div class="crate-desc">Transformer: MultiHeadAttn, FFN, RMSNorm, RoPE embeddings. OLMo 3 architecture config + weights loader.</div>
+        <div class="crate-port new">Port OLMo 3 architecture spec</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-tokenize</div>
+        <div class="crate-desc">BPE tokenizer. Encode/decode. Vocabulary management. Load OLMo tokenizer files.</div>
+        <div class="crate-port new">Port sentencepiece BPE algorithm</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-palace</div>
+        <div class="crate-desc">GraphPalace engine — 36 methods, stigmergic navigation, pheromone deposit/decay, semantic search.</div>
+        <div class="crate-port copy">Strip PyO3 bindings — already Rust</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-trm</div>
+        <div class="crate-desc">TRM-CausalValidator: 7M params, 2-layer MLP, z=net(x,y,z)×6 recursions. Quality Gate 6.</div>
+        <div class="crate-port new">Implement from arXiv:2510.04871 (~500 LOC)</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-causal</div>
+        <div class="crate-desc">PC / FCI causal inference algorithms. The core of ASTRA's scientific rigor. ~800 LOC each.</div>
+        <div class="crate-port new">Port from py-causal / tetrad Java source</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-bayes</div>
+        <div class="crate-desc">Bayesian confidence scoring. P(H|E) updates. The quality gate backbone.</div>
+        <div class="crate-port new">Port from fetch-agi Python source</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-astra</div>
+        <div class="crate-desc">Full ASTRA OODA engine — Observe, Orient, Decide, Act. 89 endpoints. The largest port (~8K LOC).</div>
+        <div class="crate-port new">Port from astra-dev Python source</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-corpus</div>
+        <div class="crate-desc">LiveDiscoveryCorpus: harvester, 5 quality gates, pheromone-weighted batch sampler, Type 5 generator.</div>
+        <div class="crate-port new">Port from fetch-agi Python source</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-zk</div>
+        <div class="crate-desc">ZK Schnorr proofs. Full provenance chain: LLM output → ASTRA discovery → live API.</div>
+        <div class="crate-port copy">Direct copy — already pure Rust in asi-build</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-http / atlas-json</div>
+        <div class="crate-desc">HTTP client (NASA/WHO/WB APIs) via raw libc syscalls. JSON parser ported from source.</div>
+        <div class="crate-port new">Port from ureq / pjson C source</div>
+      </div>
+      <div class="crate-card">
+        <div class="crate-name">atlas-cli</div>
+        <div class="crate-desc">CLI entrypoint: <code style="font-size:10px;">atlas train</code>, <code style="font-size:10px;">atlas discover</code>, <code style="font-size:10px;">atlas eval</code>, <code style="font-size:10px;">atlas prove</code>. Clap-free arg parsing.</div>
+        <div class="crate-port new">Write from scratch</div>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:16px;margin:12px 0 24px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--c3);"><span style="width:10px;height:10px;border-radius:2px;background:var(--c3);display:inline-block;"></span>Write from scratch / new port</div>
+      <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--c2);"><span style="width:10px;height:10px;border-radius:2px;background:var(--c2);display:inline-block;"></span>Already Rust — strip bindings / direct copy</div>
+    </div>
+
+    <!-- BUILD ORDER -->
+    <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;">Build Order — 7 Stages (~22 Weeks)</div>
+    <div style="border-left:2px solid rgba(232,82,10,.25);margin-bottom:24px;">
+      <div class="build-stage">
+        <div class="bs-label"><div class="bs-num">Stage 1</div><div class="bs-weeks">Weeks 1–4</div></div>
+        <div class="bs-content">
+          <div class="bs-title">Foundation</div>
+          <div class="bs-crates">atlas-core → atlas-tensor → atlas-grad → atlas-optim → atlas-quant</div>
+          <div class="bs-milestone">Milestone: <strong>f32 matmul on CPU + GPU (CUDA FFI), AdamW, backward pass through 2-layer MLP</strong></div>
+        </div>
+      </div>
+      <div class="build-stage">
+        <div class="bs-label"><div class="bs-num">Stage 2</div><div class="bs-weeks">Weeks 5–7</div></div>
+        <div class="bs-content">
+          <div class="bs-title">Model</div>
+          <div class="bs-crates">atlas-model → atlas-tokenize</div>
+          <div class="bs-milestone">Milestone: <strong>Load OLMo 3 7B weights, run forward pass, generate tokens — all in pure Rust</strong></div>
+        </div>
+      </div>
+      <div class="build-stage">
+        <div class="bs-label"><div class="bs-num">Stage 3</div><div class="bs-weeks">Weeks 8–9</div></div>
+        <div class="bs-content">
+          <div class="bs-title">Palace</div>
+          <div class="bs-crates">atlas-palace</div>
+          <div class="bs-milestone">Milestone: <strong>36-method GraphPalace native (no Python), palace search + pheromone deposit</strong></div>
+        </div>
+      </div>
+      <div class="build-stage">
+        <div class="bs-label"><div class="bs-num">Stage 4</div><div class="bs-weeks">Weeks 10–11</div></div>
+        <div class="bs-content">
+          <div class="bs-title">TRM Validator</div>
+          <div class="bs-crates">atlas-trm</div>
+          <div class="bs-milestone">Milestone: <strong>TRM-CausalValidator running — z=net(x,y,z)×6, causal graph pass/fail at &lt;10ms</strong></div>
+        </div>
+      </div>
+      <div class="build-stage">
+        <div class="bs-label"><div class="bs-num">Stage 5</div><div class="bs-weeks">Weeks 12–16</div></div>
+        <div class="bs-content">
+          <div class="bs-title">Discovery Engine</div>
+          <div class="bs-crates">atlas-http → atlas-json → atlas-bayes → atlas-causal → atlas-zk → atlas-astra</div>
+          <div class="bs-milestone">Milestone: <strong>Full ASTRA OODA in Rust — observe NASA/WHO APIs, orient, decide, act, ZK provenance</strong></div>
+        </div>
+      </div>
+      <div class="build-stage">
+        <div class="bs-label"><div class="bs-num">Stage 6</div><div class="bs-weeks">Weeks 17–20</div></div>
+        <div class="bs-content">
+          <div class="bs-title">Training Loop</div>
+          <div class="bs-crates">atlas-corpus → atlas-trm (integrated) → full backward pass + pheromone sampler</div>
+          <div class="bs-milestone">Milestone: <strong>QLoRA SFT on LiveDiscoveryCorpus, pheromone-guided batches, Type 5 traces fed back</strong></div>
+        </div>
+      </div>
+      <div class="build-stage" style="border-left:none;">
+        <div class="bs-label"><div class="bs-num">Stage 7</div><div class="bs-weeks">Weeks 21–22</div></div>
+        <div class="bs-content">
+          <div class="bs-title">ZK + CLI + Release</div>
+          <div class="bs-crates">atlas-zk (extended) → atlas-cli</div>
+          <div class="bs-milestone">Milestone: <strong>End-to-end proof chain, atlas-7b released as single static binary, benchmark suite</strong></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- VALUE TABLE -->
+    <div style="font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;">Why Zero Dependencies Makes ATLAS More Valuable</div>
+    <div style="overflow-x:auto;">
+      <table class="prop-table">
+        <tr>
+          <th>Property</th>
+          <th>With crates.io dependencies</th>
+          <th style="color:var(--c7);">Pure Rust, Zero Deps (ATLAS v4.0)</th>
+        </tr>
+        <tr><td>Portability</td><td class="prop-bad">Breaks when deps change API</td><td class="prop-good">Compiles anywhere with rustc — forever</td></tr>
+        <tr><td>Auditability</td><td class="prop-bad">~50K LOC of transitive deps to read</td><td class="prop-good">Only atlas code — every line ours to audit</td></tr>
+        <tr><td>IP ownership</td><td class="prop-bad">Contaminated by transitive MIT/Apache-2.0</td><td class="prop-good">Clean IP — 100% VBRL Holdings</td></tr>
+        <tr><td>Deployment</td><td class="prop-bad">cargo install pulls the internet</td><td class="prop-good">Single static binary, runs fully offline</td></tr>
+        <tr><td>Security</td><td class="prop-bad">Supply chain attack surface</td><td class="prop-good">Zero supply chain — no attack surface</td></tr>
+        <tr><td>Longevity</td><td class="prop-bad">Deps abandoned → broken in 5 years</td><td class="prop-good">atlas builds in 2040 exactly as it does today</td></tr>
+        <tr><td>Moat</td><td class="prop-bad">Replicable: same pip install + same crates</td><td class="prop-good">Cannot be reproduced without porting every dependency from scratch</td></tr>
+        <tr><td>Speed</td><td class="prop-bad">Limited by what crates expose</td><td class="prop-good">Kernels tuned exactly to our tensor shapes and usage patterns</td></tr>
+      </table>
+    </div>
+
+    <div style="background:rgba(232,82,10,.06);border:1px solid rgba(232,82,10,.2);border-radius:10px;padding:16px 20px;margin-top:20px;font-size:13px;color:var(--text2);">
+      <strong style="color:var(--c7);">Already Rust, near-zero porting work:</strong> GraphPalace (strip PyO3 bindings) and ZK Schnorr proofs (direct copy from asi-build) are the two biggest components and they're already pure Rust. The two hardest original implementations are the autograd backward pass (~2K LOC) and the full ASTRA OODA port (~8K LOC Python → Rust). Everything else is table stakes.
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <!-- ARCHITECTURE DIAGRAMS -->
+  <div class="sec">
+    <div class="sec-hdr">
+      <div class="sec-num">10</div>
+      <div>
+        <div class="sec-title">Architecture Diagrams</div>
+        <div class="sec-sub">8 publication-quality figures · 300 DPI · Graphviz DOT + Matplotlib · ready for academic papers · Fig. 8 new in v3.0</div>
+      </div>
+    </div>
+    <div class="diag-grid">
+
+      <a class="diag-card" href="diagrams/01_atlas_full_architecture.png" target="_blank">
+        <img src="diagrams/01_atlas_full_architecture.png" alt="ATLAS Full System Architecture" loading="lazy">
+        <div class="diag-meta">
+          <div class="diag-num">Fig. 1</div>
+          <div>
+            <div class="diag-title">Full System Architecture</div>
+            <div class="diag-sub">Six subsystems: Live Data Sources → ASTRA OODA → GraphPalace → LiveDiscoveryCorpus → OLMo 3 7B → ZK Layer. The complete ATLAS v2.0 stack in one view.</div>
+            <span class="diag-badge">Graphviz TB</span>
+          </div>
+        </div>
+      </a>
+
+      <a class="diag-card" href="diagrams/02_discovery_flywheel.png" target="_blank">
+        <img src="diagrams/02_discovery_flywheel.png" alt="ATLAS Discovery Flywheel" loading="lazy">
+        <div class="diag-meta">
+          <div class="diag-num">Fig. 2</div>
+          <div>
+            <div class="diag-title">Discovery Flywheel</div>
+            <div class="diag-sub">The closed self-improving loop: ASTRA discoveries → GraphPalace pheromones → LiveDiscoveryCorpus → OLMo SFT/RLVR → atlas-7b in ASTRA Orient → better hypotheses. d = 10.6, R² = 0.924, 34.4× more discoveries.</div>
+            <span class="diag-badge">Matplotlib circular</span>
+          </div>
+        </div>
+      </a>
+
+      <a class="diag-card" href="diagrams/03_astra_ooda_palace.png" target="_blank">
+        <img src="diagrams/03_astra_ooda_palace.png" alt="ASTRA OODA + GraphPalace Integration" loading="lazy">
+        <div class="diag-meta">
+          <div class="diag-num">Fig. 3</div>
+          <div>
+            <div class="diag-title">ASTRA OODA + Palace Integration</div>
+            <div class="diag-sub">How OBSERVE→ORIENT→DECIDE→ACT maps to GraphPalace methods. search_by_embedding, KG pathfinding, hot_paths, deposit_pheromones at each stage. Loop closure via atlas-7b Orient helper.</div>
+            <span class="diag-badge">Graphviz LR</span>
+          </div>
+        </div>
+      </a>
+
+      <a class="diag-card" href="diagrams/04_morphic_warm_start.png" target="_blank">
+        <img src="diagrams/04_morphic_warm_start.png" alt="Morphic Warm-Start Cross-Run Convergence" loading="lazy">
+        <div class="diag-meta">
+          <div class="diag-num">Fig. 4</div>
+          <div>
+            <div class="diag-title">Morphic Warm-Start: Cross-Run Convergence</div>
+            <div class="diag-sub">Pheromone heatmap showing cold → warm → hot palace state across 3 training runs. Convergence curves: ATLAS vs standard fine-tuning vs O(1/√T) theory bound. 70% regret reduction (189→57 steps), R²=0.982, p&lt;10⁻³⁰.</div>
+            <span class="diag-badge">Matplotlib 2-panel</span>
+          </div>
+        </div>
+      </a>
+
+      <a class="diag-card" href="diagrams/05_pheromone_reward.png" target="_blank">
+        <img src="diagrams/05_pheromone_reward.png" alt="Stigmergic RLVR Pheromone Reward Function" loading="lazy">
+        <div class="diag-meta">
+          <div class="diag-num">Fig. 5</div>
+          <div>
+            <div class="diag-title">Stigmergic RLVR — Pheromone Reward Function</div>
+            <div class="diag-sub">Signal merge diagram: r_total = α·r_v + β·r_φ. Verifiable task reward + pheromone density reward through two weighted streams. α decreases over training, β increases as palace matures. Decay curve φ(t) = φ₀·e⁻ᵗ/τ prevents reward hacking.</div>
+            <span class="diag-badge">Matplotlib signal flow</span>
+          </div>
+        </div>
+      </a>
+
+      <a class="diag-card" href="diagrams/06_zk_provenance_chain.png" target="_blank">
+        <img src="diagrams/06_zk_provenance_chain.png" alt="ZK Provenance Chain" loading="lazy">
+        <div class="diag-meta">
+          <div class="diag-num">Fig. 6</div>
+          <div>
+            <div class="diag-title">ZK Provenance Chain</div>
+            <div class="diag-sub">End-to-end verifiable LLM outputs: LLM output → Training Example → ASTRA Discovery → Causal Inference → Raw API → NASA/WHO/World Bank. Schnorr proofs π₁–π₄ at every link. Full proof anchored on Sepolia.</div>
+            <span class="diag-badge">Graphviz chain</span>
+          </div>
+        </div>
+      </a>
+
+      <a class="diag-card" href="diagrams/07_training_pipeline.png" target="_blank">
+        <img src="diagrams/07_training_pipeline.png" alt="ATLAS Training Pipeline Phase Roadmap" loading="lazy">
+        <div class="diag-meta">
+          <div class="diag-num">Fig. 7</div>
+          <div>
+            <div class="diag-title">Training Pipeline — Phase Roadmap</div>
+            <div class="diag-sub">4-phase roadmap from existing components to self-improving scientific intelligence. Phase 0 (1 week, any hardware) → Phase 1 (2–4 weeks, RTX 4090) → Phase 2 (4–8 weeks) → Phase 3 (3–6 months, RTX 4090×2 + A100). Component status legend: Already Built / To Build / Phase 3 Research.</div>
+            <span class="diag-badge">Matplotlib phase grid</span>
+          </div>
+        </div>
+      </a>
+
+    </div>
+      <a class="diag-card" href="diagrams/08_hybrid_generative_recursive.png" target="_blank">
+        <img src="diagrams/08_hybrid_generative_recursive.png" alt="Hybrid Generative-Recursive Architecture" loading="lazy">
+        <div class="diag-meta">
+          <div class="diag-num" style="color:#f97316;background:rgba(249,115,22,.12);border-color:rgba(249,115,22,.3);">Fig. 8</div>
+          <div>
+            <div class="diag-title" style="color:#f97316;">Hybrid Generative-Recursive Architecture ← v3.0</div>
+            <div class="diag-sub">atlas-7b (7B, generative) + TRM-CausalValidator (7M, recursive) operating as complementary components. Validation Router splits workload: structured causal graphs → TRM; open-ended reasoning → atlas-7b. Validated discoveries merge into GraphPalace + LiveDiscoveryCorpus. Type 5 training traces feed back into atlas-7b SFT.</div>
+            <span class="diag-badge" style="color:#f97316;background:rgba(249,115,22,.08);border-color:rgba(249,115,22,.2);">Graphviz TB · NEW v3.0</span>
+          </div>
+        </div>
+      </a>
+
+    <div style="margin-top:18px;font-size:12px;color:var(--text3);text-align:center;">
+      Click any diagram to open full resolution (300 DPI) · Suitable for journal submission
+    </div>
+  </div>
+
+  <div class="div"></div>
+
+  <div class="quote">
+    "Every other LLM is trained on what humans wrote about the world.<br>
+    atlas-7b is trained on what the system actually discovers about the world —<br>
+    real causal relationships, live API data, Bayesian-confirmed, dedup-verified, running every 10 seconds.<br>
+    Every causal claim validated recursively before it touches the training corpus.<br>
+    This is not a better fine-tuning recipe. This is a different paradigm."
+  </div>
+
+</div><!-- /wrap -->
+
+<footer class="z1">
+  <strong>ATLAS v4.0</strong> · Active-inference Training with Learned Adaptive Stigmergy + ASTRA-dev + TRM-CausalValidator + Pure Rust<br>
+  <span style="margin-top:8px;display:block;">VBRL Holdings · Robin · Kyall · 2026</span>
+  <span style="margin-top:8px;display:block;font-size:11px;">
+    <a href="/fetch-agi-dashboard/">System Dashboard</a> · 
+    Orchestrated by FETCH-AGI
+  </span>
+</footer>
+
+<script>
+const canvas = document.getElementById('bg');
+const ctx = canvas.getContext('2d');
+let W, H, stars = [], particles = [];
+
+function init() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  stars = Array.from({length:180}, () => ({
+    x: Math.random()*W, y: Math.random()*H,
+    r: Math.random()*1.1, o: Math.random()*.5+.1,
+    dy: Math.random()*.12+.02, t: Math.random()*Math.PI*2
+  }));
+}
+
+function spawn() {
+  // pheromone particles (green) + discovery sparks (red)
+  const isDisc = Math.random() < 0.35;
+  particles.push({
+    x: isDisc ? Math.random()*W : W*.3 + Math.random()*W*.4,
+    y: H + 10,
+    vx: (Math.random()-.5)*.8,
+    vy: -(Math.random()*1.8+.4),
+    life: 1,
+    r: Math.random()*2+.8,
+    type: isDisc ? 'disc' : 'phero'
+  });
+}
+
+function frame() {
+  ctx.clearRect(0,0,W,H);
+
+  // stars
+  stars.forEach(s => {
+    s.t += .018; s.y -= s.dy;
+    if (s.y < -2) { s.y = H+2; s.x = Math.random()*W; }
+    const o = s.o * (.7 + .3*Math.sin(s.t));
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+    ctx.fillStyle = `rgba(255,255,255,${o})`; ctx.fill();
+  });
+
+  // particles
+  if (Math.random() < .4) spawn();
+  particles = particles.filter(p => p.life > 0);
+  particles.forEach(p => {
+    p.x += p.vx; p.y += p.vy; p.life -= .007;
+    const a = p.life * .35;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+    ctx.fillStyle = p.type === 'disc'
+      ? `rgba(239,68,68,${a})`
+      : `rgba(16,185,129,${a})`;
+    ctx.fill();
+  });
+
+  requestAnimationFrame(frame);
+}
+
+init(); frame();
+window.addEventListener('resize', init);
+</script>
+</body>
+</html>

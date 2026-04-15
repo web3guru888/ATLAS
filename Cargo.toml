@@ -1,0 +1,66 @@
+[workspace]
+members = [
+    "crates/atlas-core",
+    "crates/atlas-tensor",
+    "crates/atlas-grad",
+    "crates/atlas-optim",
+    "crates/atlas-quant",
+    "crates/atlas-model",
+    "crates/atlas-tokenize",
+    "crates/atlas-palace",
+    "crates/atlas-trm",
+    "crates/atlas-causal",
+    "crates/atlas-bayes",
+    "crates/atlas-astra",
+    "crates/atlas-corpus",
+    "crates/atlas-zk",
+    "crates/atlas-http",
+    "crates/atlas-json",
+    "crates/atlas-cli",
+]
+resolver = "2"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ATLAS Workspace — Pure Rust, Zero External Crate Dependencies
+#
+# This workspace has NO [dependencies] section by design.
+# Every algorithm is written from scratch or ported from its original source.
+#
+# "Every Rust crate you depend on is a decision made by someone you've never
+#  met, that you can never revoke."
+#
+# The SQLite principle: zero dependencies → portable, auditable, sovereign.
+# CUDA is called via raw FFI from build.rs + kernels/*.cu (system dep, not a
+# Rust crate). No cudarc, no tch, no candle, no ndarray, no tokio.
+#
+# Build order (7 stages, ~22 weeks):
+#   Stage 1: atlas-core → atlas-tensor → atlas-grad → atlas-optim → atlas-quant
+#   Stage 2: atlas-model → atlas-tokenize
+#   Stage 3: atlas-palace
+#   Stage 4: atlas-trm
+#   Stage 5: atlas-http → atlas-json → atlas-bayes → atlas-causal → atlas-zk → atlas-astra
+#   Stage 6: atlas-corpus (training loop)
+#   Stage 7: atlas-zk (extended) → atlas-cli
+# ─────────────────────────────────────────────────────────────────────────────
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["web3guru888 <robin@vbrl.ai>"]
+license     = "Apache-2.0"
+repository  = "https://github.com/web3guru888/ATLAS"
+homepage    = "https://github.com/web3guru888/ATLAS"
+description = "ATLAS: Active-inference Training with Learned Adaptive Stigmergy"
+keywords    = ["llm", "training", "stigmergy", "causal-inference", "astra"]
+categories  = ["science", "machine-learning"]
+rust-version = "1.75"
+
+[profile.release]
+opt-level   = 3
+lto         = "thin"
+codegen-units = 1
+panic       = "abort"
+
+[profile.dev]
+opt-level   = 0
+debug       = true

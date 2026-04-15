@@ -1,0 +1,14 @@
+[package]
+name        = "atlas-model"
+description = "ATLAS model: Transformer model: MultiHeadAttn, FFN, RMSNorm, RoPE, OLMo 3 architecture"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core     = { path = "../atlas-core" }
+atlas-tensor   = { path = "../atlas-tensor" }
+atlas-grad     = { path = "../atlas-grad" }
+atlas-quant    = { path = "../atlas-quant" }

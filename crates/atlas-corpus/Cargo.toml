@@ -1,0 +1,14 @@
+[package]
+name        = "atlas-corpus"
+description = "ATLAS corpus: LiveDiscoveryCorpus: harvester, quality gates, pheromone-weighted sampler"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core  = { path = "../atlas-core" }
+atlas-astra  = { path = "../atlas-astra" }
+atlas-palace = { path = "../atlas-palace" }
+atlas-trm    = { path = "../atlas-trm" }

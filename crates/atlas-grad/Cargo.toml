@@ -1,0 +1,12 @@
+[package]
+name        = "atlas-grad"
+description = "ATLAS autograd: reverse-mode automatic differentiation tape"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core   = { path = "../atlas-core" }
+atlas-tensor = { path = "../atlas-tensor" }

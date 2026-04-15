@@ -1,0 +1,17 @@
+[package]
+name        = "atlas-astra"
+description = "ATLAS astra: ASTRA OODA discovery engine: Observe→Orient→Decide→Act"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core    = { path = "../atlas-core" }
+atlas-palace   = { path = "../atlas-palace" }
+atlas-causal   = { path = "../atlas-causal" }
+atlas-bayes    = { path = "../atlas-bayes" }
+atlas-http     = { path = "../atlas-http" }
+atlas-json     = { path = "../atlas-json" }
+atlas-zk       = { path = "../atlas-zk" }

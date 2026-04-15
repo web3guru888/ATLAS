@@ -1,0 +1,11 @@
+[package]
+name        = "atlas-json"
+description = "ATLAS json: JSON parser: zero-dependency, ported from source"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }

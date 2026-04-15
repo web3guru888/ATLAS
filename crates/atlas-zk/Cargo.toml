@@ -1,0 +1,11 @@
+[package]
+name        = "atlas-zk"
+description = "ATLAS zk: ZK Schnorr proofs: full provenance chain from LLM output to live API"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }

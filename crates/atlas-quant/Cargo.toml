@@ -1,0 +1,12 @@
+[package]
+name        = "atlas-quant"
+description = "ATLAS quant: INT4/INT8 quantization, QLoRA dequant"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core   = { path = "../atlas-core" }
+atlas-tensor = { path = "../atlas-tensor" }

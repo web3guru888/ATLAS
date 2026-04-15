@@ -1,0 +1,63 @@
+cff-version: 1.2.0
+title: >-
+  ATLAS: Active-inference Training with Learned Adaptive Stigmergy —
+  A Pure Rust AGI Training Framework with Live Discovery Corpus
+message: >-
+  If you use this research or software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - name: ATLAS Research Group
+    affiliation: VBRL Holdings
+date-released: "2026-04-15"
+license: Apache-2.0
+license-url: https://github.com/web3guru888/ATLAS/blob/main/LICENSE-CODE
+repository-code: https://github.com/web3guru888/ATLAS
+keywords:
+  - active inference
+  - stigmergic learning
+  - pheromone curriculum
+  - causal inference
+  - live discovery corpus
+  - ASTRA
+  - GraphPalace
+  - morphic warm-start
+  - ZK provenance
+  - TRM-CausalValidator
+  - pure Rust
+  - LLM training
+  - OLMo
+  - scientific intelligence
+  - self-improving AI
+abstract: >-
+  ATLAS (Active-inference Training with Learned Adaptive Stigmergy) is a
+  next-generation LLM training architecture built entirely in pure Rust
+  with zero external crate dependencies. It fuses four innovations: (1)
+  ASTRA-dev, an autonomous research engine that generates live, causal,
+  Bayesian-scored training data from NASA/WHO/World Bank APIs at ~10s per
+  discovery cycle; (2) GraphPalace, a stigmergic memory palace where
+  pheromone trails guide curriculum across training runs (O(1/√T)
+  convergence proven in BUTTERS, R²=0.982); (3) TRM-CausalValidator, a
+  7M-parameter recursive module that validates causal graphs before corpus
+  entry at 0.1% the compute cost of the base model; and (4) ZK Schnorr
+  proof chains linking every LLM output to live API data. The result is a
+  self-improving scientific intelligence that trains on what it discovers,
+  validated by recursive architecture, guided by stigmergic memory.
+references:
+  - type: article
+    title: "Tiny Recursive Model (TRM): Recursive Test-time Compute"
+    authors:
+      - family-names: Jolicoeur-Martineau
+        given-names: A.
+    year: 2025
+    url: https://arxiv.org/abs/2510.04871
+    notes: "Samsung SAIL Montreal. Architecture basis for TRM-CausalValidator."
+  - type: article
+    title: >-
+      Collective Habit as Infrastructure: A Computational Model of Morphic
+      Resonance via Multi-Agent Reinforcement Learning
+    authors:
+      - name: BUTTERS Research Group
+    year: 2026
+    url: https://github.com/web3guru888/morphic-resonance-sim
+    notes: "Source of O(1/√T) morphic warm-start convergence result (R²=0.982)."

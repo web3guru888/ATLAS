@@ -1,0 +1,12 @@
+[package]
+name        = "atlas-causal"
+description = "ATLAS causal: PC/FCI causal inference algorithms"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core  = { path = "../atlas-core" }
+atlas-bayes  = { path = "../atlas-bayes" }

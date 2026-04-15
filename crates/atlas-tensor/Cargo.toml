@@ -1,0 +1,16 @@
+[package]
+name        = "atlas-tensor"
+description = "ATLAS tensor engine: f32/f16 tensors, matmul, CUDA FFI — zero crate dependencies"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core = { path = "../atlas-core" }
+
+# CUDA linked via build.rs — system dep, NOT a Rust crate.
+# See build.rs for nvcc invocation and -lcuda / -lcublas linkage.
+[build-dependencies]
+# none — build.rs uses std::process::Command to invoke nvcc directly

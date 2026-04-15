@@ -1,0 +1,13 @@
+[package]
+name        = "atlas-trm"
+description = "ATLAS trm: TRM-CausalValidator: 7M-param recursive validator, z=net(x,y,z)×6"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core   = { path = "../atlas-core" }
+atlas-tensor = { path = "../atlas-tensor" }
+atlas-grad   = { path = "../atlas-grad" }
