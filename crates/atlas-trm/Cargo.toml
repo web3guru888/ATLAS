@@ -8,6 +8,4 @@ license.workspace    = true
 repository.workspace = true
 
 [dependencies]
-atlas-core   = { path = "../atlas-core" }
-atlas-tensor = { path = "../atlas-tensor" }
-atlas-grad   = { path = "../atlas-grad" }
+atlas-core = { path = "../atlas-core" }
