@@ -83,6 +83,11 @@ pub struct Pheromone {
 /// Minimum pheromone threshold.  Values below this are treated as zero.
 pub const PHEROMONE_FLOOR: f32 = 1e-4;
 
+/// Maximum pheromone ceiling (MMAS — Max-Min Ant System).
+/// Prevents saturation and ensures exploration.  CAS theory (arXiv:2604.00067)
+/// shows pheromone capacity is K-independent; this ceiling enforces it.
+pub const PHEROMONE_CEILING: f32 = 5.0;
+
 impl Pheromone {
     /// Create a new pheromone with exponential decay (backward-compatible).
     pub fn new(value: f32, decay: f32, tag: &str) -> Self {

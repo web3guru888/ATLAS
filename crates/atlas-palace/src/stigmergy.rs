@@ -80,8 +80,8 @@ pub fn deposit_path_reward(
         for (i, &ei) in edge_indices.iter().enumerate() {
             if let Some(edge) = kg.get_mut(ei) {
                 let weight = 1.0 - (i as f32 / n);
-                edge.edge_pheromones.success += base_reward * weight;
-                edge.edge_pheromones.traversal += TRAVERSAL_INCREMENT;
+                edge.edge_pheromones.success = (edge.edge_pheromones.success + base_reward * weight).min(PHEROMONE_CEILING);
+                edge.edge_pheromones.traversal = (edge.edge_pheromones.traversal + TRAVERSAL_INCREMENT).min(PHEROMONE_CEILING);
                 edge.edge_pheromones.recency = RECENCY_VALUE;
             }
         }
@@ -97,7 +97,7 @@ pub fn deposit_path_reward(
 /// Deposit a pheromone on a drawer (node-level), updating or creating the tag.
 fn deposit_on_drawer(d: &mut crate::types::Drawer, amount: f32, tag: &str) {
     if let Some(p) = d.pheromones.iter_mut().find(|p| p.tag == tag) {
-        p.value = (p.value + amount).min(1.0);
+        p.value = (p.value + amount).min(PHEROMONE_CEILING);
     } else {
         d.pheromones.push(Pheromone::new(
             amount,
@@ -119,7 +119,7 @@ impl Palace {
     pub fn deposit_pheromones(&mut self, drawer_id: &str, value: f32, decay: f32, tag: &str) {
         if let Some(d) = self.drawers.get_mut(drawer_id) {
             if let Some(p) = d.pheromones.iter_mut().find(|p| p.tag == tag) {
-                p.value = (p.value + value).min(1.0);
+                p.value = (p.value + value).min(PHEROMONE_CEILING);
             } else {
                 d.pheromones.push(Pheromone::new(value, decay, tag));
             }
@@ -133,7 +133,7 @@ impl Palace {
     ) {
         if let Some(d) = self.drawers.get_mut(drawer_id) {
             if let Some(p) = d.pheromones.iter_mut().find(|p| p.tag == tag) {
-                p.value = (p.value + value).min(1.0);
+                p.value = (p.value + value).min(PHEROMONE_CEILING);
                 p.strategy = strategy;
             } else {
                 d.pheromones.push(Pheromone::with_strategy(value, decay, tag, strategy));
@@ -403,5 +403,21 @@ mod tests {
         let hot = palace.hot_edges(5);
         assert!(!hot.is_empty());
         assert!(hot[0].2 > 0.0);
+    }
+
+    #[test]
+    fn mmas_ceiling_prevents_saturation() {
+        let mut p = test_palace();
+        let id: String = p.drawers.keys().next().unwrap().clone();
+        // Deposit 100 times — should never exceed PHEROMONE_CEILING
+        for _ in 0..100 {
+            p.deposit_pheromones(&id, 1.0, 0.01, "flood");
+        }
+        let val = p.drawers[&id].pheromones.iter()
+            .find(|ph| ph.tag == "flood").unwrap().value;
+        assert!(val <= PHEROMONE_CEILING + f32::EPSILON,
+            "pheromone {} exceeded ceiling {}", val, PHEROMONE_CEILING);
+        assert!(val >= PHEROMONE_CEILING - f32::EPSILON,
+            "pheromone should have reached ceiling");
     }
 }
