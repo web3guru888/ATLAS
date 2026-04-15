@@ -10,3 +10,7 @@ repository.workspace = true
 [dependencies]
 atlas-core   = { path = "../atlas-core" }
 atlas-tensor = { path = "../atlas-tensor" }
+
+[dev-dependencies]
+atlas-optim = { path = "../atlas-optim" }
+atlas-quant = { path = "../atlas-quant" }

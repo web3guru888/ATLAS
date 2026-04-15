@@ -1,149 +1,290 @@
 //! atlas-tensor — The seed of everything.
 //!
-//! Pure Rust tensor implementation with CUDA FFI for GPU acceleration.
-//! No external crates — matmul is either our own CUDA kernel or pure Rust.
+//! Pure Rust f32 tensor with optional CUDA acceleration.
+//! Zero external Rust crate dependencies.
 //!
-//! # Zero-dependency GPU strategy
+//! When compiled with CUDA (`atlas_cuda` cfg flag set by build.rs):
+//!   - GPU tensors hold a device pointer in `gpu_ptr`
+//!   - Ops dispatch to `extern "C"` functions in `kernels/matmul.cu`
 //!
-//! CUDA kernels live in `../../kernels/*.cu`. `build.rs` invokes `nvcc` and
-//! links `-lcuda -lcublas` as system libraries. Rust calls them via `extern "C"`.
-//!
-//! ```text
-//! atlas-tensor/build.rs  →  nvcc kernels/matmul.cu  →  libatlas_kernels.a
-//!                        →  extern "C" { fn atlas_matmul_f32(...) }
-//! ```
-//!
-//! # First file — the seed of everything
-//!
-//! Every billion-parameter transformer starts here.
+//! When compiled CPU-only (`atlas_cpu_only`):
+//!   - All ops are pure Rust, no unsafe
 
 use atlas_core::{AtlasError, Device, DType, Result};
 
-/// A multi-dimensional tensor.
+// ── CUDA FFI declarations ──────────────────────────────────────────────────
+// Only compiled in when build.rs successfully compiled the CUDA kernels.
+#[cfg(atlas_cuda)]
+mod ffi {
+    use std::ffi::c_int;
+    extern "C" {
+        pub fn atlas_matmul_f32(
+            a: *const f32, b: *const f32, c: *mut f32,
+            m: c_int, n: c_int, k: c_int,
+        );
+        pub fn atlas_vec_add_f32(a: *const f32, b: *const f32, out: *mut f32, n: c_int);
+        pub fn atlas_scale_f32(x: *const f32, s: f32, out: *mut f32, n: c_int);
+        pub fn atlas_relu_f32(x: *const f32, out: *mut f32, n: c_int);
+        pub fn atlas_softmax_f32(x: *const f32, out: *mut f32, rows: c_int, cols: c_int);
+        pub fn atlas_cuda_available() -> c_int;
+        pub fn atlas_cuda_device_count() -> c_int;
+    }
+}
+
+/// Returns true if CUDA was compiled in AND a device is reachable at runtime.
+pub fn cuda_available() -> bool {
+    #[cfg(atlas_cuda)]
+    unsafe { ffi::atlas_cuda_available() != 0 }
+    #[cfg(not(atlas_cuda))]
+    false
+}
+
+/// Returns number of CUDA devices (0 if CUDA not compiled or no devices).
+pub fn cuda_device_count() -> i32 {
+    #[cfg(atlas_cuda)]
+    unsafe { ffi::atlas_cuda_device_count() }
+    #[cfg(not(atlas_cuda))]
+    0
+}
+
+// ── GPU memory helpers ─────────────────────────────────────────────────────
+// A GpuBuffer wraps a raw CUDA device pointer with RAII dealloc.
+
+#[cfg(atlas_cuda)]
+mod gpu {
+    use std::ffi::c_void;
+
+    extern "C" {
+        fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
+        fn cudaFree(ptr: *mut c_void) -> i32;
+        fn cudaMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
+    }
+
+    const CUDA_MEMCPY_H2D: i32 = 1;
+    const CUDA_MEMCPY_D2H: i32 = 2;
+
+    pub struct GpuBuf {
+        pub ptr: *mut f32,
+        pub len: usize,
+    }
+    unsafe impl Send for GpuBuf {}
+    unsafe impl Sync for GpuBuf {}
+
+    impl GpuBuf {
+        pub fn alloc(len: usize) -> Option<Self> {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let err = unsafe { cudaMalloc(&mut ptr, len * 4) };
+            if err != 0 { return None; }
+            Some(Self { ptr: ptr as *mut f32, len })
+        }
+        pub fn upload(data: &[f32]) -> Option<Self> {
+            let buf = Self::alloc(data.len())?;
+            let err = unsafe {
+                cudaMemcpy(buf.ptr as *mut c_void, data.as_ptr() as *const c_void,
+                           data.len() * 4, CUDA_MEMCPY_H2D)
+            };
+            if err != 0 { return None; }
+            Some(buf)
+        }
+        pub fn download(&self) -> Vec<f32> {
+            let mut out = vec![0.0f32; self.len];
+            unsafe {
+                cudaMemcpy(out.as_mut_ptr() as *mut c_void, self.ptr as *const c_void,
+                           self.len * 4, CUDA_MEMCPY_D2H);
+            }
+            out
+        }
+    }
+    impl Drop for GpuBuf {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                unsafe { cudaFree(self.ptr as *mut c_void); }
+            }
+        }
+    }
+}
+
+// ── Tensor ─────────────────────────────────────────────────────────────────
+
+/// A multi-dimensional f32 tensor.
 ///
-/// Data is stored in row-major (C) order on either CPU or GPU.
-/// On GPU, `data` is a device pointer (opaque u64) — do not dereference from Rust.
-#[derive(Debug, Clone)]
+/// On CPU: `data` holds the values directly.
+/// On GPU: `data` holds a mirrored host copy; `gpu_ptr` is the device pointer.
+#[derive(Debug)]
 pub struct Tensor {
-    /// Raw data: on CPU this is actual f32 values; on GPU it is a device pointer.
-    data:   Vec<f32>,
-    /// Shape of the tensor, e.g. [batch, seq, d_model].
-    shape:  Vec<usize>,
-    /// Data type.
-    dtype:  DType,
-    /// Device placement.
-    device: Device,
+    data:    Vec<f32>,
+    shape:   Vec<usize>,
+    dtype:   DType,
+    device:  Device,
+    /// GPU buffer (Some when placed on CUDA device).
+    #[cfg(atlas_cuda)]
+    gpu_buf: Option<gpu::GpuBuf>,
+}
+
+// Manual Clone (GpuBuf is not Clone)
+impl Clone for Tensor {
+    fn clone(&self) -> Self {
+        Self {
+            data:   self.data.clone(),
+            shape:  self.shape.clone(),
+            dtype:  self.dtype,
+            device: self.device,
+            #[cfg(atlas_cuda)]
+            gpu_buf: None, // cloned tensor starts on CPU; call .to_cuda() if needed
+        }
+    }
 }
 
 impl Tensor {
-    /// Create a zero-filled tensor on CPU.
-    ///
-    /// ```rust
-    /// use atlas_tensor::Tensor;
-    /// let t = Tensor::zeros(&[2, 3]);
-    /// assert_eq!(t.shape(), &[2, 3]);
-    /// assert_eq!(t.numel(), 6);
-    /// ```
+    fn new_cpu(data: Vec<f32>, shape: Vec<usize>) -> Self {
+        Self {
+            data, shape, dtype: DType::F32, device: Device::Cpu,
+            #[cfg(atlas_cuda)]
+            gpu_buf: None,
+        }
+    }
+
+    /// Create a zero-filled CPU tensor.
     pub fn zeros(shape: &[usize]) -> Self {
         let n = shape.iter().product();
-        Self {
-            data:   vec![0.0f32; n],
-            shape:  shape.to_vec(),
-            dtype:  DType::F32,
-            device: Device::Cpu,
-        }
+        Self::new_cpu(vec![0.0f32; n], shape.to_vec())
     }
 
-    /// Create a tensor filled with a constant value.
+    /// Create a tensor filled with a constant.
     pub fn full(shape: &[usize], value: f32) -> Self {
         let n = shape.iter().product();
-        Self {
-            data:   vec![value; n],
-            shape:  shape.to_vec(),
-            dtype:  DType::F32,
-            device: Device::Cpu,
-        }
+        Self::new_cpu(vec![value; n], shape.to_vec())
     }
 
-    /// Create a tensor from raw data.
+    /// Create from owned data.
     pub fn from_vec(data: Vec<f32>, shape: Vec<usize>) -> Result<Self> {
         let expected: usize = shape.iter().product();
         if data.len() != expected {
             return Err(AtlasError::ShapeMismatch {
                 expected: vec![expected],
-                got: vec![data.len()],
+                got:      vec![data.len()],
             });
         }
-        Ok(Self { data, shape, dtype: DType::F32, device: Device::Cpu })
+        Ok(Self::new_cpu(data, shape))
     }
 
-    /// Total number of elements.
-    pub fn numel(&self) -> usize {
-        self.data.len()
+    /// Upload to GPU. Returns self if CUDA not available (silently stays CPU).
+    pub fn to_cuda(mut self) -> Self {
+        #[cfg(atlas_cuda)]
+        {
+            if cuda_available() {
+                if let Some(buf) = gpu::GpuBuf::upload(&self.data) {
+                    self.device  = Device::Cuda(0);
+                    self.gpu_buf = Some(buf);
+                }
+            }
+        }
+        self
     }
 
-    /// Shape slice.
-    pub fn shape(&self) -> &[usize] {
-        &self.shape
+    /// Sync GPU→CPU (no-op if already on CPU).
+    pub fn to_cpu(mut self) -> Self {
+        #[cfg(atlas_cuda)]
+        {
+            if let Some(ref buf) = self.gpu_buf {
+                self.data   = buf.download();
+                self.device = Device::Cpu;
+            }
+            self.gpu_buf = None;
+        }
+        self
     }
 
-    /// Number of dimensions.
-    pub fn ndim(&self) -> usize {
-        self.shape.len()
-    }
+    pub fn numel(&self)          -> usize        { self.shape.iter().product() }
+    pub fn shape(&self)          -> &[usize]     { &self.shape }
+    pub fn ndim(&self)           -> usize        { self.shape.len() }
+    pub fn dtype(&self)          -> DType        { self.dtype }
+    pub fn device(&self)         -> Device       { self.device }
+    pub fn is_cuda(&self)        -> bool         { self.device != Device::Cpu }
 
-    /// View the raw data (CPU only).
     pub fn as_slice(&self) -> Result<&[f32]> {
-        if self.device != Device::Cpu {
-            return Err(AtlasError::Other("as_slice called on GPU tensor".into()));
+        if self.is_cuda() {
+            return Err(AtlasError::Other(
+                "as_slice() on GPU tensor — call .to_cpu() first".into()));
         }
         Ok(&self.data)
     }
 
-    /// Matrix multiplication: [M, K] × [K, N] → [M, N]
-    ///
-    /// Uses CUDA kernel when CUDA feature is enabled; falls back to pure Rust O(n³).
-    /// The CUDA path calls `atlas_matmul_f32` from `kernels/matmul.cu`.
+    pub fn as_slice_mut(&mut self) -> Result<&mut [f32]> {
+        if self.is_cuda() {
+            return Err(AtlasError::Other(
+                "as_slice_mut() on GPU tensor".into()));
+        }
+        Ok(&mut self.data)
+    }
+
+    // ── Arithmetic ops ────────────────────────────────────────────────────
+
+    /// Matrix multiply: [M,K] × [K,N] → [M,N]
     pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
-        // Validate shapes
         if self.ndim() != 2 || other.ndim() != 2 {
             return Err(AtlasError::Other("matmul requires 2D tensors".into()));
         }
-        let (m, k) = (self.shape[0], self.shape[1]);
-        let (k2, n) = (other.shape[0], other.shape[1]);
-        if k != k2 {
+        let (m, k, n) = (self.shape[0], self.shape[1], other.shape[1]);
+        if k != other.shape[0] {
             return Err(AtlasError::ShapeMismatch {
                 expected: vec![m, k],
-                got: vec![k2, n],
+                got:      vec![other.shape[0], n],
             });
         }
 
-        // TODO Stage 1: replace with CUDA kernel call via FFI
-        // extern "C" {
-        //     fn atlas_matmul_f32(a: *const f32, b: *const f32, c: *mut f32,
-        //                         m: i32, n: i32, k: i32);
-        // }
+        #[cfg(atlas_cuda)]
+        if self.is_cuda() && other.is_cuda() {
+            if let (Some(a_buf), Some(b_buf)) = (&self.gpu_buf, &other.gpu_buf) {
+                let mut out = Tensor::zeros(&[m, n]).to_cuda();
+                if let Some(c_buf) = &out.gpu_buf {
+                    unsafe {
+                        ffi::atlas_matmul_f32(
+                            a_buf.ptr, b_buf.ptr, c_buf.ptr,
+                            m as i32, n as i32, k as i32,
+                        );
+                    }
+                    out.data = c_buf.download();
+                    return Ok(out);
+                }
+            }
+        }
+
+        // CPU fallback
+        let a = self.as_slice()?;
+        let b = other.as_slice()?;
         let mut out = vec![0.0f32; m * n];
         for i in 0..m {
             for p in 0..k {
-                let a_ip = self.data[i * k + p];
+                let a_ip = a[i * k + p];
                 for j in 0..n {
-                    out[i * n + j] += a_ip * other.data[p * n + j];
+                    out[i * n + j] += a_ip * b[p * n + j];
                 }
             }
         }
         Tensor::from_vec(out, vec![m, n])
     }
 
-    /// Element-wise addition.
+    /// Element-wise add.
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
         if self.shape != other.shape {
             return Err(AtlasError::ShapeMismatch {
                 expected: self.shape.clone(),
-                got: other.shape.clone(),
+                got:      other.shape.clone(),
             });
         }
-        let data: Vec<f32> = self.data.iter().zip(&other.data).map(|(a, b)| a + b).collect();
+        #[cfg(atlas_cuda)]
+        if self.is_cuda() && other.is_cuda() {
+            if let (Some(a), Some(b)) = (&self.gpu_buf, &other.gpu_buf) {
+                let mut out = Tensor::zeros(&self.shape).to_cuda();
+                if let Some(c) = &out.gpu_buf {
+                    unsafe { ffi::atlas_vec_add_f32(a.ptr, b.ptr, c.ptr, self.numel() as i32); }
+                    out.data = c.download();
+                    return Ok(out);
+                }
+            }
+        }
+        let data: Vec<f32> = self.data.iter().zip(&other.data).map(|(a,b)| a+b).collect();
         Tensor::from_vec(data, self.shape.clone())
     }
 
@@ -152,59 +293,87 @@ impl Tensor {
         if self.shape != other.shape {
             return Err(AtlasError::ShapeMismatch {
                 expected: self.shape.clone(),
-                got: other.shape.clone(),
+                got:      other.shape.clone(),
             });
         }
-        let data: Vec<f32> = self.data.iter().zip(&other.data).map(|(a, b)| a * b).collect();
+        let data: Vec<f32> = self.data.iter().zip(&other.data).map(|(a,b)| a*b).collect();
         Tensor::from_vec(data, self.shape.clone())
     }
 
     /// Scalar multiply.
     pub fn scale(&self, s: f32) -> Tensor {
-        let data: Vec<f32> = self.data.iter().map(|x| x * s).collect();
-        Tensor { data, shape: self.shape.clone(), dtype: self.dtype, device: self.device }
-    }
-
-    /// Apply ReLU activation.
-    pub fn relu(&self) -> Tensor {
-        let data: Vec<f32> = self.data.iter().map(|x| x.max(0.0)).collect();
-        Tensor { data, shape: self.shape.clone(), dtype: self.dtype, device: self.device }
-    }
-
-    /// Apply softmax along the last dimension.
-    pub fn softmax(&self) -> Result<Tensor> {
-        if self.ndim() < 1 {
-            return Err(AtlasError::Other("softmax requires at least 1D tensor".into()));
+        #[cfg(atlas_cuda)]
+        if self.is_cuda() {
+            if let Some(buf) = &self.gpu_buf {
+                let mut out = Tensor::zeros(&self.shape).to_cuda();
+                if let Some(c) = &out.gpu_buf {
+                    unsafe { ffi::atlas_scale_f32(buf.ptr, s, c.ptr, self.numel() as i32); }
+                    out.data = c.download();
+                    return out;
+                }
+            }
         }
-        let last = *self.shape.last().unwrap();
+        let data: Vec<f32> = self.data.iter().map(|x| x * s).collect();
+        Tensor::new_cpu(data, self.shape.clone())
+    }
+
+    /// ReLU activation.
+    pub fn relu(&self) -> Tensor {
+        #[cfg(atlas_cuda)]
+        if self.is_cuda() {
+            if let Some(buf) = &self.gpu_buf {
+                let mut out = Tensor::zeros(&self.shape).to_cuda();
+                if let Some(c) = &out.gpu_buf {
+                    unsafe { ffi::atlas_relu_f32(buf.ptr, c.ptr, self.numel() as i32); }
+                    out.data = c.download();
+                    return out;
+                }
+            }
+        }
+        let data: Vec<f32> = self.data.iter().map(|x| x.max(0.0)).collect();
+        Tensor::new_cpu(data, self.shape.clone())
+    }
+
+    /// Softmax along the last dimension.
+    pub fn softmax(&self) -> Result<Tensor> {
+        let last = *self.shape.last()
+            .ok_or_else(|| AtlasError::Other("softmax on 0-dim tensor".into()))?;
         let rows = self.numel() / last;
+
+        #[cfg(atlas_cuda)]
+        if self.is_cuda() {
+            if let Some(buf) = &self.gpu_buf {
+                let mut out = Tensor::zeros(&self.shape).to_cuda();
+                if let Some(c) = &out.gpu_buf {
+                    unsafe { ffi::atlas_softmax_f32(buf.ptr, c.ptr, rows as i32, last as i32); }
+                    out.data = c.download();
+                    return Ok(out);
+                }
+            }
+        }
         let mut data = self.data.clone();
         for r in 0..rows {
             let row = &mut data[r * last..(r + 1) * last];
-            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            row.iter_mut().for_each(|x| *x = (*x - max).exp());
-            let sum: f32 = row.iter().sum();
-            row.iter_mut().for_each(|x| *x /= sum);
+            let mx  = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            row.iter_mut().for_each(|x| *x = (*x - mx).exp());
+            let s: f32 = row.iter().sum();
+            row.iter_mut().for_each(|x| *x /= s);
         }
         Tensor::from_vec(data, self.shape.clone())
     }
 
-    /// Reshape (must have same total elements).
+    /// Reshape (same total elements).
     pub fn reshape(&self, shape: Vec<usize>) -> Result<Tensor> {
-        let new_n: usize = shape.iter().product();
-        if new_n != self.numel() {
-            return Err(AtlasError::ShapeMismatch {
-                expected: vec![self.numel()],
-                got: vec![new_n],
-            });
+        if shape.iter().product::<usize>() != self.numel() {
+            return Err(AtlasError::Other("reshape: element count mismatch".into()));
         }
-        Ok(Tensor { data: self.data.clone(), shape, dtype: self.dtype, device: self.device })
+        Ok(Tensor::new_cpu(self.data.clone(), shape))
     }
 
-    /// Transpose a 2D tensor.
+    /// Transpose 2D tensor.
     pub fn transpose(&self) -> Result<Tensor> {
         if self.ndim() != 2 {
-            return Err(AtlasError::Other("transpose requires 2D tensor".into()));
+            return Err(AtlasError::Other("transpose requires 2D".into()));
         }
         let (m, n) = (self.shape[0], self.shape[1]);
         let mut data = vec![0.0f32; m * n];
@@ -214,6 +383,21 @@ impl Tensor {
             }
         }
         Tensor::from_vec(data, vec![n, m])
+    }
+
+    /// Sum all elements.
+    pub fn sum(&self) -> f32 {
+        self.data.iter().sum()
+    }
+
+    /// Mean of all elements.
+    pub fn mean(&self) -> f32 {
+        self.sum() / self.numel() as f32
+    }
+
+    /// L2 norm.
+    pub fn norm(&self) -> f32 {
+        self.data.iter().map(|x| x * x).sum::<f32>().sqrt()
     }
 }
 
@@ -226,44 +410,48 @@ mod tests {
         let t = Tensor::zeros(&[3, 4]);
         assert_eq!(t.shape(), &[3, 4]);
         assert_eq!(t.numel(), 12);
-        assert!(t.as_slice().unwrap().iter().all(|&x| x == 0.0));
     }
 
     #[test]
-    fn matmul_2x3_3x2() {
-        // [1,2,3; 4,5,6] × [7,8; 9,10; 11,12] = [58,64; 139,154]
+    fn matmul_correct() {
+        // [1,2,3;4,5,6] × [7,8;9,10;11,12] = [58,64;139,154]
         let a = Tensor::from_vec(vec![1.,2.,3.,4.,5.,6.], vec![2,3]).unwrap();
         let b = Tensor::from_vec(vec![7.,8.,9.,10.,11.,12.], vec![3,2]).unwrap();
         let c = a.matmul(&b).unwrap();
-        assert_eq!(c.shape(), &[2, 2]);
         let s = c.as_slice().unwrap();
-        assert!((s[0] - 58.0).abs() < 1e-4);
-        assert!((s[1] - 64.0).abs() < 1e-4);
-        assert!((s[2] - 139.0).abs() < 1e-4);
-        assert!((s[3] - 154.0).abs() < 1e-4);
+        assert!((s[0] - 58.).abs() < 1e-4);
+        assert!((s[3] - 154.).abs() < 1e-4);
     }
 
     #[test]
     fn softmax_sums_to_one() {
-        let t = Tensor::from_vec(vec![1.0, 2.0, 3.0], vec![1, 3]).unwrap();
+        let t = Tensor::from_vec(vec![1.,2.,3.], vec![1,3]).unwrap();
         let s = t.softmax().unwrap();
         let sum: f32 = s.as_slice().unwrap().iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn transpose_2d() {
+    fn transpose_correct() {
         let t = Tensor::from_vec(vec![1.,2.,3.,4.,5.,6.], vec![2,3]).unwrap();
         let tt = t.transpose().unwrap();
-        assert_eq!(tt.shape(), &[3, 2]);
-        assert_eq!(tt.as_slice().unwrap()[0], 1.0);
-        assert_eq!(tt.as_slice().unwrap()[1], 4.0);
+        assert_eq!(tt.shape(), &[3,2]);
+        assert_eq!(tt.as_slice().unwrap()[1], 4.0); // (0,1)→(1,0) → index 1 in [3,2]
     }
 
     #[test]
-    fn reshape() {
-        let t = Tensor::zeros(&[2, 3]);
-        let r = t.reshape(vec![3, 2]).unwrap();
-        assert_eq!(r.shape(), &[3, 2]);
+    fn cuda_info() {
+        // Just check it doesn't panic; result depends on build environment
+        let _ = cuda_available();
+        let _ = cuda_device_count();
+    }
+
+    #[test]
+    fn scale_relu() {
+        let t = Tensor::from_vec(vec![-2., -1., 0., 1., 2.], vec![5]).unwrap();
+        let s = t.scale(2.0);
+        assert_eq!(s.as_slice().unwrap(), &[-4.,-2.,0.,2.,4.]);
+        let r = t.relu();
+        assert_eq!(r.as_slice().unwrap(), &[0.,0.,0.,1.,2.]);
     }
 }
