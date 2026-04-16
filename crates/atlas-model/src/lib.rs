@@ -107,6 +107,22 @@ impl ModelConfig {
         }
     }
 
+    /// SmolLM2-360M (HuggingFaceTB) — LlamaForCausalLM, Apache 2.0
+    /// hidden=960, layers=32, heads=15, kv_heads=5, ffn=2560, vocab=49152
+    pub fn smollm2_360m() -> Self {
+        Self {
+            vocab_size:   49152,
+            d_model:      960,
+            n_layers:     32,
+            n_heads:      15,
+            n_kv_heads:   5,
+            ffn_hidden:   2560,
+            max_seq_len:  8192,
+            rope_theta:   100_000.0,
+            rms_norm_eps: 1e-5,
+        }
+    }
+
     /// SmolLM2-135M (HuggingFaceTB) — LlamaForCausalLM, Apache 2.0
     /// hidden=576, layers=30, heads=9, kv_heads=3, ffn=1536, vocab=49152
     pub fn smollm2_135m() -> Self {
@@ -1736,6 +1752,155 @@ mod tests {
         assert!(tok_s > 5.0, "Throughput below 5 tok/s: {tok_s:.1}");
     }
 
+    /// GPU throughput benchmark: 50 tokens from SmolLM2-360M with timing report.
+    /// Requires: ~/models/smollm2-360m/model.safetensors
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_smollm2_360m_50tok() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let weights = format!("{home}/models/smollm2-360m/model.safetensors");
+        let t_load = std::time::Instant::now();
+        let mut model = match load_model_from_safetensors(&weights, ModelConfig::smollm2_360m()) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("SKIP: {e}"); return; }
+        };
+        let load_ms = t_load.elapsed().as_millis();
+        eprintln!("  Load time: {}ms", load_ms);
+        // Warm-up
+        let t_first = std::time::Instant::now();
+        let _ = model.forward_one_gpu(1);
+        let first_tok_ms = t_first.elapsed().as_millis();
+        eprintln!("  First-token latency: {}ms", first_tok_ms);
+        model.reset();
+        // Benchmark
+        let n = 50usize;
+        let t0 = std::time::Instant::now();
+        let out = model.generate(&[1u32, 2, 3], n, 0.0);
+        let elapsed = t0.elapsed();
+        let tok_s = n as f64 / elapsed.as_secs_f64();
+        eprintln!("");
+        eprintln!("  ┌─────────────────────────────────────────────────┐");
+        eprintln!("  │  ATLAS GPU Benchmark - SmolLM2-360M             │");
+        eprintln!("  │  Load:        {:>8}ms                          │", load_ms);
+        eprintln!("  │  First-token: {:>8}ms                          │", first_tok_ms);
+        eprintln!("  │  Tokens:      {:>8}                            │", n);
+        eprintln!("  │  Elapsed:     {:>11.3}s                       │", elapsed.as_secs_f64());
+        eprintln!("  │  Throughput:  {:>8.1} tok/s                    │", tok_s);
+        eprintln!("  └─────────────────────────────────────────────────┘");
+        eprintln!("");
+        assert_eq!(out.len(), n);
+        assert!(tok_s > 2.0, "Throughput below 2 tok/s: {tok_s:.1}");
+    }
+
+    /// GPU throughput benchmark: 50 tokens from SmolLM2-1.7B with timing report.
+    /// Requires: ~/models/smollm2-1b7/model.safetensors
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_smollm2_1b7_50tok() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let weights = format!("{home}/models/smollm2-1b7/model.safetensors");
+        let t_load = std::time::Instant::now();
+        let mut model = match load_model_from_safetensors(&weights, ModelConfig::smollm2_1b7()) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("SKIP: {e}"); return; }
+        };
+        let load_ms = t_load.elapsed().as_millis();
+        eprintln!("  Load time: {}ms", load_ms);
+        // Warm-up
+        let t_first = std::time::Instant::now();
+        let _ = model.forward_one_gpu(1);
+        let first_tok_ms = t_first.elapsed().as_millis();
+        eprintln!("  First-token latency: {}ms", first_tok_ms);
+        model.reset();
+        // Benchmark
+        let n = 50usize;
+        let t0 = std::time::Instant::now();
+        let out = model.generate(&[1u32, 2, 3], n, 0.0);
+        let elapsed = t0.elapsed();
+        let tok_s = n as f64 / elapsed.as_secs_f64();
+        eprintln!("");
+        eprintln!("  ┌─────────────────────────────────────────────────┐");
+        eprintln!("  │  ATLAS GPU Benchmark - SmolLM2-1.7B             │");
+        eprintln!("  │  Load:        {:>8}ms                          │", load_ms);
+        eprintln!("  │  First-token: {:>8}ms                          │", first_tok_ms);
+        eprintln!("  │  Tokens:      {:>8}                            │", n);
+        eprintln!("  │  Elapsed:     {:>11.3}s                       │", elapsed.as_secs_f64());
+        eprintln!("  │  Throughput:  {:>8.1} tok/s                    │", tok_s);
+        eprintln!("  └─────────────────────────────────────────────────┘");
+        eprintln!("");
+        assert_eq!(out.len(), n);
+        assert!(tok_s > 1.0, "Throughput below 1 tok/s: {tok_s:.1}");
+    }
+
+    /// Comparative GPU benchmark — runs all three SmolLM2 sizes and prints a summary table.
+    /// Requires: ~/models/smollm2-135m/, ~/models/smollm2-360m/, ~/models/smollm2-1b7/
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_smollm2_all_sizes() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+
+        struct BenchResult {
+            name:       &'static str,
+            params_m:   f32,
+            load_ms:    u128,
+            first_ms:   u128,
+            tok_s:      f64,
+            vram_note:  &'static str,
+        }
+
+        let mut results: Vec<BenchResult> = Vec::new();
+
+        let models: &[(&str, &str, ModelConfig, f32, &str)] = &[
+            ("SmolLM2-135M", "smollm2-135m", ModelConfig::smollm2_135m(), 135.0, "~0.5GB"),
+            ("SmolLM2-360M", "smollm2-360m", ModelConfig::smollm2_360m(), 360.0, "~1.4GB"),
+            ("SmolLM2-1.7B", "smollm2-1b7",  ModelConfig::smollm2_1b7(),  1700.0, "~6.5GB"),
+        ];
+
+        for (name, dir, cfg, params_m, vram_note) in models {
+            let weights = format!("{home}/models/{dir}/model.safetensors");
+            eprintln!("\n  Loading {name}...");
+            let t_load = std::time::Instant::now();
+            let mut model = match load_model_from_safetensors(&weights, cfg.clone()) {
+                Ok(m) => m,
+                Err(e) => { eprintln!("  SKIP {name}: {e}"); continue; }
+            };
+            let load_ms = t_load.elapsed().as_millis();
+            // Warm-up
+            let t_first = std::time::Instant::now();
+            let _ = model.forward_one_gpu(1);
+            let first_ms = t_first.elapsed().as_millis();
+            model.reset();
+            // Benchmark 30 tokens
+            let n = 30usize;
+            let t0 = std::time::Instant::now();
+            let out = model.generate(&[1u32, 2, 3], n, 0.0);
+            let elapsed = t0.elapsed();
+            let tok_s = n as f64 / elapsed.as_secs_f64();
+            assert_eq!(out.len(), n, "{name}: wrong output length");
+            results.push(BenchResult { name, params_m: *params_m, load_ms, first_ms, tok_s, vram_note });
+        }
+
+        // Print summary table
+        eprintln!("");
+        eprintln!("  ╔══════════════════╦═══════════╦══════════╦═══════════╦══════════════╦══════════╗");
+        eprintln!("  ║ Model            ║ Params    ║ Load(ms) ║ 1st-tok   ║ Throughput   ║ VRAM est ║");
+        eprintln!("  ╠══════════════════╬═══════════╬══════════╬═══════════╬══════════════╬══════════╣");
+        for r in &results {
+            eprintln!("  ║ {:<16} ║ {:>7.0}M ║ {:>8} ║ {:>7}ms ║ {:>8.1} tok/s ║ {:>8} ║",
+                r.name, r.params_m, r.load_ms, r.first_ms, r.tok_s, r.vram_note);
+        }
+        eprintln!("  ╚══════════════════╩═══════════╩══════════╩═══════════╩══════════════╩══════════╝");
+        eprintln!("  Hardware: Tesla T4 (15GB VRAM) | CUDA 13.0 | ATLAS v3.0.0");
+        eprintln!("");
+
+        assert!(!results.is_empty(), "No models benchmarked");
+        for r in &results {
+            assert!(r.tok_s > 0.5, "{} throughput too low: {:.1} tok/s", r.name, r.tok_s);
+        }
+    }
 
     /// Helper: compute the expected shape and numel for a tensor name given a config.
     fn tensor_shape_for_config(cfg: &ModelConfig, name: &str) -> (Vec<usize>, usize) {
