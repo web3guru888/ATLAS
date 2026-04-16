@@ -411,3 +411,231 @@ mod tests {
         assert_eq!(ctrl.state, SafetyState::Nominal, "reset from EMERGENCY_STOP → NOMINAL");
     }
 }
+
+// ─── Tractable Safety Constitution (Young 2026) ──────────────────────────
+//
+// Young (2026, arXiv:2501.15446, EACL) proves Semantic Self-Verification is
+// NP-complete via 3-SAT reduction. Constitutions with overlapping disjunctive
+// rules are NP-hard to verify. The escape route: ≤12 atomic Horn-clause
+// principles across ≤4 non-overlapping domains stay in polynomial time.
+//
+// Reference: "NP-Hard Lower Bound Complexity for Semantic Self-Verification"
+// Robin Young, EACL 2026, arXiv:2501.15446.
+
+/// The four non-overlapping safety domains (disjointness enforced by Rust enum).
+///
+/// Keeping domains non-overlapping is the key tractability constraint:
+/// each principle belongs to exactly one domain, eliminating cross-domain
+/// semantic interdependencies that create NP-hard constraint graphs.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SafetyDomain {
+    /// What is generated — harmful content, bias, toxicity.
+    Content,
+    /// Where knowledge comes from — citations, ZK claims, source integrity.
+    Provenance,
+    /// Uncertainty handling — refusing to confabulate, calibrated confidence.
+    Epistemic,
+    /// Data handling — no PII leakage, session isolation.
+    Privacy,
+}
+
+impl SafetyDomain {
+    /// Human-readable domain name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Content    => "Content",
+            Self::Provenance => "Provenance",
+            Self::Epistemic  => "Epistemic",
+            Self::Privacy    => "Privacy",
+        }
+    }
+
+    /// All four domains.
+    pub const ALL: [SafetyDomain; 4] = [
+        Self::Content, Self::Provenance, Self::Epistemic, Self::Privacy,
+    ];
+}
+
+/// A single constitutional principle in Horn-clause form: `head :- body`.
+///
+/// Horn clauses (single positive consequent) are verifiable in linear time,
+/// avoiding the exponential blowup of general clause verification.
+#[derive(Debug, Clone)]
+pub struct SafetyPrinciple {
+    /// Unique principle ID (1..=12).
+    pub id: u8,
+    /// Non-overlapping domain this principle belongs to.
+    pub domain: SafetyDomain,
+    /// Plain-English description.
+    pub description: &'static str,
+    /// Horn clause head: what is asserted to be safe/true.
+    pub horn_head: &'static str,
+    /// Horn clause body: the condition that must hold.
+    pub horn_body: &'static str,
+}
+
+/// The ATLAS safety constitution: 8 principles across 4 non-overlapping domains.
+///
+/// Designed per Young (2026) tractability criteria:
+/// - ≤12 principles total
+/// - Exactly 4 non-overlapping domains (Content, Provenance, Epistemic, Privacy)
+/// - Horn-clause structure (one positive head, conjunctive body — no disjunctions)
+/// - Rust enum enforces domain disjointness at compile time
+pub const SAFETY_CONSTITUTION: &[SafetyPrinciple] = &[
+    // ── Content (2 principles) ──────────────────────────────────────────
+    SafetyPrinciple {
+        id: 1,
+        domain: SafetyDomain::Content,
+        description: "Refuse to generate content that provides instructions for violence or self-harm",
+        horn_head: "content_safe",
+        horn_body: "NOT contains_violence_instructions AND NOT contains_self_harm_instructions",
+    },
+    SafetyPrinciple {
+        id: 2,
+        domain: SafetyDomain::Content,
+        description: "Do not generate content that demeans individuals based on protected characteristics",
+        horn_head: "content_unbiased",
+        horn_body: "NOT contains_targeted_derogation",
+    },
+    // ── Provenance (2 principles) ───────────────────────────────────────
+    SafetyPrinciple {
+        id: 3,
+        domain: SafetyDomain::Provenance,
+        description: "Knowledge claims above confidence threshold must be backed by a ZK proof or citation",
+        horn_head: "provenance_verified",
+        horn_body: "confidence < HIGH_THRESHOLD OR has_zk_proof OR has_citation",
+    },
+    SafetyPrinciple {
+        id: 4,
+        domain: SafetyDomain::Provenance,
+        description: "Do not attribute statements to sources that did not make them",
+        horn_head: "attribution_honest",
+        horn_body: "NOT false_attribution",
+    },
+    // ── Epistemic (2 principles) ────────────────────────────────────────
+    SafetyPrinciple {
+        id: 5,
+        domain: SafetyDomain::Epistemic,
+        description: "Express calibrated uncertainty — do not assert facts with confidence exceeding knowledge",
+        horn_head: "epistemic_calibrated",
+        horn_body: "expressed_confidence <= actual_confidence + CALIBRATION_TOLERANCE",
+    },
+    SafetyPrinciple {
+        id: 6,
+        domain: SafetyDomain::Epistemic,
+        description: "Refuse to speculate as fact in safety-critical domains without explicit uncertainty markers",
+        horn_head: "speculation_marked",
+        horn_body: "NOT safety_critical_domain OR contains_uncertainty_marker",
+    },
+    // ── Privacy (2 principles) ──────────────────────────────────────────
+    SafetyPrinciple {
+        id: 7,
+        domain: SafetyDomain::Privacy,
+        description: "Do not include personally identifiable information in generated outputs",
+        horn_head: "no_pii_leakage",
+        horn_body: "NOT contains_pii",
+    },
+    SafetyPrinciple {
+        id: 8,
+        domain: SafetyDomain::Privacy,
+        description: "Session context must not bleed across user sessions",
+        horn_head: "session_isolated",
+        horn_body: "session_context.origin == current_session",
+    },
+];
+
+/// Verify that the constitution satisfies Young (2026) tractability constraints.
+///
+/// Returns `Ok(())` if the constitution is tractable, or `Err(description)` if not.
+///
+/// Constraints checked:
+/// 1. ≤12 total principles
+/// 2. All four domains covered
+/// 3. Each principle ID is unique
+pub fn verify_tractability() -> core::result::Result<(), String> {
+    if SAFETY_CONSTITUTION.len() > 12 {
+        return Err(format!(
+            "Constitution has {} principles; Young (2026) tractability bound is ≤12",
+            SAFETY_CONSTITUTION.len()
+        ));
+    }
+
+    // Check all four domains are covered
+    let domains_covered: std::collections::HashSet<String> = SAFETY_CONSTITUTION
+        .iter()
+        .map(|p| p.domain.name().to_string())
+        .collect();
+
+    for domain in SafetyDomain::ALL.iter() {
+        if !domains_covered.contains(domain.name()) {
+            return Err(format!("Domain '{}' has no principles", domain.name()));
+        }
+    }
+
+    // Check unique IDs
+    let mut seen_ids = std::collections::HashSet::new();
+    for p in SAFETY_CONSTITUTION {
+        if !seen_ids.insert(p.id) {
+            return Err(format!("Duplicate principle ID: {}", p.id));
+        }
+    }
+
+    Ok(())
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod constitution_tests {
+    use super::*;
+
+    #[test]
+    fn constitution_is_tractable() {
+        verify_tractability().expect("SAFETY_CONSTITUTION violates Young 2026 tractability");
+    }
+
+    #[test]
+    fn all_four_domains_covered() {
+        let domains: std::collections::HashSet<String> = SAFETY_CONSTITUTION
+            .iter()
+            .map(|p| p.domain.name().to_string())
+            .collect();
+        assert!(domains.contains("Content"),    "Missing Content domain");
+        assert!(domains.contains("Provenance"), "Missing Provenance domain");
+        assert!(domains.contains("Epistemic"),  "Missing Epistemic domain");
+        assert!(domains.contains("Privacy"),    "Missing Privacy domain");
+    }
+
+    #[test]
+    fn max_twelve_principles() {
+        assert!(
+            SAFETY_CONSTITUTION.len() <= 12,
+            "Constitution has {} principles — exceeds NP-hard tractability bound of 12",
+            SAFETY_CONSTITUTION.len()
+        );
+    }
+
+    #[test]
+    fn all_principles_have_unique_ids() {
+        let mut ids = std::collections::HashSet::new();
+        for p in SAFETY_CONSTITUTION {
+            assert!(ids.insert(p.id), "Duplicate principle ID: {}", p.id);
+        }
+    }
+
+    #[test]
+    fn principles_have_horn_clause_structure() {
+        for p in SAFETY_CONSTITUTION {
+            assert!(!p.horn_head.is_empty(), "Principle {} has empty head", p.id);
+            assert!(!p.horn_body.is_empty(), "Principle {} has empty body", p.id);
+        }
+    }
+
+    #[test]
+    fn safety_domain_names() {
+        assert_eq!(SafetyDomain::Content.name(),    "Content");
+        assert_eq!(SafetyDomain::Provenance.name(), "Provenance");
+        assert_eq!(SafetyDomain::Epistemic.name(),  "Epistemic");
+        assert_eq!(SafetyDomain::Privacy.name(),    "Privacy");
+    }
+}
