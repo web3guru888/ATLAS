@@ -177,6 +177,122 @@ impl DeepSupervisionTrainer {
     }
 }
 
+// ── BarBovier2017Constraints ────────────────────────────────────────────────
+//
+// Validates the two stability conditions from Baar-Bovier-Champagnat (2017) AAP
+// that are necessary for n-morphic pheromone dynamics to avoid saturation:
+//
+//   Condition 2.1a: explore_ratio × batch_size > min_explore_batch_product (default 10)
+//   Condition 2.1b: temperature ≥ 1 / √batch_size
+//
+// Violating either condition leads to pheromone saturation instability (all
+// pheromones collapse to a single mode or all go to zero).
+
+/// Report produced by [`BarBovier2017Constraints::check`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct BarBovier2017Report {
+    /// Whether explore_ratio × batch_size > min_explore_batch_product.
+    pub explore_batch_ok: bool,
+    /// Whether temperature ≥ 1/√batch_size.
+    pub temperature_ok: bool,
+    /// Actual value of explore_ratio × batch_size.
+    pub explore_batch_product: f32,
+    /// Minimum required temperature = 1/√batch_size.
+    pub min_temperature: f32,
+    /// True iff both conditions are satisfied.
+    pub all_ok: bool,
+}
+
+impl BarBovier2017Report {
+    /// One-line human-readable summary.
+    pub fn summary(&self) -> String {
+        if self.all_ok {
+            format!(
+                "BarBovier OK: explore×batch={:.2} (>{:.1}), temp≥{:.4}",
+                self.explore_batch_product,
+                10.0_f32,
+                self.min_temperature,
+            )
+        } else {
+            let mut violations = Vec::new();
+            if !self.explore_batch_ok {
+                violations.push(format!(
+                    "explore×batch={:.2} must be >{:.1}",
+                    self.explore_batch_product, 10.0_f32
+                ));
+            }
+            if !self.temperature_ok {
+                violations.push(format!(
+                    "temperature must be ≥{:.4} (= 1/√batch)",
+                    self.min_temperature
+                ));
+            }
+            format!("BarBovier VIOLATION: {}", violations.join("; "))
+        }
+    }
+}
+
+/// Validates Baar-Bovier-Champagnat (2017) stability conditions for
+/// n-morphic pheromone dynamics in [`DeepSupervisionConfig`].
+///
+/// # Example
+/// ```rust
+/// use atlas_corpus::BarBovier2017Constraints;
+/// let checker = BarBovier2017Constraints::default();
+/// let report = checker.check(0.5, 32, 0.2);
+/// assert!(report.all_ok);
+/// ```
+#[derive(Debug, Clone)]
+pub struct BarBovier2017Constraints {
+    /// Minimum required value for explore_ratio × batch_size (default: 10.0).
+    /// From Condition 2.1a of Baar-Bovier-Champagnat (2017).
+    pub min_explore_batch_product: f32,
+    /// If true, only log a warning on violation rather than returning all_ok=false.
+    pub warn_only: bool,
+}
+
+impl Default for BarBovier2017Constraints {
+    fn default() -> Self {
+        Self { min_explore_batch_product: 10.0, warn_only: false }
+    }
+}
+
+impl BarBovier2017Constraints {
+    /// Create a new checker with default thresholds.
+    pub fn new() -> Self { Self::default() }
+
+    /// Create a strict checker (warn_only=false, product threshold=10.0).
+    pub fn strict() -> Self {
+        Self { min_explore_batch_product: 10.0, warn_only: false }
+    }
+
+    /// Check both Baar-Bovier-Champagnat (2017) stability conditions.
+    ///
+    /// - `explore_ratio` — μ proxy (OODA explore fraction, ∈ [0,1])
+    /// - `batch_size`    — population size N
+    /// - `temperature`   — σ proxy (sampling temperature)
+    pub fn check(&self, explore_ratio: f32, batch_size: usize, temperature: f32) -> BarBovier2017Report {
+        let product = explore_ratio * batch_size as f32;
+        let min_temp = 1.0 / (batch_size as f32).sqrt();
+        let explore_batch_ok = product > self.min_explore_batch_product;
+        let temperature_ok = temperature >= min_temp;
+        let all_ok = if self.warn_only { true } else { explore_batch_ok && temperature_ok };
+        BarBovier2017Report {
+            explore_batch_ok,
+            temperature_ok,
+            explore_batch_product: product,
+            min_temperature: min_temp,
+            all_ok,
+        }
+    }
+
+    /// Check conditions against a [`DeepSupervisionConfig`].
+    pub fn check_config(&self, cfg: &DeepSupervisionConfig, batch_size: usize, temperature: f32) -> BarBovier2017Report {
+        // Use pheromone_weight as an explore_ratio proxy (both ∈ [0,1])
+        self.check(cfg.pheromone_weight, batch_size, temperature)
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -319,5 +435,63 @@ mod tests {
         assert!(trace[0] > trace[1]);
         assert!(trace[1] > trace[2]);
         assert!(trace[2] > trace[3]);
+    }
+
+    // ── BarBovier2017Constraints tests ────────────────────────────────────
+
+    #[test]
+    fn bar_bovier_satisfied() {
+        let checker = BarBovier2017Constraints::default();
+        let r = checker.check(0.5, 32, 0.2);
+        assert!(r.explore_batch_ok);  // 0.5×32=16 > 10
+        assert!(r.temperature_ok);   // 0.2 >= 1/√32≈0.177
+        assert!(r.all_ok);
+    }
+
+    #[test]
+    fn bar_bovier_explore_batch_violated() {
+        let checker = BarBovier2017Constraints::default();
+        let r = checker.check(0.2, 32, 0.2); // 0.2×32=6.4 < 10
+        assert!(!r.explore_batch_ok);
+        assert!(!r.all_ok);
+    }
+
+    #[test]
+    fn bar_bovier_temperature_violated() {
+        let checker = BarBovier2017Constraints::default();
+        let r = checker.check(0.5, 32, 0.1); // 0.1 < 1/√32≈0.177
+        assert!(!r.temperature_ok);
+        assert!(!r.all_ok);
+    }
+
+    #[test]
+    fn bar_bovier_boundary_exact_ten() {
+        let checker = BarBovier2017Constraints::default();
+        // product = exactly 10.0 → NOT strictly > 10 → violated
+        let r = checker.check(0.5, 20, 0.25); // 0.5×20=10.0
+        assert!(!r.explore_batch_ok);
+    }
+
+    #[test]
+    fn bar_bovier_summary_ok() {
+        let checker = BarBovier2017Constraints::default();
+        let r = checker.check(0.5, 32, 0.2);
+        assert!(r.summary().contains("OK"));
+    }
+
+    #[test]
+    fn bar_bovier_summary_violation() {
+        let checker = BarBovier2017Constraints::default();
+        let r = checker.check(0.1, 4, 0.01);
+        assert!(r.summary().contains("VIOLATION"));
+    }
+
+    #[test]
+    fn bar_bovier_strict_mode() {
+        let checker = BarBovier2017Constraints::strict();
+        let r = checker.check(1.0, 100, 0.5); // all pass
+        assert!(r.all_ok);
+        assert_eq!(r.explore_batch_product, 100.0);
+        assert!((r.min_temperature - 0.1).abs() < 1e-4);
     }
 }

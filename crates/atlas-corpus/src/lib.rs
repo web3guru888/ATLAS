@@ -25,7 +25,13 @@ pub use train::{
 };
 
 pub mod deep_supervision;
-pub use deep_supervision::{DeepSupervisionConfig, DeepSupervisionTrainer};
+pub use deep_supervision::{
+    BarBovier2017Constraints, BarBovier2017Report,
+    DeepSupervisionConfig, DeepSupervisionTrainer,
+};
+
+pub mod invasion_fitness;
+pub use invasion_fitness::{InvasionFitnessScorer, InvasionFitnessConfig, FitnessItem, cosine_sim};
 
 use std::collections::HashMap;
 
