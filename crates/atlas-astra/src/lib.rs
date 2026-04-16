@@ -975,6 +975,140 @@ fn compute_novelty(text: &str, known: &[String]) -> f64 {
     (1.0 - max_overlap).clamp(0.0, 1.0)
 }
 
+// ── CognitiveBranching ──────────────────────────────────────────────────────
+//
+// Detects n-morphic disruptive selection: if explore_ratio plateaus for
+// `plateau_window` consecutive OODA cycles AND loss_trace variance is high,
+// bifurcate the OODA loop into two exploration threads at ratio ± branch_delta.
+//
+// Based on Champagnat (2011) PTRF branching condition: when the canonical
+// equation's drift term is near zero and fluctuations dominate, the
+// monomorphic population undergoes disruptive selection and splits.
+//
+// Reference: Champagnat-Méléard (2011) PTRF §5 (polymorphic branching).
+
+/// Result of a [`CognitiveBranching`] cycle evaluation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BranchingResult {
+    /// Whether the system should branch into two OODA threads.
+    pub should_branch: bool,
+    /// Thread A explore ratio = current − branch_delta (clamped to [0.05, 0.95]).
+    pub branch_a_ratio: f32,
+    /// Thread B explore ratio = current + branch_delta (clamped to [0.05, 0.95]).
+    pub branch_b_ratio: f32,
+    /// Whether explore_ratio has been plateaued for `plateau_window` cycles.
+    pub is_plateaued: bool,
+    /// Variance of the most recent `loss_trace`.
+    pub loss_variance: f32,
+}
+
+/// Detects n-morphic disruptive selection and triggers OODA bifurcation.
+///
+/// # Example
+/// ```rust
+/// use atlas_astra::CognitiveBranching;
+/// let mut brancher = CognitiveBranching::default();
+/// // Feed cycles with a stable explore_ratio and high-variance loss
+/// for _ in 0..6 {
+///     let result = brancher.record_cycle(0.5, &[1.0, 0.1, 0.9, 0.2, 0.8]);
+///     if result.should_branch {
+///         println!("Branch A: {:.2}, B: {:.2}", result.branch_a_ratio, result.branch_b_ratio);
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct CognitiveBranching {
+    /// Maximum allowed explore_ratio change between cycles to count as a plateau (default: 0.01).
+    pub plateau_threshold: f32,
+    /// Number of consecutive stable cycles required to declare a plateau (default: 5).
+    pub plateau_window: usize,
+    /// Minimum loss_trace variance to trigger branching (default: 0.05).
+    pub variance_threshold: f32,
+    /// Explore ratio delta for the two branches (default: 0.1).
+    pub branch_delta: f32,
+    /// History of explore_ratio values (last `plateau_window + 1` cycles).
+    explore_history: Vec<f32>,
+    /// History of loss variance values (last `plateau_window` cycles).
+    variance_history: Vec<f32>,
+    /// Total number of branch events recorded.
+    pub branch_events: u32,
+}
+
+impl Default for CognitiveBranching {
+    fn default() -> Self {
+        Self {
+            plateau_threshold: 0.01,
+            plateau_window: 5,
+            variance_threshold: 0.05,
+            branch_delta: 0.1,
+            explore_history: Vec::new(),
+            variance_history: Vec::new(),
+            branch_events: 0,
+        }
+    }
+}
+
+impl CognitiveBranching {
+    /// Create with default parameters.
+    pub fn new() -> Self { Self::default() }
+
+    /// Record one OODA cycle and check for branching condition.
+    ///
+    /// - `explore_ratio` — current OODA explore fraction (∈ [0, 1])
+    /// - `loss_trace`    — loss values from this cycle's N_sup forward passes
+    pub fn record_cycle(&mut self, explore_ratio: f32, loss_trace: &[f32]) -> BranchingResult {
+        // Update explore history
+        self.explore_history.push(explore_ratio);
+        if self.explore_history.len() > self.plateau_window + 1 {
+            self.explore_history.remove(0);
+        }
+
+        // Compute loss variance
+        let lv = compute_variance(loss_trace);
+        self.variance_history.push(lv);
+        if self.variance_history.len() > self.plateau_window {
+            self.variance_history.remove(0);
+        }
+
+        let is_plateaued = self.check_plateau();
+        let high_variance = lv >= self.variance_threshold;
+        let should_branch = is_plateaued && high_variance;
+
+        if should_branch { self.branch_events += 1; }
+
+        let branch_a_ratio = (explore_ratio - self.branch_delta).clamp(0.05, 0.95);
+        let branch_b_ratio = (explore_ratio + self.branch_delta).clamp(0.05, 0.95);
+
+        BranchingResult {
+            should_branch,
+            branch_a_ratio,
+            branch_b_ratio,
+            is_plateaued,
+            loss_variance: lv,
+        }
+    }
+
+    /// Returns true if explore_ratio has been stable for `plateau_window` cycles.
+    fn check_plateau(&self) -> bool {
+        if self.explore_history.len() < self.plateau_window + 1 { return false; }
+        let recent = &self.explore_history[self.explore_history.len() - (self.plateau_window + 1)..];
+        recent.windows(2).all(|w| (w[1] - w[0]).abs() < self.plateau_threshold)
+    }
+
+    /// Reset history (e.g., after a branch event is acted on).
+    pub fn reset(&mut self) {
+        self.explore_history.clear();
+        self.variance_history.clear();
+    }
+}
+
+/// Variance of a slice of f32 values. Returns 0.0 for empty or single-element slices.
+fn compute_variance(values: &[f32]) -> f32 {
+    if values.len() < 2 { return 0.0; }
+    let mean = values.iter().sum::<f32>() / values.len() as f32;
+    values.iter().map(|x| (x - mean) * (x - mean)).sum::<f32>() / values.len() as f32
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1473,5 +1607,92 @@ mod tests {
         assert_eq!(engine.feedback().cycles_recorded(), 0);
         let _ = engine.run_cycle();
         assert_eq!(engine.feedback().cycles_recorded(), 1);
+    }
+
+    // ── CognitiveBranching tests ──────────────────────────────────────────
+
+    #[test]
+    fn branching_no_branch_before_plateau_window() {
+        let mut b = CognitiveBranching::default();
+        // Only 3 cycles, need 5 for plateau
+        for _ in 0..3 {
+            let r = b.record_cycle(0.5, &[1.0, 0.9, 0.8, 1.1, 0.7]);
+            assert!(!r.should_branch, "should not branch before plateau window");
+        }
+    }
+
+    #[test]
+    fn branching_triggers_after_plateau_and_high_variance() {
+        let mut b = CognitiveBranching::default();
+        // 6 cycles with stable ratio=0.5 and high-variance loss
+        let high_var_loss = [1.0_f32, 0.1, 0.9, 0.05, 0.95, 0.2, 0.8];
+        let mut branched = false;
+        for _ in 0..6 {
+            let r = b.record_cycle(0.5, &high_var_loss);
+            if r.should_branch { branched = true; }
+        }
+        assert!(branched, "should branch after 6 stable cycles with high variance");
+    }
+
+    #[test]
+    fn branching_no_branch_with_low_variance() {
+        let mut b = CognitiveBranching::default();
+        // Stable ratio, but loss is nearly constant → low variance
+        for _ in 0..10 {
+            let r = b.record_cycle(0.5, &[1.0, 1.0, 1.0, 1.0, 1.0]);
+            assert!(!r.should_branch, "should not branch with low variance loss");
+        }
+    }
+
+    #[test]
+    fn branching_no_branch_with_varying_ratio() {
+        let mut b = CognitiveBranching::default();
+        let high_var_loss = [1.0_f32, 0.0, 1.0, 0.0, 1.0];
+        let ratios = [0.2, 0.5, 0.3, 0.7, 0.4, 0.6, 0.3];
+        for &ratio in &ratios {
+            let r = b.record_cycle(ratio, &high_var_loss);
+            assert!(!r.should_branch, "should not branch if ratio varies");
+        }
+    }
+
+    #[test]
+    fn branching_result_ratios_clamped() {
+        let mut b = CognitiveBranching { branch_delta: 0.2, ..Default::default() };
+        // explore_ratio near boundary
+        let r = b.record_cycle(0.05, &[1.0, 0.0]);
+        assert!(r.branch_a_ratio >= 0.05, "branch_a should be clamped");
+        assert!(r.branch_b_ratio <= 0.95, "branch_b should be clamped");
+
+        let r2 = b.record_cycle(0.95, &[1.0, 0.0]);
+        assert!(r2.branch_a_ratio >= 0.05);
+        assert!(r2.branch_b_ratio <= 0.95);
+    }
+
+    #[test]
+    fn branching_counts_events() {
+        let mut b = CognitiveBranching::default();
+        let high_var_loss = [1.0_f32, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+        for _ in 0..10 {
+            b.record_cycle(0.5, &high_var_loss);
+        }
+        assert!(b.branch_events > 0, "should have counted branch events");
+    }
+
+    #[test]
+    fn branching_reset_clears_history() {
+        let mut b = CognitiveBranching::default();
+        for _ in 0..6 {
+            b.record_cycle(0.5, &[1.0, 0.0, 1.0, 0.0, 1.0]);
+        }
+        b.reset();
+        // After reset, need another full window before branching
+        let r = b.record_cycle(0.5, &[1.0, 0.0, 1.0, 0.0, 1.0]);
+        assert!(!r.should_branch, "should not branch immediately after reset");
+    }
+
+    #[test]
+    fn compute_variance_zero_for_constant() {
+        let v = compute_variance(&[3.0, 3.0, 3.0, 3.0]);
+        assert!(v.abs() < 1e-6, "variance of constant sequence should be 0");
     }
 }
