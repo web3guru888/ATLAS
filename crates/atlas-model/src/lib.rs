@@ -256,8 +256,9 @@ impl RopeCache {
 
 /// A weight matrix (no bias). Row-major: weight[out_i * in_dim + in_j].
 struct Linear {
-    weight: Vec<f32>,
-    in_dim: usize,
+    weight:  Vec<f32>,
+    gpu_mat: atlas_tensor::GpuMatrix,
+    in_dim:  usize,
     out_dim: usize,
 }
 
@@ -265,21 +266,28 @@ impl Linear {
     /// Create with Xavier-style initialization (deterministic, no rand crate).
     fn new(in_dim: usize, out_dim: usize, seed: u64) -> Self {
         let scale = (2.0 / (in_dim + out_dim) as f32).sqrt();
-        let weight = pseudo_randn(in_dim * out_dim, seed)
+        let weight: Vec<f32> = pseudo_randn(in_dim * out_dim, seed)
             .into_iter().map(|v| v * scale).collect();
-        Self { weight, in_dim, out_dim }
+        let gpu_mat = atlas_tensor::GpuMatrix::upload(&weight, out_dim, in_dim);
+        Self { weight, gpu_mat, in_dim, out_dim }
     }
 
     /// Load from f32 slice (used by safetensors loader).
     fn from_data(weight: Vec<f32>, in_dim: usize, out_dim: usize) -> Self {
         assert_eq!(weight.len(), in_dim * out_dim);
-        Self { weight, in_dim, out_dim }
+        let gpu_mat = atlas_tensor::GpuMatrix::upload(&weight, out_dim, in_dim);
+        Self { weight, gpu_mat, in_dim, out_dim }
     }
 
-    /// y[out_i] = sum_j weight[out_i*in + j] * x[j]
+    /// y = W x  (weight: [out × in], x: [in], y: [out])
     fn forward(&self, x: &[f32], y: &mut [f32]) {
         assert_eq!(x.len(), self.in_dim);
         assert_eq!(y.len(), self.out_dim);
+        // Try GPU SGEMM: W[out×in] × x[in×1] → y[out×1]
+        if self.gpu_mat.sgemm(x, self.in_dim, 1, y) {
+            return;
+        }
+        // CPU fallback
         for o in 0..self.out_dim {
             let row = &self.weight[o * self.in_dim .. (o+1) * self.in_dim];
             y[o] = row.iter().zip(x.iter()).map(|(&w, &xi)| w * xi).sum();
@@ -287,10 +295,13 @@ impl Linear {
     }
 
     /// Batch forward: X[seq_len × in_dim] → Y[seq_len × out_dim].
+    /// Each token is dispatched via GPU SGEMM if available.
     fn forward_batch(&self, x: &[f32], seq_len: usize, y: &mut [f32]) {
         for s in 0..seq_len {
-            self.forward(&x[s*self.in_dim..(s+1)*self.in_dim],
-                         &mut y[s*self.out_dim..(s+1)*self.out_dim]);
+            self.forward(
+                &x[s * self.in_dim .. (s+1) * self.in_dim],
+                &mut y[s * self.out_dim .. (s+1) * self.out_dim],
+            );
         }
     }
 }

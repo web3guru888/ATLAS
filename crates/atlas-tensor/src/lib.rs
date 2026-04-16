@@ -109,6 +109,80 @@ mod gpu {
     }
 }
 
+
+// ── GpuMatrix — weight matrix pinned in VRAM ──────────────────────────────
+
+/// A matrix pre-uploaded to GPU VRAM (upload once, multiply many times).
+///
+/// On CUDA builds: the data lives in VRAM and is reused across `sgemm()` calls.
+/// Input vectors are uploaded per call; only the tiny x-vector moves on the bus.
+///
+/// On CPU-only builds (no `atlas_cuda` cfg): this is a zero-overhead no-op;
+/// `sgemm()` always returns `false` and the caller uses its own CPU path.
+pub struct GpuMatrix {
+    #[cfg(atlas_cuda)]
+    buf: Option<gpu::GpuBuf>,
+    pub rows: usize,   // output dimension
+    pub cols: usize,   // input dimension
+}
+
+impl GpuMatrix {
+    /// Upload a row-major f32 matrix [rows × cols] to GPU VRAM.
+    /// Falls back gracefully if CUDA is not available.
+    pub fn upload(data: &[f32], rows: usize, cols: usize) -> Self {
+        debug_assert_eq!(data.len(), rows * cols);
+        Self {
+            #[cfg(atlas_cuda)]
+            buf: if cuda_available() { gpu::GpuBuf::upload(data) } else { None },
+            rows,
+            cols,
+        }
+    }
+
+    /// Whether the matrix is resident in GPU VRAM.
+    pub fn is_on_gpu(&self) -> bool {
+        #[cfg(atlas_cuda)]
+        { self.buf.is_some() }
+        #[cfg(not(atlas_cuda))]
+        { false }
+    }
+
+    /// GPU SGEMM: `out[m × n] = self[m × k] × rhs[k × n]` (row-major).
+    ///
+    /// Weight matrix is already in VRAM. Only `rhs` (the input activations)
+    /// is uploaded per call — typically a tiny x-vector (k floats).
+    ///
+    /// Returns `true` if GPU was used; caller should fall back to CPU if `false`.
+    pub fn sgemm(&self, rhs: &[f32], k: usize, n: usize, out: &mut [f32]) -> bool {
+        let m = self.rows;
+        debug_assert_eq!(self.cols, k);
+        debug_assert_eq!(rhs.len(), k * n);
+        debug_assert_eq!(out.len(), m * n);
+        #[cfg(atlas_cuda)]
+        if let Some(ref a_buf) = self.buf {
+            if let Some(b_buf) = gpu::GpuBuf::upload(rhs) {
+                if let Some(c_buf) = gpu::GpuBuf::alloc(m * n) {
+                    unsafe {
+                        ffi::atlas_matmul_f32(
+                            a_buf.ptr, b_buf.ptr, c_buf.ptr,
+                            m as i32, n as i32, k as i32,
+                        );
+                    }
+                    out.copy_from_slice(&c_buf.download());
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+impl std::fmt::Debug for GpuMatrix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GpuMatrix({}×{}, gpu={})", self.rows, self.cols, self.is_on_gpu())
+    }
+}
+
 // ── Tensor ─────────────────────────────────────────────────────────────────
 
 /// A multi-dimensional f32 tensor.
