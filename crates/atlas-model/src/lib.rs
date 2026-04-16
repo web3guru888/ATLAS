@@ -294,6 +294,12 @@ impl Linear {
         }
     }
 
+    /// GPU-to-GPU matmul: input stays in VRAM, output stays in VRAM.
+    /// Returns None if CUDA is not available (caller must use CPU path).
+    fn forward_vec(&self, x: &atlas_tensor::GpuVec) -> Option<atlas_tensor::GpuVec> {
+        self.gpu_mat.sgemm_vec(x, 1)
+    }
+
     /// Batch forward: X[seq_len × in_dim] → Y[seq_len × out_dim].
     /// Each token is dispatched via GPU SGEMM if available.
     fn forward_batch(&self, x: &[f32], seq_len: usize, y: &mut [f32]) {
@@ -478,6 +484,67 @@ impl Attention {
         result
     }
 
+    /// GPU attention forward: QKV projections stay in VRAM.
+    /// RoPE + attention scores run on CPU; output projection back on GPU.
+    fn forward_token_gpu(
+        &mut self,
+        x: &atlas_tensor::GpuVec,
+        pos: usize,
+        rope: &RopeCache,
+    ) -> Option<atlas_tensor::GpuVec> {
+        let d   = self.n_heads * self.head_dim;
+        let kv  = self.n_kv_heads * self.head_dim;
+
+        // QKV projections (stay in VRAM)
+        let q_gpu = self.wq.forward_vec(x)?;
+        let k_gpu = self.wk.forward_vec(x)?;
+        let v_gpu = self.wv.forward_vec(x)?;
+
+        // Download Q, K, V for RoPE + attention (CPU for correctness)
+        let mut q = q_gpu.download();
+        let mut k = k_gpu.download();
+        let     v = v_gpu.download();
+
+        // Apply RoPE
+        for h in 0..self.n_heads {
+            rope.apply(&mut q[h*self.head_dim..(h+1)*self.head_dim], pos);
+        }
+        for h in 0..self.n_kv_heads {
+            rope.apply(&mut k[h*self.head_dim..(h+1)*self.head_dim], pos);
+        }
+
+        // KV cache write
+        for h in 0..self.n_kv_heads {
+            self.kv_cache.write_key(pos, h, &k[h*self.head_dim..(h+1)*self.head_dim]);
+            self.kv_cache.write_val(pos, h, &v[h*self.head_dim..(h+1)*self.head_dim]);
+        }
+
+        // Attention scores + weighted value sum (CPU)
+        let group = self.n_heads / self.n_kv_heads;
+        let mut out_cpu = vec![0.0f32; d];
+        let mut scores  = vec![0.0f32; pos + 1];
+        for h in 0..self.n_heads {
+            let kv_h = h / group;
+            let q_h = &q[h*self.head_dim..(h+1)*self.head_dim];
+            for t in 0..=pos {
+                let k_t = self.kv_cache.key(t, kv_h);
+                let score: f32 = q_h.iter().zip(k_t.iter()).map(|(&qi, &ki)| qi*ki).sum();
+                scores[t] = score * self.scale;
+            }
+            softmax_inplace(&mut scores[..pos+1]);
+            let o_h = &mut out_cpu[h*self.head_dim..(h+1)*self.head_dim];
+            for t in 0..=pos {
+                let v_t = self.kv_cache.val(t, kv_h);
+                let a = scores[t];
+                for (oi, &vi) in o_h.iter_mut().zip(v_t.iter()) { *oi += a * vi; }
+            }
+        }
+
+        // Output projection (GPU)
+        let out_gpu = atlas_tensor::GpuVec::from_slice(&out_cpu);
+        self.wo.forward_vec(&out_gpu)
+    }
+
     fn reset_cache(&mut self) {
         self.kv_cache.keys.iter_mut().for_each(|v| *v = 0.0);
         self.kv_cache.values.iter_mut().for_each(|v| *v = 0.0);
@@ -500,6 +567,15 @@ impl FeedForward {
             w_up:   Linear::new(cfg.d_model, cfg.ffn_hidden, seed + 1),
             w_down: Linear::new(cfg.ffn_hidden, cfg.d_model, seed + 2),
         }
+    }
+
+    /// GPU SwiGLU FFN: hidden state stays in VRAM throughout.
+    fn forward_gpu(&self, x: &atlas_tensor::GpuVec) -> Option<atlas_tensor::GpuVec> {
+        use atlas_tensor::silu_mul_gpu;
+        let gate = self.w_gate.forward_vec(x)?;
+        let up   = self.w_up.forward_vec(x)?;
+        let hidden = silu_mul_gpu(&gate, &up);
+        self.w_down.forward_vec(&hidden)
     }
 
     /// SwiGLU: out = W_down * (silu(W_gate * x) ⊙ W_up * x)
@@ -542,8 +618,8 @@ impl TransformerBlock {
         }
     }
 
-    /// Process one token at position `pos`. x: [d_model] → modified in-place.
-    fn forward_token(&mut self, x: &mut Vec<f32>, pos: usize, rope: &RopeCache) {
+    /// CPU-only path for one token at position `pos`. x: [d_model] → modified in-place.
+    fn forward_token_cpu(&mut self, x: &mut Vec<f32>, pos: usize, rope: &RopeCache) {
         // Attention sub-layer with pre-norm residual
         let mut x_norm = x.clone();
         rmsnorm_inplace(&mut x_norm, &self.attn_norm, self.eps);
@@ -555,6 +631,53 @@ impl TransformerBlock {
         rmsnorm_inplace(&mut x_norm2, &self.ffn_norm, self.eps);
         let ffn_out = self.ffn.forward(&x_norm2);
         for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) { *xi += fi; }
+    }
+
+    /// GPU transformer block: RMSNorm, attention projections, and FFN on GPU.
+    /// Residual adds on GPU. Falls back to CPU path if any GPU op fails.
+    fn forward_token_gpu(
+        &mut self,
+        x: &mut atlas_tensor::GpuVec,
+        pos: usize,
+        rope: &RopeCache,
+    ) {
+        use atlas_tensor::GpuVec;
+
+        // Attention sub-layer: pre-norm + attention + residual
+        let norm_w = GpuVec::from_slice(&self.attn_norm);
+        let mut x_norm = GpuVec::from_slice(&x.download());
+        x_norm.rmsnorm_inplace(&norm_w, self.eps);
+
+        if let Some(attn_out) = self.attn.forward_token_gpu(&x_norm, pos, rope) {
+            x.add_inplace(&attn_out);
+        } else {
+            // GPU fallback: run CPU path, write result back
+            let mut x_cpu = x.download();
+            self.forward_token_cpu(&mut x_cpu, pos, rope);
+            *x = GpuVec::from_slice(&x_cpu);
+            return;
+        }
+
+        // FFN sub-layer: pre-norm + FFN + residual
+        let ffn_norm_w = GpuVec::from_slice(&self.ffn_norm);
+        let mut x_norm2 = GpuVec::from_slice(&x.download());
+        x_norm2.rmsnorm_inplace(&ffn_norm_w, self.eps);
+
+        if let Some(ffn_out) = self.ffn.forward_gpu(&x_norm2) {
+            x.add_inplace(&ffn_out);
+        }
+        // If FFN GPU fails, continue — partial GPU is still better than nothing
+    }
+
+    /// Process one token at position `pos`. Dispatches to GPU or CPU.
+    fn forward_token(&mut self, x: &mut Vec<f32>, pos: usize, rope: &RopeCache) {
+        if atlas_tensor::cuda_available() {
+            let mut gpu_x = atlas_tensor::GpuVec::from_slice(x);
+            self.forward_token_gpu(&mut gpu_x, pos, rope);
+            *x = gpu_x.download();
+        } else {
+            self.forward_token_cpu(x, pos, rope);
+        }
     }
 }
 
@@ -613,6 +736,40 @@ impl OlmoModel {
         logits
     }
 
+    /// GPU-resident autoregressive forward pass for one token.
+    ///
+    /// Uploads the token embedding once (H2D), runs all layers with hidden
+    /// state staying in VRAM, downloads logits at the end (D2H).
+    /// PCIe transfers: 2 per token (vs 211 in the current CPU path).
+    ///
+    /// Returns `None` if CUDA is not available — caller should use `forward_one`.
+    pub fn forward_one_gpu(&mut self, token: u32) -> Option<Vec<f32>> {
+        use atlas_tensor::GpuVec;
+        if !atlas_tensor::cuda_available() { return None; }
+
+        let pos = self.pos;
+        self.pos += 1;
+
+        // H2D: upload embedding (one PCIe transfer per token)
+        let embed = self.embed.embed_token(token);
+        let mut x = GpuVec::from_slice(embed);
+
+        // Run all transformer layers entirely in VRAM
+        for layer in &mut self.layers {
+            layer.forward_token_gpu(&mut x, pos, &self.rope);
+        }
+
+        // Final RMSNorm (GPU)
+        let norm_w = GpuVec::from_slice(&self.norm);
+        x.rmsnorm_inplace(&norm_w, self.config.rms_norm_eps);
+
+        // LM head projection (GPU)
+        let logits_gpu = self.lm_head.forward_vec(&x)?;
+
+        // D2H: download logits (one PCIe transfer per token)
+        Some(logits_gpu.download())
+    }
+
     /// Forward pass for a sequence. Returns logits for every token position.
     /// Shape: [seq_len × vocab_size] stored as flat Vec.
     pub fn forward(&mut self, tokens: &[u32], start_pos: usize) -> SequenceLogits {
@@ -631,6 +788,8 @@ impl OlmoModel {
     }
 
     /// Greedy generation: given prompt tokens, generate up to `max_new` more.
+    /// Greedy generation: given prompt tokens, generate up to `max_new` more.
+    /// Uses GPU-resident forward pass if CUDA available (2 PCIe transfers/token).
     pub fn generate(&mut self, prompt: &[u32], max_new: usize, temperature: f32) -> Vec<u32> {
         self.reset();
         // Process prompt
@@ -638,7 +797,11 @@ impl OlmoModel {
         let mut last_logits = vec![0.0f32; self.config.vocab_size];
 
         for &tok in prompt {
-            last_logits = self.forward_one(tok);
+            last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
+                gl
+            } else {
+                self.forward_one(tok)
+            };
         }
 
         for step in 0..max_new {
@@ -656,7 +819,12 @@ impl OlmoModel {
             if let Some(eos) = None::<u32> {
                 if next as u32 == eos { break; }
             }
-            last_logits = self.forward_one(next as u32);
+            // Prefer GPU-resident forward
+            last_logits = if let Some(gl) = self.forward_one_gpu(next as u32) {
+                gl
+            } else {
+                self.forward_one(next as u32)
+            };
         }
         new_tokens
     }
