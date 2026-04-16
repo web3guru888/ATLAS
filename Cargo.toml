@@ -50,10 +50,10 @@ resolver = "2"
 [workspace.package]
 version     = "0.1.0"
 edition     = "2021"
-authors     = ["web3guru888 <robin@vbrl.ai>"]
+authors     = ["Robin Dey <robin@openhubresearch.org>"]
 license     = "Apache-2.0"
 repository  = "https://github.com/web3guru888/ATLAS"
-homepage    = "https://github.com/web3guru888/ATLAS"
+homepage    = "https://atlasagi.org"
 description = "ATLAS: Active-inference Training with Learned Adaptive Stigmergy"
 keywords    = ["llm", "training", "stigmergy", "causal-inference", "astra"]
 categories  = ["science", "machine-learning"]
