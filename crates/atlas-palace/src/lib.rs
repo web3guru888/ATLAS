@@ -45,6 +45,69 @@ mod util;
 pub use types::*;
 pub use util::{cosine_sim, tfidf_embedding};
 
+// ── PalaceBackend trait ────────────────────────────────────────────────────
+
+/// Trait for pluggable palace storage backends.
+///
+/// The current in-memory implementation (`Palace`) implements this.
+/// Future backends (Grafeo, LadybugDB) implement the same interface,
+/// enabling drop-in storage migration without changing calling code.
+pub trait PalaceBackend: Send + Sync {
+    /// Add a top-level wing. Returns the wing id.
+    fn add_wing(&mut self, name: &str, desc: &str) -> String;
+    /// Add a room within a wing. Returns the room id.
+    fn add_room(&mut self, wing_id: &str, name: &str, desc: &str) -> Result<String>;
+    /// Add a drawer (knowledge item) within a room. Returns the drawer id.
+    fn add_drawer(&mut self, room_id: &str, title: &str, content: &str, tags: &[&str]) -> Result<String>;
+    /// Full-text search across all drawers.
+    fn search(&self, query: &str, top_k: usize) -> Vec<types::SearchResult>;
+    /// Deposit pheromones on a drawer path.
+    fn deposit_pheromones(&mut self, drawer_id: &str, value: f32, decay: f32, tag: &str);
+    /// Tick all pheromone decay.
+    fn decay_pheromones(&mut self);
+    /// Return the top-k hottest pheromone paths for a given tag.
+    fn hot_paths(&self, tag: &str, top_k: usize) -> Vec<(String, f32)>;
+    /// List all wings as (id, name) pairs.
+    fn list_wings(&self) -> Vec<(String, String)>;
+    /// List all rooms in a wing as (id, name) pairs.
+    fn list_rooms(&self, wing_id: &str) -> Vec<(String, String)>;
+    /// Human-readable status summary.
+    fn status(&self) -> String;
+}
+
+impl PalaceBackend for Palace {
+    fn add_wing(&mut self, name: &str, desc: &str) -> String {
+        Palace::add_wing(self, name, desc)
+    }
+    fn add_room(&mut self, wing_id: &str, name: &str, desc: &str) -> Result<String> {
+        Palace::add_room(self, wing_id, name, desc)
+    }
+    fn add_drawer(&mut self, room_id: &str, title: &str, content: &str, tags: &[&str]) -> Result<String> {
+        Palace::add_drawer(self, room_id, title, content, tags)
+    }
+    fn search(&self, query: &str, top_k: usize) -> Vec<types::SearchResult> {
+        Palace::search(self, query, top_k)
+    }
+    fn deposit_pheromones(&mut self, drawer_id: &str, value: f32, decay: f32, tag: &str) {
+        Palace::deposit_pheromones(self, drawer_id, value, decay, tag)
+    }
+    fn decay_pheromones(&mut self) {
+        Palace::decay_pheromones(self)
+    }
+    fn hot_paths(&self, tag: &str, top_k: usize) -> Vec<(String, f32)> {
+        Palace::hot_paths(self, tag, top_k)
+    }
+    fn list_wings(&self) -> Vec<(String, String)> {
+        Palace::list_wings(self)
+    }
+    fn list_rooms(&self, wing_id: &str) -> Vec<(String, String)> {
+        Palace::list_rooms(self, wing_id)
+    }
+    fn status(&self) -> String {
+        Palace::status(self)
+    }
+}
+
 // ── Palace engine ─────────────────────────────────────────────────────────
 
 /// The ATLAS memory palace engine.
@@ -288,5 +351,12 @@ pub(crate) mod tests {
         assert_eq!(d["wings"], 2);
         assert_eq!(d["rooms"], 2);
         assert_eq!(d["drawers"], 3);
+    }
+
+    #[test]
+    fn palace_implements_backend_trait() {
+        // Verify Palace can be used as a PalaceBackend (trait object)
+        let palace = Palace::new("backend-test", "/tmp/atlas-backend-test");
+        let _: &dyn PalaceBackend = &palace;  // must compile
     }
 }
