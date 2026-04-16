@@ -183,6 +183,55 @@ impl AdamW {
         Ok(())
     }
 
+    /// GPU-accelerated AdamW step. Calls the `atlas_adamw_step` CUDA kernel.
+    ///
+    /// Returns true if GPU kernel was used, false if CUDA is not available
+    /// (in which case the standard CPU `step()` should be called instead).
+    ///
+    /// `grads`: one `Vec<f32>` per parameter group, same layout as `step()`.
+    pub fn step_gpu(&mut self, grads: &[Vec<f32>]) -> Result<bool> {
+        if !atlas_tensor::cuda_available() {
+            return Ok(false);
+        }
+        if grads.len() != self.params.len() {
+            return Err(AtlasError::Other(format!(
+                "optim.step_gpu: got {} grad groups, have {} params",
+                grads.len(), self.params.len()
+            )));
+        }
+
+        self.step += 1;
+        let t = self.step as f32;
+        let bc1 = 1.0 / (1.0 - self.cfg.beta1.powf(t));
+        let bc2 = 1.0 / (1.0 - self.cfg.beta2.powf(t));
+
+        for (ps, grad) in self.params.iter_mut().zip(grads.iter()) {
+            let n = ps.param.len();
+            if n == 0 { continue; }
+            // Ensure moment buffers are initialized
+            if ps.m.len() != n { ps.m = vec![0.0f32; n]; }
+            if ps.v.len() != n { ps.v = vec![0.0f32; n]; }
+
+            let did_gpu = atlas_tensor::adamw_step_gpu(
+                ps.param.as_mut_ptr(),
+                ps.m.as_mut_ptr(),
+                ps.v.as_mut_ptr(),
+                grad.as_ptr(),
+                self.cfg.lr,
+                self.cfg.beta1,
+                self.cfg.beta2,
+                self.cfg.eps,
+                self.cfg.weight_decay,
+                bc1, bc2,
+                n,
+            );
+            if !did_gpu {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Read the current parameter values as a Tensor.
     pub fn param_tensor(&self, idx: usize) -> Result<Tensor> {
         let ps = self.params.get(idx)
@@ -359,5 +408,36 @@ mod tests {
         // Params should have changed
         assert!(opt.params[0].param[0] != 0.5);
         assert!(opt.params[1].param[0] != 0.1);
+    }
+
+    #[test]
+    fn adamw_step_gpu_matches_cpu() {
+        // Both CPU and GPU paths should produce same result (within tolerance)
+        let cfg = AdamWConfig { lr: 0.01, ..Default::default() };
+        let params = vec![vec![1.0f32, 2.0, 3.0, 4.0]];
+        let grads  = vec![vec![0.1f32, 0.1, 0.1, 0.1]];
+
+        // CPU path
+        let mut opt_cpu = AdamW::new(cfg.clone());
+        opt_cpu.add_param(ParamState::new("w", params[0].clone(), vec![4], true));
+        opt_cpu.step(&grads).unwrap();
+        let cpu_result = opt_cpu.params[0].param.clone();
+
+        // GPU path (or CPU fallback if no CUDA — should match CPU)
+        let mut opt_gpu = AdamW::new(cfg.clone());
+        opt_gpu.add_param(ParamState::new("w", params[0].clone(), vec![4], true));
+        let used_gpu = opt_gpu.step_gpu(&grads).unwrap();
+        let gpu_result = opt_gpu.params[0].param.clone();
+
+        if used_gpu {
+            // GPU and CPU should produce same result within float tolerance
+            for (a, b) in cpu_result.iter().zip(gpu_result.iter()) {
+                assert!((a - b).abs() < 1e-4, "GPU/CPU mismatch: {} vs {}", a, b);
+            }
+        } else {
+            // No CUDA — GPU path fell back to returning false, result unchanged
+            // Just verify the function ran without panic
+            assert_eq!(gpu_result, params[0]);
+        }
     }
 }
