@@ -162,6 +162,7 @@ impl Palace {
             embedding,
             pheromones: Vec::new(),
             created_at: util::epoch_secs(),
+            session_id: 0,
             tags: tags.iter().map(|t| t.to_string()).collect(),
         });
         self.rooms.get_mut(room_id).unwrap().drawer_ids.push(id.clone());

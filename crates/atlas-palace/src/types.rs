@@ -48,6 +48,14 @@ impl PheromoneType {
         }
     }
 
+    /// CAS-optimal decay rate (arXiv:2604.00067 algebraic mapping).
+    ///
+    /// CAS theory shows optimal decay is ~3.3× lower than the GP spec defaults,
+    /// enabling longer pheromone persistence for cross-session warm-start.
+    pub fn calibrated_decay_rate(&self) -> f32 {
+        self.default_decay_rate() / 3.3
+    }
+
     /// Whether this is a node pheromone (lives on drawers).
     pub fn is_node(&self) -> bool {
         matches!(self, Self::Exploitation | Self::Exploration)
@@ -166,6 +174,9 @@ pub struct Drawer {
     pub pheromones: Vec<Pheromone>,
     /// Creation timestamp (seconds since epoch, 0 if unknown).
     pub created_at: u64,
+    /// Session ID — monotonically increasing counter across palace sessions.
+    /// Used for recency-weighted pheromone decay: deposit_weight *= exp(-λ * age_sessions).
+    pub session_id: u64,
     /// Tags for filtering.
     pub tags: Vec<String>,
 }
@@ -388,4 +399,94 @@ pub fn build_status_dict(
     m.insert("agents".to_string(),   agents);
     m.insert("tick".to_string(),     tick as usize);
     m
+}
+
+// ── Palace configuration ──────────────────────────────────────────────────
+
+/// Configuration for the Palace, including pheromone decay parameters.
+#[derive(Debug, Clone)]
+pub struct PalaceConfig {
+    /// Lambda for session-recency weighting of pheromone deposits.
+    /// deposit_effective = deposit * exp(-lambda * age_sessions)
+    /// Default: 0.1 (deposits from 23 sessions ago have ~10% weight).
+    pub session_decay_lambda: f32,
+    /// Whether to use CAS-calibrated decay rates (÷3.3×) instead of GP spec defaults.
+    pub use_cas_calibrated_decay: bool,
+}
+
+impl Default for PalaceConfig {
+    fn default() -> Self {
+        Self {
+            session_decay_lambda: 0.1,
+            use_cas_calibrated_decay: false, // opt-in; v3.0.0 enables experimentally
+        }
+    }
+}
+
+impl PalaceConfig {
+    /// Compute recency weight for a drawer given current session and its session_id.
+    pub fn recency_weight(&self, current_session: u64, drawer_session: u64) -> f32 {
+        let age = current_session.saturating_sub(drawer_session) as f32;
+        (-self.session_decay_lambda * age).exp()
+    }
+}
+
+#[cfg(test)]
+mod types_tests {
+    use super::*;
+
+    #[test]
+    fn drawer_has_session_id() {
+        let d = Drawer {
+            id: "d1".to_string(),
+            room_id: "r1".to_string(),
+            title: "Test".to_string(),
+            content: "content".to_string(),
+            embedding: vec![],
+            pheromones: vec![],
+            created_at: 0,
+            session_id: 42,
+            tags: vec![],
+        };
+        assert_eq!(d.session_id, 42);
+    }
+
+    #[test]
+    fn cas_calibration_factor() {
+        for pt in PheromoneType::ALL {
+            let ratio = pt.default_decay_rate() / pt.calibrated_decay_rate();
+            assert!(
+                (ratio - 3.3).abs() < 0.01,
+                "{:?}: ratio {} ≠ 3.3",
+                pt,
+                ratio
+            );
+        }
+    }
+
+    #[test]
+    fn recency_weight_decays() {
+        let cfg = PalaceConfig::default();
+        // same session → weight = 1.0
+        assert!((cfg.recency_weight(10, 10) - 1.0).abs() < 1e-5);
+        // 10 sessions ago, lambda=0.1 → exp(-1.0) ≈ 0.368
+        let w = cfg.recency_weight(10, 0);
+        assert!((w - 0.368_f32).abs() < 0.01, "got {}", w);
+    }
+
+    #[test]
+    fn recency_weight_no_underflow() {
+        let cfg = PalaceConfig::default();
+        // very old session → weight approaches 0 but never negative
+        let w = cfg.recency_weight(1000, 0);
+        assert!(w >= 0.0);
+        assert!(w < 0.01);
+    }
+
+    #[test]
+    fn palace_config_default() {
+        let cfg = PalaceConfig::default();
+        assert!((cfg.session_decay_lambda - 0.1).abs() < 1e-6);
+        assert!(!cfg.use_cas_calibrated_decay);
+    }
 }

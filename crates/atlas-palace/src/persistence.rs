@@ -149,7 +149,8 @@ impl Palace {
                 }
                 palace.drawers.insert(id.clone(), Drawer {
                     id, room_id, title, content, embedding,
-                    pheromones: Vec::new(), created_at: created, tags,
+                    pheromones: Vec::new(), created_at: created,
+                    session_id: 0, tags,
                 });
             }
         }
