@@ -20,6 +20,7 @@ members = [
     "crates/atlas-mcp",
     "crates/atlas-safety",
     "crates/atlas-bridge",
+    "crates/atlas-api",
 ]
 resolver = "2"
 

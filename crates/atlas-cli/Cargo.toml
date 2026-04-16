@@ -20,3 +20,4 @@ atlas-corpus   = { path = "../atlas-corpus" }
 atlas-palace   = { path = "../atlas-palace" }
 atlas-zk       = { path = "../atlas-zk" }
 atlas-mcp      = { path = "../atlas-mcp" }
+atlas-api      = { path = "../atlas-api" }

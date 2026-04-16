@@ -3,6 +3,16 @@
 version = 4
 
 [[package]]
+name = "atlas-api"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-json",
+ "atlas-model",
+ "atlas-tokenize",
+]
+
+[[package]]
 name = "atlas-astra"
 version = "0.1.0"
 dependencies = [
@@ -42,6 +52,7 @@ dependencies = [
 name = "atlas-cli"
 version = "0.1.0"
 dependencies = [
+ "atlas-api",
  "atlas-astra",
  "atlas-core",
  "atlas-corpus",

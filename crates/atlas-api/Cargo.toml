@@ -1,0 +1,14 @@
+[package]
+name        = "atlas-api"
+description = "ATLAS api: OpenAI-compatible HTTP/1.1 inference endpoint — zero external deps"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+atlas-core     = { path = "../atlas-core" }
+atlas-json     = { path = "../atlas-json" }
+atlas-model    = { path = "../atlas-model" }
+atlas-tokenize = { path = "../atlas-tokenize" }

@@ -14,6 +14,7 @@
 //! - `atlas bench`     — End-to-end benchmark suite (palace/training/gates throughput)
 //! - `atlas mcp`       — Model Context Protocol server (JSON-RPC 2.0 over stdin/stdout)
 //! - `atlas infer`     — Real LLM inference (SmolLM2-1.7B / OLMo / Llama)
+//! - `atlas api`       — OpenAI-compatible HTTP inference API
 //!
 //! # Zero-dependency arg parsing: no clap, no structopt.
 
@@ -43,6 +44,7 @@ fn main() {
         "bench"     => cmd_bench(&args[2..]),
         "mcp"       => cmd_mcp(&args[2..]),
         "infer"     => cmd_infer(&args[2..]),
+        "api"       => cmd_api(&args[2..]),
         "--version" | "-V" => { println!("atlas {}", env!("CARGO_PKG_VERSION")); 0 }
         "--help" | "-h" => { print_usage(); 0 }
         cmd => {
@@ -118,6 +120,14 @@ COMMANDS:
                   --prompt <TEXT>    Input prompt (default: "The capital of France is")
                   --max-tokens <N>   Max new tokens to generate (default: 50)
                   --temperature <F>  Sampling temperature: 0.0 = greedy (default: 0.0)
+
+    api         OpenAI-compatible HTTP inference API
+                  serve              Start API server (default)
+                  --weights <DIR>    Model weights directory (optional; echo mode if absent)
+                  --model <NAME>     Model config name (default: smollm2-135m)
+                  --port <PORT>      TCP port (default: 8080)
+                  --host <HOST>      Bind host (default: 0.0.0.0)
+                  --max-tokens <N>   Max tokens per request (default: 2048)
 
 OPTIONS:
 
@@ -671,6 +681,7 @@ const CRATE_TABLE: &[(&str, &str, &str)] = &[
     ("5", "atlas-astra",    "OODA: NASA/WHO/WorldBank/ArXiv"),
     ("6", "atlas-corpus",   "LiveDiscoveryCorpus, 5 gates, curriculum"),
     ("7", "atlas-cli",      "this binary"),
+    ("7", "atlas-api",      "OpenAI-compatible HTTP inference endpoint"),
 ];
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -943,6 +954,48 @@ fn cmd_mcp(args: &[String]) -> i32 {
         }
         _ => {
             eprintln!("atlas mcp: unknown subcommand '{subcmd}'. Available: serve");
+            1
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+//  api — OpenAI-compatible HTTP inference server
+// ────────────────────────────────────────────────────────────────────────────
+
+fn cmd_api(args: &[String]) -> i32 {
+    use atlas_api::{ApiServer, types::ServerConfig};
+
+    let subcmd = args.first().map(|s| s.as_str()).unwrap_or("serve");
+    match subcmd {
+        "serve" => {
+            let weights_dir = opt(args, "--weights").map(|s| s.to_string());
+            let model_id    = opt(args, "--model").unwrap_or("smollm2-135m").to_string();
+            let port: u16   = opt(args, "--port")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080);
+            let host        = opt(args, "--host").unwrap_or("0.0.0.0").to_string();
+            let max_tokens  = opt_usize(args, "--max-tokens", 2048);
+
+            let cfg = ServerConfig {
+                host,
+                port,
+                model_id,
+                weights_dir,
+                max_tokens,
+                workers: 4,
+            };
+            let server = ApiServer::new(cfg);
+            match server.serve() {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("atlas api serve error: {e}");
+                    1
+                }
+            }
+        }
+        _ => {
+            eprintln!("atlas api: unknown subcommand '{subcmd}'. Available: serve");
             1
         }
     }
