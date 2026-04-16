@@ -157,6 +157,23 @@ impl ModelConfig {
         }
     }
 
+    /// OLMo-2-1124-7B (AllenAI) — Olmo2ForCausalLM, Apache 2.0
+    /// hidden=4096, layers=32, heads=32/32, ffn=11008, vocab=100352
+    /// Post-norm + QK-norm architecture. HF: allenai/OLMo-2-1124-7B (FP32, 29GB)
+    pub fn olmo2_7b() -> Self {
+        Self {
+            vocab_size:   100352,
+            d_model:      4096,
+            n_layers:     32,
+            n_heads:      32,
+            n_kv_heads:   32,
+            ffn_hidden:   11008,
+            max_seq_len:  4096,
+            rope_theta:   500_000.0,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
     /// Head dimension (d_model / n_heads).
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_heads
@@ -436,6 +453,9 @@ struct Attention {
     head_dim:   usize,
     scale:      f32,      // 1/sqrt(head_dim)
     kv_cache:   KvCache,
+    /// OLMo-2 QK-norm weights (empty = disabled)
+    q_norm: Vec<f32>,
+    k_norm: Vec<f32>,
 }
 
 impl Attention {
@@ -453,6 +473,8 @@ impl Attention {
             head_dim,
             scale:      1.0 / (head_dim as f32).sqrt(),
             kv_cache:   KvCache::new(cfg.n_kv_heads, head_dim, cfg.max_seq_len),
+            q_norm:     Vec::new(),
+            k_norm:     Vec::new(),
         }
     }
 
@@ -538,6 +560,18 @@ impl Attention {
         let mut q = q_gpu.download();
         let mut k = k_gpu.download();
         let     v = v_gpu.download();
+
+        // OLMo-2 QK-norm: per-head RMSNorm on Q and K before RoPE
+        if !self.q_norm.is_empty() {
+            for h in 0..self.n_heads {
+                rmsnorm_inplace(&mut q[h*self.head_dim..(h+1)*self.head_dim], &self.q_norm, 1e-6);
+            }
+        }
+        if !self.k_norm.is_empty() {
+            for h in 0..self.n_kv_heads {
+                rmsnorm_inplace(&mut k[h*self.head_dim..(h+1)*self.head_dim], &self.k_norm, 1e-6);
+            }
+        }
 
         // Apply RoPE
         for h in 0..self.n_heads {
@@ -634,10 +668,12 @@ impl FeedForward {
 struct TransformerBlock {
     attn:     Attention,
     ffn:      FeedForward,
-    attn_norm: Vec<f32>,   // RMSNorm weight
-    ffn_norm:  Vec<f32>,   // RMSNorm weight
+    attn_norm: Vec<f32>,   // pre-attn norm (Llama) OR post-attn norm (OLMo-2)
+    ffn_norm:  Vec<f32>,   // pre-FFN norm (Llama) OR post-FFN norm (OLMo-2)
     eps:       f32,
     d_model:   usize,
+    /// OLMo-2: norm applied after residual add rather than before sub-layer
+    post_norm: bool,
 }
 
 impl TransformerBlock {
@@ -649,6 +685,7 @@ impl TransformerBlock {
             ffn_norm:  vec![1.0f32; cfg.d_model],
             eps:       cfg.rms_norm_eps,
             d_model:   cfg.d_model,
+            post_norm: false,
         }
     }
 
@@ -677,30 +714,43 @@ impl TransformerBlock {
     ) {
         use atlas_tensor::GpuVec;
 
-        // Attention sub-layer: pre-norm + attention + residual
-        let norm_w = GpuVec::from_slice(&self.attn_norm);
-        let mut x_norm = GpuVec::from_slice(&x.download());
-        x_norm.rmsnorm_inplace(&norm_w, self.eps);
-
-        if let Some(attn_out) = self.attn.forward_token_gpu(&x_norm, pos, rope) {
-            x.add_inplace(&attn_out);
+        if self.post_norm {
+            // ── OLMo-2 post-norm path ──────────────────────────────────────────
+            if let Some(attn_out) = self.attn.forward_token_gpu(x, pos, rope) {
+                x.add_inplace(&attn_out);
+            } else {
+                let mut x_cpu = x.download();
+                self.forward_token_cpu(&mut x_cpu, pos, rope);
+                *x = GpuVec::from_slice(&x_cpu);
+                return;
+            }
+            let norm_w = GpuVec::from_slice(&self.attn_norm);
+            x.rmsnorm_inplace(&norm_w, self.eps);
+            if let Some(ffn_out) = self.ffn.forward_gpu(x) {
+                x.add_inplace(&ffn_out);
+            }
+            let ffn_norm_w = GpuVec::from_slice(&self.ffn_norm);
+            x.rmsnorm_inplace(&ffn_norm_w, self.eps);
         } else {
-            // GPU fallback: run CPU path, write result back
-            let mut x_cpu = x.download();
-            self.forward_token_cpu(&mut x_cpu, pos, rope);
-            *x = GpuVec::from_slice(&x_cpu);
-            return;
+            // ── Llama pre-norm path (default) ─────────────────────────────────
+            let norm_w = GpuVec::from_slice(&self.attn_norm);
+            let mut x_norm = GpuVec::from_slice(&x.download());
+            x_norm.rmsnorm_inplace(&norm_w, self.eps);
+            if let Some(attn_out) = self.attn.forward_token_gpu(&x_norm, pos, rope) {
+                x.add_inplace(&attn_out);
+            } else {
+                let mut x_cpu = x.download();
+                self.forward_token_cpu(&mut x_cpu, pos, rope);
+                *x = GpuVec::from_slice(&x_cpu);
+                return;
+            }
+            let ffn_norm_w = GpuVec::from_slice(&self.ffn_norm);
+            let mut x_norm2 = GpuVec::from_slice(&x.download());
+            x_norm2.rmsnorm_inplace(&ffn_norm_w, self.eps);
+            if let Some(ffn_out) = self.ffn.forward_gpu(&x_norm2) {
+                x.add_inplace(&ffn_out);
+            }
         }
-
-        // FFN sub-layer: pre-norm + FFN + residual
-        let ffn_norm_w = GpuVec::from_slice(&self.ffn_norm);
-        let mut x_norm2 = GpuVec::from_slice(&x.download());
-        x_norm2.rmsnorm_inplace(&ffn_norm_w, self.eps);
-
-        if let Some(ffn_out) = self.ffn.forward_gpu(&x_norm2) {
-            x.add_inplace(&ffn_out);
-        }
-        // If FFN GPU fails, continue — partial GPU is still better than nothing
     }
 
     /// Process one token at position `pos` via the CPU path.
@@ -1152,9 +1202,108 @@ pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoM
                     "mlp.gate_proj.weight"     => layer.ffn.w_gate = Linear::from_data(data.clone(), cfg.d_model, cfg.ffn_hidden),
                     "mlp.up_proj.weight"       => layer.ffn.w_up   = Linear::from_data(data.clone(), cfg.d_model, cfg.ffn_hidden),
                     "mlp.down_proj.weight"     => layer.ffn.w_down  = Linear::from_data(data.clone(), cfg.ffn_hidden, cfg.d_model),
-                    "input_layernorm.weight"   => layer.attn_norm = data.clone(),
-                    "post_attention_layernorm.weight" => layer.ffn_norm = data.clone(),
+                               // Llama pre-norm names
+                    "input_layernorm.weight"            => layer.attn_norm = data.clone(),
+                    "post_attention_layernorm.weight"   => {
+                        if layer.post_norm { layer.attn_norm = data.clone(); }
+                        else               { layer.ffn_norm  = data.clone(); }
+                    }
+                    // OLMo-2 post-norm specific names
+                    "post_feedforward_layernorm.weight" => {
+                        layer.post_norm = true;
+                        layer.ffn_norm  = data.clone();
+                    }
+                    "self_attn.q_norm.weight"           => layer.attn.q_norm = data.clone(),
+                    "self_attn.k_norm.weight"           => layer.attn.k_norm = data.clone(),
                     _ => {} // ignore unknown weights
+                }
+                break;
+            }
+        }
+    }
+    Ok(model)
+}
+
+
+/// Load a sharded model from a directory.
+/// Reads model.safetensors.index.json and loads all referenced shards.
+/// Falls back to model.safetensors if no index file is found.
+pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
+    use std::path::Path;
+    use std::fs;
+    use std::collections::{HashMap, HashSet};
+
+    let index_path = Path::new(dir).join("model.safetensors.index.json");
+    if !index_path.exists() {
+        let single = Path::new(dir).join("model.safetensors");
+        return load_model_from_safetensors(
+            single.to_str().unwrap_or(dir), cfg);
+    }
+
+    // Parse weight_map from index JSON
+    let index_json = fs::read_to_string(&index_path)
+        .map_err(|e| AtlasError::Io(format!("index.json: {e}")))?;
+    // Simple extraction: find all "key": "shard" pairs without full serde
+    let mut shard_set: HashSet<String> = HashSet::new();
+    for cap in index_json.split('"') {
+        if cap.ends_with(".safetensors") {
+            shard_set.insert(cap.to_string());
+        }
+    }
+    let mut shard_files: Vec<String> = shard_set.into_iter().collect();
+    shard_files.sort();
+
+    eprintln!("[load_model_from_dir] loading {} shards from {dir}", shard_files.len());
+
+    // Load all tensors from all shards into a flat map
+    let mut all_tensors: HashMap<String, Vec<f32>> = HashMap::new();
+    for shard_name in &shard_files {
+        let shard_path = Path::new(dir).join(shard_name);
+        eprintln!("[load_model_from_dir]   shard: {shard_name}");
+        let st = SafetensorsFile::open(shard_path.to_str().unwrap_or(shard_name))?;
+        for desc in &st.tensors {
+            let data = st.get_f32(&desc.name)?;
+            all_tensors.insert(desc.name.clone(), data);
+        }
+    }
+    eprintln!("[load_model_from_dir] loaded {} tensors total", all_tensors.len());
+
+    // Build model from merged tensor map
+    let mut model = OlmoModel::new(cfg.clone());
+    for (name, data) in &all_tensors {
+        if name == "model.embed_tokens.weight" || name == "tok_embeddings.weight" {
+            let vocab = data.len() / cfg.d_model;
+            model.embed = Embedding::from_data(data.clone(), vocab, cfg.d_model);
+            model.lm_head = Linear::from_data(data.clone(), cfg.d_model, vocab);
+        } else if name == "model.norm.weight" || name == "norm.weight" {
+            model.norm = data.clone();
+        } else if name == "lm_head.weight" {
+            model.lm_head = Linear::from_data(data.clone(), cfg.d_model, cfg.vocab_size);
+        } else {
+            for layer_i in 0..cfg.n_layers {
+                let pfx  = format!("model.layers.{layer_i}.");
+                let pfx2 = format!("layers.{layer_i}.");
+                let local = if name.starts_with(&pfx) { &name[pfx.len()..] }
+                            else if name.starts_with(&pfx2) { &name[pfx2.len()..] }
+                            else { continue };
+                let layer = &mut model.layers[layer_i];
+                match local {
+                    "self_attn.q_proj.weight"  => layer.attn.wq = Linear::from_data(data.clone(), cfg.d_model, cfg.d_model),
+                    "self_attn.k_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wk = Linear::from_data(data.clone(), cfg.d_model, kd); }
+                    "self_attn.v_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wv = Linear::from_data(data.clone(), cfg.d_model, kd); }
+                    "self_attn.o_proj.weight"  => layer.attn.wo = Linear::from_data(data.clone(), cfg.d_model, cfg.d_model),
+                    "mlp.gate_proj.weight"     => layer.ffn.w_gate = Linear::from_data(data.clone(), cfg.d_model, cfg.ffn_hidden),
+                    "mlp.up_proj.weight"       => layer.ffn.w_up   = Linear::from_data(data.clone(), cfg.d_model, cfg.ffn_hidden),
+                    "mlp.down_proj.weight"     => layer.ffn.w_down  = Linear::from_data(data.clone(), cfg.ffn_hidden, cfg.d_model),
+                    "input_layernorm.weight"            => layer.attn_norm = data.clone(),
+                    "post_attention_layernorm.weight"   => {
+                        if layer.post_norm { layer.attn_norm = data.clone(); }
+                        else               { layer.ffn_norm  = data.clone(); }
+                    }
+                    "post_feedforward_layernorm.weight" => { layer.post_norm = true; layer.ffn_norm = data.clone(); }
+                    "self_attn.q_norm.weight"           => layer.attn.q_norm = data.clone(),
+                    "self_attn.k_norm.weight"           => layer.attn.k_norm = data.clone(),
+                    _ => {}
                 }
                 break;
             }
@@ -1922,6 +2071,40 @@ mod tests {
     }
 
     /// Helper: compute the expected shape and numel for a tensor name given a config.
+
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_olmo2_7b() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let dir = format!("{home}/models/olmo2-7b");
+
+        eprintln!("\n  Loading OLMo-2-1124-7B from {dir} (sharded, ~29GB FP32)...");
+        let t_load = std::time::Instant::now();
+        let mut model = match load_model_from_dir(&dir, ModelConfig::olmo2_7b()) {
+            Ok(m)  => m,
+            Err(e) => { eprintln!("  SKIP: {e}"); return; }
+        };
+        let load_ms = t_load.elapsed().as_millis();
+
+        let t_first = std::time::Instant::now();
+        let _ = model.forward_one_gpu(1);
+        let first_ms = t_first.elapsed().as_millis();
+        model.reset();
+
+        let n = 20usize;
+        let t0 = std::time::Instant::now();
+        let out = model.generate(&[1u32, 2, 3], n, 0.0);
+        let tok_s = n as f64 / t0.elapsed().as_secs_f64();
+
+        eprintln!("\n  OLMo-2-1124-7B | load={}ms | 1st={}ms | {:.1} tok/s | {} tokens",
+                  load_ms, first_ms, tok_s, out.len());
+        eprintln!("  Hardware: NVIDIA A100-SXM4-40GB | CUDA 13.0 | ATLAS v4.0 (post-norm+QK-norm)");
+
+        assert_eq!(out.len(), n, "wrong output length");
+        assert!(tok_s > 0.5, "OLMo-2-7B: {tok_s:.2} tok/s < 0.5");
+    }
+
     fn tensor_shape_for_config(cfg: &ModelConfig, name: &str) -> (Vec<usize>, usize) {
         let d = cfg.d_model;
         let kv = cfg.kv_dim();
