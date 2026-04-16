@@ -241,7 +241,7 @@ __global__ void rmsnorm_kernel(
         for (int d = (blockDim.x / 64); d > 0; d >>= 1)
             sum += __shfl_down_sync(0xffffffff, sum, d);
     }
-    float rms_inv = __rsqrtf(__shfl_sync(0xffffffff, sum, 0) / (float)n + eps);
+    float rms_inv = rsqrtf(__shfl_sync(0xffffffff, sum, 0) / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         out[i] = x[i] * rms_inv * w[i];
 }
