@@ -307,6 +307,104 @@ impl CasDecayCalibrator {
     }
 }
 
+// ── CanonicalPheromoneUpdate ───────────────────────────────────────────────
+//
+// Implements the canonical equation from Champagnat-Méléard (2011) PTRF §4
+// and Champagnat-Hass (2025) AAP for adaptive pheromone decay:
+//
+//   Δρ = ½ · μ · σ² · n̄ · |∂₁s|
+//
+// where:
+//   μ = explore_ratio   (mutation rate proxy)
+//   σ = temperature     (landscape variance proxy; σ² = temperature²)
+//   n̄ = avg_pheromone   (equilibrium density)
+//   ∂₁s = delta_success_rate (selection gradient)
+//
+// The adjusted rate = base_rate × (1 − Δρ), clamped to [min_rate, max_rate].
+
+/// State snapshot passed to [`CanonicalPheromoneUpdate::compute_rate`].
+#[derive(Debug, Clone)]
+pub struct CanonicalUpdateState {
+    /// μ — mutation rate proxy (OODA explore_ratio, ∈ [0, 1]).
+    pub explore_ratio: f32,
+    /// σ — landscape variance proxy (sampling temperature, > 0).
+    pub temperature: f32,
+    /// n̄ — average pheromone value across all drawers (equilibrium density).
+    pub avg_pheromone: f32,
+    /// ∂₁s — selection gradient (change in success rate, can be negative).
+    pub delta_success_rate: f32,
+}
+
+/// Adaptive pheromone decay implementing the Champagnat canonical equation.
+///
+/// Drop-in companion to [`CasDecayCalibrator`]: call `compute_rate` to get
+/// the principled decay rate, then `apply` to update a `Palace` in place.
+///
+/// # Example
+/// ```rust
+/// use atlas_palace::stigmergy::{CanonicalPheromoneUpdate, CanonicalUpdateState};
+/// let mut updater = CanonicalPheromoneUpdate::default();
+/// let state = CanonicalUpdateState {
+///     explore_ratio: 0.3, temperature: 0.8,
+///     avg_pheromone: 0.5, delta_success_rate: 0.1,
+/// };
+/// let rate = updater.compute_rate(&state);
+/// assert!(rate > 0.0 && rate < 0.30);
+/// ```
+#[derive(Debug, Clone)]
+pub struct CanonicalPheromoneUpdate {
+    /// Base decay rate before canonical adjustment (default: 0.05).
+    pub base_rate: f32,
+    /// Minimum allowed decay rate (default: 0.005).
+    pub min_rate: f32,
+    /// Maximum allowed decay rate (default: 0.30).
+    pub max_rate: f32,
+    /// Number of updates applied so far.
+    pub updates: u32,
+    /// Last computed rate (for diagnostics).
+    pub last_rate: f32,
+}
+
+impl Default for CanonicalPheromoneUpdate {
+    fn default() -> Self {
+        Self { base_rate: 0.05, min_rate: 0.005, max_rate: 0.30, updates: 0, last_rate: 0.05 }
+    }
+}
+
+impl CanonicalPheromoneUpdate {
+    /// Create with default parameters.
+    pub fn new() -> Self { Self::default() }
+
+    /// Compute adaptive decay rate using Champagnat canonical equation.
+    ///
+    /// rate = base_rate × (1 − ½·μ·σ²·n̄·|∂₁s|), clamped to [min_rate, max_rate].
+    pub fn compute_rate(&mut self, state: &CanonicalUpdateState) -> f32 {
+        let sigma_sq = state.temperature * state.temperature;
+        let canonical_delta = 0.5
+            * state.explore_ratio
+            * sigma_sq
+            * state.avg_pheromone
+            * state.delta_success_rate.abs();
+        let adjusted = self.base_rate * (1.0 - canonical_delta);
+        let rate = adjusted.clamp(self.min_rate, self.max_rate);
+        self.last_rate = rate;
+        self.updates += 1;
+        rate
+    }
+
+    /// Apply canonical decay to all pheromones in `palace`, returning the rate used.
+    pub fn apply(&mut self, palace: &mut Palace, state: &CanonicalUpdateState) -> f32 {
+        let rate = self.compute_rate(state);
+        for d in palace.drawers.values_mut() {
+            for p in &mut d.pheromones {
+                p.value *= 1.0 - rate;
+            }
+            d.pheromones.retain(|p| p.value > PHEROMONE_FLOOR);
+        }
+        rate
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -568,5 +666,80 @@ mod tests {
         p.deposit_pheromones(&id, 0.6, 0.05, "test");
         let avg = p.avg_pheromone();
         assert!(avg > 0.0);
+    }
+
+    // ── CanonicalPheromoneUpdate tests ─────────────────────────────────────
+
+    #[test]
+    fn canonical_update_default_rate() {
+        let mut updater = CanonicalPheromoneUpdate::default();
+        let state = CanonicalUpdateState {
+            explore_ratio: 0.0, temperature: 1.0,
+            avg_pheromone: 0.5, delta_success_rate: 0.0,
+        };
+        let rate = updater.compute_rate(&state);
+        // Δρ = 0 → rate = base_rate × 1.0 = 0.05
+        assert!((rate - 0.05).abs() < 1e-6, "expected 0.05, got {rate}");
+    }
+
+    #[test]
+    fn canonical_update_reduced_rate() {
+        let mut updater = CanonicalPheromoneUpdate::default();
+        let state = CanonicalUpdateState {
+            explore_ratio: 0.5, temperature: 1.0,
+            avg_pheromone: 1.0, delta_success_rate: 0.5,
+        };
+        // Δρ = 0.5×0.5×1.0×1.0×0.5 = 0.125 → rate = 0.05×(1−0.125) = 0.04375
+        let rate = updater.compute_rate(&state);
+        assert!(rate < 0.05, "rate should be reduced by canonical term, got {rate}");
+        assert!(rate >= updater.min_rate);
+    }
+
+    #[test]
+    fn canonical_update_clamped_to_min() {
+        let mut updater = CanonicalPheromoneUpdate::default();
+        // Very large canonical delta → adjusted rate goes negative → clamp to min
+        let state = CanonicalUpdateState {
+            explore_ratio: 1.0, temperature: 10.0,
+            avg_pheromone: 100.0, delta_success_rate: 1.0,
+        };
+        let rate = updater.compute_rate(&state);
+        assert!((rate - updater.min_rate).abs() < 1e-6,
+            "should clamp to min_rate={}, got {rate}", updater.min_rate);
+    }
+
+    #[test]
+    fn canonical_update_counter_increments() {
+        let mut updater = CanonicalPheromoneUpdate::default();
+        let state = CanonicalUpdateState {
+            explore_ratio: 0.3, temperature: 0.8,
+            avg_pheromone: 0.5, delta_success_rate: 0.1,
+        };
+        updater.compute_rate(&state);
+        updater.compute_rate(&state);
+        assert_eq!(updater.updates, 2);
+    }
+
+    #[test]
+    fn canonical_update_zero_gradient_uses_base() {
+        let mut updater = CanonicalPheromoneUpdate::default();
+        let state = CanonicalUpdateState {
+            explore_ratio: 0.9, temperature: 2.0,
+            avg_pheromone: 5.0, delta_success_rate: 0.0, // zero gradient
+        };
+        let rate = updater.compute_rate(&state);
+        // Δρ = 0 when ∂₁s=0 → rate = base_rate
+        assert!((rate - 0.05).abs() < 1e-6, "zero gradient → base rate, got {rate}");
+    }
+
+    #[test]
+    fn canonical_update_last_rate_stored() {
+        let mut updater = CanonicalPheromoneUpdate::default();
+        let state = CanonicalUpdateState {
+            explore_ratio: 0.2, temperature: 0.5,
+            avg_pheromone: 0.8, delta_success_rate: 0.3,
+        };
+        let rate = updater.compute_rate(&state);
+        assert!((updater.last_rate - rate).abs() < 1e-9);
     }
 }
