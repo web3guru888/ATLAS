@@ -1,18 +1,23 @@
 cff-version: 1.2.0
 title: >-
   ATLAS: Active-inference Training with Learned Adaptive Stigmergy —
-  A Pure Rust AGI Training Framework with Live Discovery Corpus
+  A Pure Rust AGI Training Framework with Stigmergic Memory and GPU Inference
 message: >-
-  If you use this research or software, please cite it using the
+  If you use this software or research, please cite it using the
   metadata from this file.
 type: software
 authors:
-  - name: ATLAS Research Group
-    affiliation: VBRL Holdings
-date-released: "2026-04-15"
+  - family-names: Dey
+    given-names: Robin
+    affiliation: OpenHub Research
+    country: TH
+    website: https://openhubresearch.org/
+version: 3.0.0-alpha.1
+date-released: "2026-04-16"
 license: Apache-2.0
-license-url: https://github.com/web3guru888/ATLAS/blob/main/LICENSE-CODE
+license-url: https://github.com/web3guru888/ATLAS/blob/main/LICENSE
 repository-code: https://github.com/web3guru888/ATLAS
+url: https://atlasagi.org
 keywords:
   - active inference
   - stigmergic learning
@@ -25,39 +30,115 @@ keywords:
   - ZK provenance
   - TRM-CausalValidator
   - pure Rust
+  - zero dependencies
   - LLM training
-  - OLMo
-  - scientific intelligence
+  - GPU inference
+  - CUDA
+  - OpenAI-compatible API
+  - deep supervision
+  - n-morphic architecture
+  - Champagnat canonical equation
   - self-improving AI
+  - open source
 abstract: >-
   ATLAS (Active-inference Training with Learned Adaptive Stigmergy) is a
-  next-generation LLM training architecture built entirely in pure Rust
-  with zero external crate dependencies. It fuses four innovations: (1)
-  ASTRA-dev, an autonomous research engine that generates live, causal,
-  Bayesian-scored training data from NASA/WHO/World Bank APIs at ~10s per
-  discovery cycle; (2) GraphPalace, a stigmergic memory palace where
-  pheromone trails guide curriculum across training runs (O(1/√T)
-  convergence proven in BUTTERS, R²=0.982); (3) TRM-CausalValidator, a
-  7M-parameter recursive module that validates causal graphs before corpus
-  entry at 0.1% the compute cost of the base model; and (4) ZK Schnorr
-  proof chains linking every LLM output to live API data. The result is a
-  self-improving scientific intelligence that trains on what it discovers,
-  validated by recursive architecture, guided by stigmergic memory.
+  pure Rust AGI training framework with zero external crate dependencies —
+  the SQLite principle applied to AI infrastructure. It fuses five
+  architectural innovations across 21 crates and 426 tests: (1) ASTRA-dev,
+  an autonomous discovery engine generating live causal training data from
+  NASA/WHO/World Bank/ArXiv APIs in ~10s cycles; (2) GraphPalace, a
+  stigmergic memory palace where 5-type pheromone trails guide the training
+  curriculum across runs, achieving O(1/√T) convergence (R²=0.982, BUTTERS);
+  (3) DeepSupervisionTrainer with N_sup=4..16 forward passes per batch and
+  latent carry, validated by TRM (>75% gain from N_sup, arXiv:2510.04871);
+  (4) GPU-accelerated inference on Tesla T4 — 29 tok/s vs 5 tok/s CPU
+  (5.8× speedup), with GPU-resident hidden state and custom CUDA kernels for
+  rmsnorm/rope/silu_mul/AdamW; and (5) an OpenAI-compatible HTTP inference
+  API (atlas-api) with SSE streaming and CORS support. Safety is enforced by
+  a Horn-clause tractable constitution of 8 principles across 4 domains
+  (Young 2026). Storage is abstracted behind the PalaceBackend trait for
+  pluggable backends. ZK Schnorr proof chains link every LLM output to live
+  API provenance. ATLAS is an open source contribution from OpenHub Research
+  (Thailand).
 references:
   - type: article
     title: "Tiny Recursive Model (TRM): Recursive Test-time Compute"
     authors:
       - family-names: Jolicoeur-Martineau
-        given-names: A.
+        given-names: Alexia
     year: 2025
     url: https://arxiv.org/abs/2510.04871
-    notes: "Samsung SAIL Montreal. Architecture basis for TRM-CausalValidator."
+    notes: >-
+      Samsung SAIL Montreal. Architecture basis for TRM-CausalValidator.
+      Validates DeepSupervisionTrainer: >75% of gain from N_sup passes.
   - type: article
     title: >-
       Collective Habit as Infrastructure: A Computational Model of Morphic
       Resonance via Multi-Agent Reinforcement Learning
     authors:
-      - name: BUTTERS Research Group
+      - family-names: Dey
+        given-names: Robin
     year: 2026
     url: https://github.com/web3guru888/morphic-resonance-sim
-    notes: "Source of O(1/√T) morphic warm-start convergence result (R²=0.982)."
+    notes: "O(1/√T) morphic warm-start convergence result (R²=0.982, p<10⁻³⁰)."
+  - type: article
+    title: >-
+      Convergence of adaptive dynamics n-morphic jump processes to the
+      canonical equation and degenerate diffusion approximation
+    authors:
+      - family-names: Champagnat
+        given-names: Nicolas
+    year: 2003
+    notes: >-
+      Prépublication Université de Nanterre 03/7; Chapter III of PhD thesis
+      HAL tel-00091929. Mathematical foundation for v4.0 n-Morphic architecture:
+      DeepSupervisionTrainer with N_sup passes is a discrete-time k-morphic TSS.
+  - type: article
+    title: >-
+      Polymorphic evolution sequence and evolutionary branching
+    authors:
+      - family-names: Champagnat
+        given-names: Nicolas
+      - family-names: Méléard
+        given-names: Sylvie
+    year: 2011
+    journal: Probability Theory and Related Fields
+    volume: "151"
+    pages: "45–94"
+    doi: 10.1007/s00440-010-0292-9
+  - type: article
+    title: >-
+      From stochastic, individual-based models to the canonical equation of
+      adaptive dynamics in one step
+    authors:
+      - family-names: Baar
+        given-names: Martina
+      - family-names: Bovier
+        given-names: Anton
+      - family-names: Champagnat
+        given-names: Nicolas
+    year: 2017
+    journal: Annals of Applied Probability
+    volume: "27"
+    pages: "1093–1170"
+    doi: 10.1214/16-AAP1227
+    notes: "Stability condition μ·K→∞ constrains joint (explore_ratio, decay_rate) tuning."
+  - type: article
+    title: >-
+      On the hardness and tractability of AI safety constraints
+    authors:
+      - family-names: Young
+        given-names: Andrew G.
+    year: 2026
+    url: https://arxiv.org/abs/2501.15446
+    notes: >-
+      NP-hardness result validating ≤12-principle Horn-clause tractable
+      safety constitution in atlas-safety.
+  - type: article
+    title: >-
+      Differentiable Pheromone Policy Networks
+    year: 2026
+    url: https://arxiv.org/abs/2603.22858
+    notes: >-
+      DPPN: warm pheromone as learning-rate prior. Pheromone.success sets
+      LR multiplier (not sampling weight) — first-principles derivation.
