@@ -145,8 +145,8 @@ ARCHITECTURE:
     Stage 7: atlas-cli (this binary), bench suite
 
 LICENSE:
-    Code: Apache 2.0 (LICENSE) · Docs: CC BY 4.0 (LICENSE-DOCS)
-    © 2026 Robin Dey, OpenHub Research (Thailand) — https://openhubresearch.org/
+    Code: Apache 2.0 (LICENSE-CODE) · Docs: CC BY 4.0 (LICENSE)
+    © 2026 web3guru888 / VBRL Holdings
 "#,
         ver = env!("CARGO_PKG_VERSION")
     );

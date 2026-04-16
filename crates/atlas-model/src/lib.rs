@@ -46,8 +46,8 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    /// OLMo 3 7B / Llama 3 8B configuration.
-    pub fn olmo3_7b() -> Self {
+    /// Llama 3 8B / Llama 3.1 8B configuration (GQA, vocab=128256).
+    pub fn llama3_8b() -> Self {
         Self {
             vocab_size:   128_256,
             d_model:      4096,
@@ -163,6 +163,23 @@ impl ModelConfig {
     pub fn olmo2_7b() -> Self {
         Self {
             vocab_size:   100352,
+            d_model:      4096,
+            n_layers:     32,
+            n_heads:      32,
+            n_kv_heads:   32,
+            ffn_hidden:   11008,
+            max_seq_len:  4096,
+            rope_theta:   500_000.0,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
+    /// OLMo-3-1025-7B / OLMo-3-7B-Instruct / OLMo-3-7B-Think (AllenAI)
+    /// Architecture: Olmo3ForCausalLM — post-norm + QK-norm (identical structure to OLMo-2)
+    /// hidden=4096, layers=32, heads=32/32, ffn=11008, vocab=100278 (BF16, 14.6GB, 3 shards)
+    pub fn olmo3_actual_7b() -> Self {
+        Self {
+            vocab_size:   100278,
             d_model:      4096,
             n_layers:     32,
             n_heads:      32,
@@ -1650,9 +1667,9 @@ mod tests {
         }
 
         // Also verify for a larger config
-        let cfg7b = ModelConfig::olmo3_7b();
+        let cfg7b = ModelConfig::llama3_8b();
         let names7b = cfg7b.expected_tensor_names();
-        assert_eq!(names7b.len(), 32 * 9 + 3); // 291
+        assert_eq!(names7b.len(), 32 * 9 + 3); // 291 (Llama naming: 9 per layer)
     }
 
     #[test]
@@ -2105,6 +2122,137 @@ mod tests {
         assert!(tok_s > 0.5, "OLMo-2-7B: {tok_s:.2} tok/s < 0.5");
     }
 
+
+    /// GPU benchmark — OLMo-3-1025-7B base model (BF16, 14.6GB, 3 shards).
+    /// Requires: ~/models/olmo3-7b-base/
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_olmo3_7b_base() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let dir = format!("{home}/models/olmo3-7b-base");
+        eprintln!("\n  Loading OLMo-3-1025-7B (base) from {dir}...");
+        let t_load = std::time::Instant::now();
+        let mut model = match load_model_from_dir(&dir, ModelConfig::olmo3_actual_7b()) {
+            Ok(m) => m, Err(e) => { eprintln!("  SKIP: {e}"); return; }
+        };
+        let load_ms = t_load.elapsed().as_millis();
+        let t1 = std::time::Instant::now();
+        let _ = model.forward_one_gpu(1);
+        let first_ms = t1.elapsed().as_millis();
+        model.reset();
+        let n = 20usize;
+        let t0 = std::time::Instant::now();
+        let out = model.generate(&[1u32, 2, 3], n, 0.0);
+        let tok_s = n as f64 / t0.elapsed().as_secs_f64();
+        eprintln!("  OLMo-3-7B (base)     | load={}ms | 1st={}ms | {:.1} tok/s", load_ms, first_ms, tok_s);
+        assert_eq!(out.len(), n);
+        assert!(tok_s > 0.5, "too slow: {tok_s:.2}");
+    }
+
+    /// GPU benchmark — OLMo-3-7B-Instruct (BF16, 14.6GB, 3 shards).
+    /// Requires: ~/models/olmo3-7b-instruct/
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_olmo3_7b_instruct() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let dir = format!("{home}/models/olmo3-7b-instruct");
+        eprintln!("\n  Loading OLMo-3-7B-Instruct from {dir}...");
+        let t_load = std::time::Instant::now();
+        let mut model = match load_model_from_dir(&dir, ModelConfig::olmo3_actual_7b()) {
+            Ok(m) => m, Err(e) => { eprintln!("  SKIP: {e}"); return; }
+        };
+        let load_ms = t_load.elapsed().as_millis();
+        let t1 = std::time::Instant::now();
+        let _ = model.forward_one_gpu(1);
+        let first_ms = t1.elapsed().as_millis();
+        model.reset();
+        let n = 20usize;
+        let t0 = std::time::Instant::now();
+        let out = model.generate(&[1u32, 2, 3], n, 0.0);
+        let tok_s = n as f64 / t0.elapsed().as_secs_f64();
+        eprintln!("  OLMo-3-7B (instruct) | load={}ms | 1st={}ms | {:.1} tok/s", load_ms, first_ms, tok_s);
+        assert_eq!(out.len(), n);
+        assert!(tok_s > 0.5, "too slow: {tok_s:.2}");
+    }
+
+    /// GPU benchmark — OLMo-3-7B-Think (BF16, 14.6GB, 3 shards).
+    /// Requires: ~/models/olmo3-7b-think/
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_olmo3_7b_think() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let dir = format!("{home}/models/olmo3-7b-think");
+        eprintln!("\n  Loading OLMo-3-7B-Think from {dir}...");
+        let t_load = std::time::Instant::now();
+        let mut model = match load_model_from_dir(&dir, ModelConfig::olmo3_actual_7b()) {
+            Ok(m) => m, Err(e) => { eprintln!("  SKIP: {e}"); return; }
+        };
+        let load_ms = t_load.elapsed().as_millis();
+        let t1 = std::time::Instant::now();
+        let _ = model.forward_one_gpu(1);
+        let first_ms = t1.elapsed().as_millis();
+        model.reset();
+        let n = 20usize;
+        let t0 = std::time::Instant::now();
+        let out = model.generate(&[1u32, 2, 3], n, 0.0);
+        let tok_s = n as f64 / t0.elapsed().as_secs_f64();
+        eprintln!("  OLMo-3-7B (think)    | load={}ms | 1st={}ms | {:.1} tok/s", load_ms, first_ms, tok_s);
+        assert_eq!(out.len(), n);
+        assert!(tok_s > 0.5, "too slow: {tok_s:.2}");
+    }
+
+    /// Comparative GPU benchmark — all OLMo variants side by side.
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_olmo_all() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+
+        struct R { name: &'static str, load_ms: u128, first_ms: u128, tok_s: f64 }
+        let mut results: Vec<R> = Vec::new();
+
+        let models: &[(&str, &str, ModelConfig)] = &[
+            ("OLMo-2-7B (FP32)",     "olmo2-7b",          ModelConfig::olmo2_7b()),
+            ("OLMo-3-7B base (BF16)","olmo3-7b-base",     ModelConfig::olmo3_actual_7b()),
+            ("OLMo-3-7B inst (BF16)","olmo3-7b-instruct", ModelConfig::olmo3_actual_7b()),
+            ("OLMo-3-7B think(BF16)","olmo3-7b-think",    ModelConfig::olmo3_actual_7b()),
+        ];
+
+        for (name, dir, cfg) in models {
+            let path = format!("{home}/models/{dir}");
+            eprintln!("\n  Loading {name}...");
+            let t_load = std::time::Instant::now();
+            let mut model = match load_model_from_dir(&path, cfg.clone()) {
+                Ok(m) => m, Err(e) => { eprintln!("  SKIP: {e}"); continue; }
+            };
+            let load_ms = t_load.elapsed().as_millis();
+            let t1 = std::time::Instant::now();
+            let _ = model.forward_one_gpu(1);
+            let first_ms = t1.elapsed().as_millis();
+            model.reset();
+            let n = 20usize;
+            let t0 = std::time::Instant::now();
+            let out = model.generate(&[1u32, 2, 3], n, 0.0);
+            let tok_s = n as f64 / t0.elapsed().as_secs_f64();
+            assert_eq!(out.len(), n);
+            results.push(R { name, load_ms, first_ms, tok_s });
+        }
+
+        eprintln!("");
+        eprintln!("  ╔═══════════════════════╦══════════╦═══════════╦══════════════╗");
+        eprintln!("  ║ Model                 ║ Load(s)  ║ 1st-tok   ║ Throughput   ║");
+        eprintln!("  ╠═══════════════════════╬══════════╬═══════════╬══════════════╣");
+        for r in &results {
+            eprintln!("  ║ {:<21} ║ {:>6.0}s  ║ {:>7}ms ║ {:>8.1} tok/s ║",
+                r.name, r.load_ms as f64/1000.0, r.first_ms, r.tok_s);
+        }
+        eprintln!("  ╚═══════════════════════╩══════════╩═══════════╩══════════════╝");
+        eprintln!("  Hardware: NVIDIA A100-SXM4-40GB | CUDA 13.0 | ATLAS v4.0");
+        assert!(!results.is_empty());
+    }
     fn tensor_shape_for_config(cfg: &ModelConfig, name: &str) -> (Vec<usize>, usize) {
         let d = cfg.d_model;
         let kv = cfg.kv_dim();

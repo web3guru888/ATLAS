@@ -124,7 +124,7 @@ pub fn model_config_from_id(id: &str) -> ModelConfig {
     } else if id_lc.contains("1.7b") || id_lc.contains("1b7") {
         ModelConfig::smollm2_1b7()
     } else if id_lc.contains("olmo") && id_lc.contains("7b") {
-        ModelConfig::olmo3_7b()
+        ModelConfig::olmo3_actual_7b()
     } else if id_lc.contains("olmo") {
         ModelConfig::olmo3_1b()
     } else if id_lc.contains("llama") {
