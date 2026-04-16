@@ -1,9 +1,13 @@
 //! OpenAI-compatible request/response types.
 //!
 //! All serialization is hand-rolled — no serde or external deps.
+//! Types mirror the OpenAI v1 REST API spec so any OpenAI-compatible
+//! client can talk to ATLAS out of the box.
 
-use atlas_json::Json;
 use atlas_core::{AtlasError, Result};
+use atlas_json::Json;
+
+// ── Configuration ─────────────────────────────────────────────────────────────
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -14,26 +18,28 @@ pub struct ServerConfig {
     pub port: u16,
     /// Model identifier returned by /v1/models.
     pub model_id: String,
-    /// Directory containing model weights and tokenizer.
+    /// Directory containing model weights and tokenizer.json.
     pub weights_dir: Option<String>,
     /// Max tokens per generation (hard cap).
     pub max_tokens: usize,
-    /// Number of worker threads (currently 1 inference thread + N HTTP threads).
+    /// Number of worker threads.
     pub workers: usize,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "0.0.0.0".to_string(),
-            port: 8080,
-            model_id: "atlas".to_string(),
+            host:        "0.0.0.0".to_string(),
+            port:        8080,
+            model_id:    "atlas".to_string(),
             weights_dir: None,
-            max_tokens: 2048,
-            workers: 4,
+            max_tokens:  2048,
+            workers:     4,
         }
     }
 }
+
+// ── Chat message ─────────────────────────────────────────────────────────────
 
 /// A single message in a chat conversation.
 #[derive(Debug, Clone)]
@@ -51,16 +57,9 @@ impl ChatMessage {
         let content = v.get("content")?.as_str()?.to_string();
         Some(Self { role, content })
     }
-
-    /// Serialize to JSON string.
-    pub fn to_json(&self) -> String {
-        format!(
-            r#"{{"role":{},"content":{}}}"#,
-            json_string(&self.role),
-            json_string(&self.content),
-        )
-    }
 }
+
+// ── Request types ─────────────────────────────────────────────────────────────
 
 /// POST /v1/chat/completions request body.
 #[derive(Debug, Clone)]
@@ -142,7 +141,7 @@ impl CompletionRequest {
             .unwrap_or("atlas")
             .to_string();
         let prompt = v.get("prompt")
-            .and_then(|m| m.as_str())
+            .and_then(|p| p.as_str())
             .unwrap_or("")
             .to_string();
         let max_tokens = v.get("max_tokens")
@@ -183,20 +182,25 @@ impl ChatCompletionResponse {
     pub fn to_json(&self) -> String {
         let total = self.prompt_tokens + self.completion_tokens;
         format!(
-            r#"{{"id":{},"object":"chat.completion","created":{},"model":{},"choices":[{{"index":0,"message":{{"role":"assistant","content":{}}},"finish_reason":{}}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{}}}}}"#,
-            json_string(&self.id),
-            self.created,
-            json_string(&self.model),
-            json_string(&self.content),
-            json_string(self.finish_reason),
-            self.prompt_tokens,
-            self.completion_tokens,
-            total,
+            concat!(
+                r#"{{"id":{id},"object":"chat.completion","created":{created},"model":{model},"#,
+                r#""choices":[{{"index":0,"message":{{"role":"assistant","content":{content}}},"#,
+                r#""finish_reason":{finish}}}],"#,
+                r#""usage":{{"prompt_tokens":{pt},"completion_tokens":{ct},"total_tokens":{tt}}}}}"#
+            ),
+            id      = json_string(&self.id),
+            created = self.created,
+            model   = json_string(&self.model),
+            content = json_string(&self.content),
+            finish  = json_string(self.finish_reason),
+            pt      = self.prompt_tokens,
+            ct      = self.completion_tokens,
+            tt      = total,
         )
     }
 }
 
-/// A streaming SSE chunk.
+/// A streaming SSE chunk (OpenAI format).
 pub struct StreamChunk {
     /// Completion ID.
     pub id: String,
@@ -204,9 +208,9 @@ pub struct StreamChunk {
     pub model: String,
     /// Token text (empty for [DONE]).
     pub delta: String,
-    /// True if this is the final chunk.
+    /// True if this is the final [DONE] sentinel.
     pub done: bool,
-    /// Finish reason (None unless done).
+    /// Finish reason (present on last content chunk).
     pub finish_reason: Option<&'static str>,
 }
 
@@ -221,11 +225,15 @@ impl StreamChunk {
                 None    => "null".to_string(),
             };
             let data = format!(
-                r#"{{"id":{},"object":"chat.completion.chunk","model":{},"choices":[{{"index":0,"delta":{{"role":"assistant","content":{}}},"finish_reason":{}}}]}}"#,
-                json_string(&self.id),
-                json_string(&self.model),
-                json_string(&self.delta),
-                fr_json,
+                concat!(
+                    r#"{{"id":{id},"object":"chat.completion.chunk","model":{model},"#,
+                    r#""choices":[{{"index":0,"delta":{{"role":"assistant","content":{content}}},"#,
+                    r#""finish_reason":{finish}}}]}}"#
+                ),
+                id      = json_string(&self.id),
+                model   = json_string(&self.model),
+                content = json_string(&self.delta),
+                finish  = fr_json,
             );
             format!("data: {data}\n\n")
         }
@@ -255,24 +263,28 @@ impl CompletionResponse {
     pub fn to_json(&self) -> String {
         let total = self.prompt_tokens + self.completion_tokens;
         format!(
-            r#"{{"id":{},"object":"text_completion","created":{},"model":{},"choices":[{{"text":{},"index":0,"finish_reason":{}}}],"usage":{{"prompt_tokens":{},"completion_tokens":{},"total_tokens":{}}}}}"#,
-            json_string(&self.id),
-            self.created,
-            json_string(&self.model),
-            json_string(&self.text),
-            json_string(self.finish_reason),
-            self.prompt_tokens,
-            self.completion_tokens,
-            total,
+            concat!(
+                r#"{{"id":{id},"object":"text_completion","created":{created},"model":{model},"#,
+                r#""choices":[{{"text":{text},"index":0,"finish_reason":{finish}}}],"#,
+                r#""usage":{{"prompt_tokens":{pt},"completion_tokens":{ct},"total_tokens":{tt}}}}}"#
+            ),
+            id      = json_string(&self.id),
+            created = self.created,
+            model   = json_string(&self.model),
+            text    = json_string(&self.text),
+            finish  = json_string(self.finish_reason),
+            pt      = self.prompt_tokens,
+            ct      = self.completion_tokens,
+            tt      = total,
         )
     }
 }
 
-/// Error response body.
+/// API error response body.
 pub struct ErrorResponse {
     /// Error message.
     pub message: String,
-    /// Error type.
+    /// OpenAI error type string.
     pub error_type: &'static str,
     /// HTTP status code.
     pub status: u16,
@@ -282,30 +294,28 @@ impl ErrorResponse {
     /// Serialize to JSON.
     pub fn to_json(&self) -> String {
         format!(
-            r#"{{"error":{{"message":{},"type":{},"code":{}}}}}"#,
-            json_string(&self.message),
-            json_string(self.error_type),
-            self.status,
+            r#"{{"error":{{"message":{msg},"type":{tp},"code":{code}}}}}"#,
+            msg  = json_string(&self.message),
+            tp   = json_string(self.error_type),
+            code = self.status,
         )
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Escape a string for JSON — surround with quotes, escape special chars.
+/// Escape a string for JSON — surround with double-quotes, escape specials.
 pub fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
         match ch {
-            '"'  => out.push_str(r#"\""#),
-            '\\' => out.push_str(r#"\\"#),
-            '\n' => out.push_str(r#"\n"#),
-            '\r' => out.push_str(r#"\r"#),
-            '\t' => out.push_str(r#"\t"#),
-            c if (c as u32) < 32 => {
-                out.push_str(&format!(r#"\u{:04x}"#, c as u32));
-            }
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 32 => { out.push_str(&format!("\\u{:04x}", c as u32)); }
             c    => out.push(c),
         }
     }
@@ -313,13 +323,12 @@ pub fn json_string(s: &str) -> String {
     out
 }
 
-/// Generate a pseudo-unique ID string.
+/// Generate a pseudo-unique ID string from wall-clock time.
 pub fn gen_id(prefix: &str) -> String {
-    // Simple deterministic ID based on time (no random deps).
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{}-{}{}", prefix, t.as_secs(), t.subsec_nanos() / 1_000_000)
+    format!("{}-{}{:06}", prefix, t.as_secs(), t.subsec_micros())
 }
 
 /// Current Unix timestamp in seconds.
@@ -342,24 +351,43 @@ mod tests {
     }
 
     #[test]
-    fn json_string_escapes() {
-        assert_eq!(json_string("say \"hi\""), r#""say \"hi\"""#);
+    fn json_string_escapes_quotes() {
+        assert_eq!(json_string(r#"say "hi""#), r#""say \"hi\"""#);
+    }
+
+    #[test]
+    fn json_string_escapes_newline() {
         assert_eq!(json_string("line\nnew"), r#""line\nnew""#);
+    }
+
+    #[test]
+    fn json_string_escapes_tab() {
         assert_eq!(json_string("tab\there"), r#""tab\there""#);
     }
 
     #[test]
-    fn chat_message_round_trip() {
-        let json = r#"{"role":"user","content":"Hello!"}"#;
-        let v = atlas_json::Json::parse(json).unwrap();
+    fn json_string_escapes_backslash() {
+        assert_eq!(json_string("a\\b"), r#""a\\b""#);
+    }
+
+    #[test]
+    fn chat_message_from_json() {
+        let raw = r#"{"role":"user","content":"Hello!"}"#;
+        let v = Json::parse(raw).unwrap();
         let msg = ChatMessage::from_json(&v).unwrap();
         assert_eq!(msg.role, "user");
         assert_eq!(msg.content, "Hello!");
     }
 
     #[test]
-    fn chat_request_parse() {
-        let body = r#"{"model":"atlas","messages":[{"role":"user","content":"Hi"}],"max_tokens":50,"temperature":0.7}"#;
+    fn chat_message_missing_role_returns_none() {
+        let v = Json::parse(r#"{"content":"Hi"}"#).unwrap();
+        assert!(ChatMessage::from_json(&v).is_none());
+    }
+
+    #[test]
+    fn chat_request_parse_full() {
+        let body = r#"{"model":"atlas","messages":[{"role":"user","content":"Hi"}],"max_tokens":50,"temperature":0.7,"stream":false}"#;
         let req = ChatCompletionRequest::parse(body).unwrap();
         assert_eq!(req.model, "atlas");
         assert_eq!(req.messages.len(), 1);
@@ -378,25 +406,47 @@ mod tests {
 
     #[test]
     fn chat_request_defaults() {
-        let body = r#"{"messages":[]}"#;
-        let req = ChatCompletionRequest::parse(body).unwrap();
+        let req = ChatCompletionRequest::parse(r#"{"messages":[]}"#).unwrap();
         assert_eq!(req.max_tokens, 256);
         assert_eq!(req.temperature, 0.0);
         assert!(!req.stream);
     }
 
     #[test]
+    fn chat_request_invalid_json_errors() {
+        assert!(ChatCompletionRequest::parse("{bad json}").is_err());
+    }
+
+    #[test]
     fn completion_request_parse() {
-        let body = r#"{"model":"atlas","prompt":"Hello world","max_tokens":100}"#;
+        let body = r#"{"model":"atlas","prompt":"Hello","max_tokens":100}"#;
         let req = CompletionRequest::parse(body).unwrap();
-        assert_eq!(req.prompt, "Hello world");
+        assert_eq!(req.prompt, "Hello");
         assert_eq!(req.max_tokens, 100);
     }
 
     #[test]
-    fn chat_completion_response_json() {
+    fn to_prompt_system_user() {
+        let req = ChatCompletionRequest {
+            model: "atlas".to_string(),
+            messages: vec![
+                ChatMessage { role: "system".to_string(),    content: "You are helpful.".to_string() },
+                ChatMessage { role: "user".to_string(),      content: "What is 2+2?".to_string() },
+            ],
+            max_tokens: 50, temperature: 0.0, stream: false,
+        };
+        let p = req.to_prompt();
+        assert!(p.contains("<|system|>"));
+        assert!(p.contains("You are helpful."));
+        assert!(p.contains("<|user|>"));
+        assert!(p.contains("What is 2+2?"));
+        assert!(p.contains("<|assistant|>"));
+    }
+
+    #[test]
+    fn chat_completion_response_json_valid() {
         let resp = ChatCompletionResponse {
-            id: "cmpl-1".to_string(),
+            id: "chatcmpl-1".to_string(),
             created: 1000,
             model: "atlas".to_string(),
             content: "Hello!".to_string(),
@@ -405,18 +455,20 @@ mod tests {
             finish_reason: "stop",
         };
         let json = resp.to_json();
-        let v = atlas_json::Json::parse(&json).unwrap();
+        let v = Json::parse(&json).unwrap();
         assert_eq!(v.get("object").and_then(|x| x.as_str()), Some("chat.completion"));
-        let choice = &v.get("choices").unwrap().as_array().unwrap()[0];
-        assert_eq!(choice.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()), Some("Hello!"));
+        let choices = v.get("choices").unwrap().as_array().unwrap();
+        let msg = choices[0].get("message").unwrap();
+        assert_eq!(msg.get("content").and_then(|c| c.as_str()), Some("Hello!"));
+        assert_eq!(msg.get("role").and_then(|r| r.as_str()), Some("assistant"));
         let usage = v.get("usage").unwrap();
         assert_eq!(usage.get("total_tokens").and_then(|x| x.as_i64()), Some(6));
     }
 
     #[test]
-    fn completion_response_json() {
+    fn completion_response_json_valid() {
         let resp = CompletionResponse {
-            id: "cmpl-2".to_string(),
+            id: "cmpl-1".to_string(),
             created: 2000,
             model: "atlas".to_string(),
             text: "World".to_string(),
@@ -425,16 +477,16 @@ mod tests {
             finish_reason: "stop",
         };
         let json = resp.to_json();
-        let v = atlas_json::Json::parse(&json).unwrap();
+        let v = Json::parse(&json).unwrap();
         assert_eq!(v.get("object").and_then(|x| x.as_str()), Some("text_completion"));
-        let choice = &v.get("choices").unwrap().as_array().unwrap()[0];
-        assert_eq!(choice.get("text").and_then(|c| c.as_str()), Some("World"));
+        let choices = v.get("choices").unwrap().as_array().unwrap();
+        assert_eq!(choices[0].get("text").and_then(|t| t.as_str()), Some("World"));
     }
 
     #[test]
     fn stream_chunk_sse_format() {
         let chunk = StreamChunk {
-            id: "cmpl-1".to_string(),
+            id: "chatcmpl-1".to_string(),
             model: "atlas".to_string(),
             delta: "Hi".to_string(),
             done: false,
@@ -443,49 +495,47 @@ mod tests {
         let sse = chunk.to_sse();
         assert!(sse.starts_with("data: {"));
         assert!(sse.ends_with("\n\n"));
+        let data_json = &sse["data: ".len()..sse.len()-2];
+        let v = Json::parse(data_json).unwrap();
+        assert_eq!(v.get("object").and_then(|x| x.as_str()), Some("chat.completion.chunk"));
     }
 
     #[test]
-    fn stream_chunk_done() {
+    fn stream_chunk_done_sentinel() {
         let chunk = StreamChunk {
-            id: "cmpl-1".to_string(),
-            model: "atlas".to_string(),
-            delta: String::new(),
-            done: true,
-            finish_reason: Some("stop"),
+            id: "x".to_string(), model: "atlas".to_string(),
+            delta: String::new(), done: true, finish_reason: Some("stop"),
         };
         assert_eq!(chunk.to_sse(), "data: [DONE]\n\n");
     }
 
     #[test]
-    fn to_prompt_chatml() {
-        let req = ChatCompletionRequest {
-            model: "atlas".to_string(),
-            messages: vec![
-                ChatMessage { role: "system".to_string(), content: "You are helpful.".to_string() },
-                ChatMessage { role: "user".to_string(), content: "What is 2+2?".to_string() },
-            ],
-            max_tokens: 50,
-            temperature: 0.0,
-            stream: false,
-        };
-        let prompt = req.to_prompt();
-        assert!(prompt.contains("<|system|>"));
-        assert!(prompt.contains("<|user|>"));
-        assert!(prompt.contains("<|assistant|>"));
-    }
-
-    #[test]
-    fn error_response_json() {
+    fn error_response_json_valid() {
         let err = ErrorResponse {
             message: "Model not found".to_string(),
             error_type: "invalid_request_error",
             status: 404,
         };
         let json = err.to_json();
-        let v = atlas_json::Json::parse(&json).unwrap();
+        let v = Json::parse(&json).unwrap();
         let e = v.get("error").unwrap();
         assert_eq!(e.get("message").and_then(|x| x.as_str()), Some("Model not found"));
         assert_eq!(e.get("type").and_then(|x| x.as_str()), Some("invalid_request_error"));
+        assert_eq!(e.get("code").and_then(|x| x.as_i64()), Some(404));
+    }
+
+    #[test]
+    fn gen_id_prefixed() {
+        let id = gen_id("chatcmpl");
+        assert!(id.starts_with("chatcmpl-"));
+    }
+
+    #[test]
+    fn server_config_default_values() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.port, 8080);
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.max_tokens, 2048);
+        assert!(cfg.weights_dir.is_none());
     }
 }
