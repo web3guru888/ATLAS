@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use atlas_model::{ModelConfig, load_model_from_safetensors};
+use atlas_model::{ModelConfig, load_model_from_safetensors, load_model_from_dir};
 use atlas_tokenize::Tokenizer;
 
 use crate::handler::{handle, parse_http_request, InferState};
@@ -101,11 +101,23 @@ impl ApiServer {
                 Err(e) => { eprintln!("  tokenizer: ⚠ {e} — byte fallback"); None }
             };
 
-            let weights_path = format!("{}/model.safetensors", weights_dir.trim_end_matches('/'));
+            let dir = weights_dir.trim_end_matches('/');
+            let index_path = format!("{dir}/model.safetensors.index.json");
             let cfg   = model_config_from_id(&self.cfg.model_id);
-            let model = match load_model_from_safetensors(&weights_path, cfg) {
-                Ok(m)  => { eprintln!("  model: ✓ {} M params", m.param_count() / 1_000_000); Some(m) }
-                Err(e) => { eprintln!("  model: ⚠ {e} — echo mode"); None }
+            let model = if std::path::Path::new(&index_path).exists() {
+                // Sharded model (OLMo-2/3 7B etc.) — use index-based dir loader
+                eprintln!("  model: sharded index detected — using load_model_from_dir");
+                match load_model_from_dir(dir, cfg) {
+                    Ok(m)  => { eprintln!("  model: ✓ {} M params (sharded)", m.param_count() / 1_000_000); Some(m) }
+                    Err(e) => { eprintln!("  model: ⚠ {e} — echo mode"); None }
+                }
+            } else {
+                // Single-file model (SmolLM2, TinyLlama etc.)
+                let weights_path = format!("{dir}/model.safetensors");
+                match load_model_from_safetensors(&weights_path, cfg) {
+                    Ok(m)  => { eprintln!("  model: ✓ {} M params", m.param_count() / 1_000_000); Some(m) }
+                    Err(e) => { eprintln!("  model: ⚠ {e} — echo mode"); None }
+                }
             };
 
             InferState { model, tokenizer, model_id: self.cfg.model_id.clone() }
