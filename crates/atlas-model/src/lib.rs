@@ -1609,6 +1609,134 @@ mod tests {
         assert!(b.ns_per_op() > 0.0);
     }
 
+
+    // ── GPU Inference Tests ──────────────────────────────────────────────────
+    // Run: cargo test -p atlas-model -- --ignored --nocapture --test-threads=1
+
+    /// Regression test: GPU rmsnorm must not deadlock on small d.
+    /// d=64 = 2 warps. Old __shfl_down_sync(0xffffffff,...) with only 2 active
+    /// threads out of 32 caused a GPU-level deadlock. Fixed by smem[0] broadcast.
+    #[test]
+    #[ignore]
+    fn gpu_rmsnorm_small_d_no_deadlock() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        use atlas_tensor::GpuVec;
+        let n = 64usize;
+        let x_cpu: Vec<f32> = (0..n).map(|i| (i as f32 + 1.0) * 0.01).collect();
+        let w_cpu: Vec<f32> = vec![1.0f32; n];
+        let mut x_gpu = GpuVec::from_slice(&x_cpu);
+        let w_gpu     = GpuVec::from_slice(&w_cpu);
+        x_gpu.rmsnorm_inplace(&w_gpu, 1e-5);
+        let result = x_gpu.download();
+        let mut x_ref = x_cpu.clone();
+        crate::rmsnorm_inplace(&mut x_ref, &w_cpu, 1e-5);
+        let max_err = result.iter().zip(x_ref.iter())
+            .map(|(&g, &c)| (g - c).abs()).fold(0.0f32, f32::max);
+        eprintln!("  gpu_rmsnorm_small_d: max_err={max_err:.2e}");
+        assert!(max_err < 1e-4,
+            "GPU/CPU rmsnorm mismatch (d=64): max_err={max_err:.2e}");
+    }
+
+    /// GPU forward pass on tiny synthetic model - checks output is finite.
+    #[test]
+    #[ignore]
+    fn gpu_forward_tiny_model_explicit() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+        let logits = model.forward_one_gpu(42);
+        assert!(logits.is_some(), "forward_one_gpu returned None");
+        let logits = logits.unwrap();
+        assert_eq!(logits.len(), 256);
+        assert!(logits.iter().all(|&v| v.is_finite()), "non-finite GPU logit");
+        eprintln!("  gpu_forward_tiny: 256 logits, all finite");
+        model.reset();
+        let tokens = model.generate(&[0u32, 1, 2], 5, 0.0);
+        assert_eq!(tokens.len(), 5);
+        eprintln!("  gpu_generate_tiny: {} tokens", tokens.len());
+    }
+
+    /// GPU vs CPU parity on tiny model.
+    #[test]
+    #[ignore]
+    fn gpu_cpu_parity_tiny_model() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let cfg = ModelConfig::tiny();
+        let mut m_gpu = OlmoModel::new(cfg.clone());
+        let mut m_cpu = OlmoModel::new(cfg);
+        let gpu_l = m_gpu.forward_one_gpu(7).unwrap();
+        let cpu_l = m_cpu.forward_one(7);
+        let max_err = gpu_l.iter().zip(cpu_l.iter())
+            .map(|(&g, &c)| (g - c).abs()).fold(0.0f32, f32::max);
+        eprintln!("  gpu_cpu_parity tiny: max_err={max_err:.6}");
+        assert!(max_err < 0.1, "GPU/CPU divergence: {max_err}");
+    }
+
+    /// Load real SmolLM2-135M weights and run GPU inference end-to-end.
+    /// Requires: ~/models/smollm2-135m/model.safetensors
+    #[test]
+    #[ignore]
+    fn gpu_inference_smollm2_135m() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let weights = format!("{home}/models/smollm2-135m/model.safetensors");
+        let cfg = ModelConfig::smollm2_135m();
+        eprintln!("  Loading SmolLM2-135M ...");
+        let t0 = std::time::Instant::now();
+        let mut model = match load_model_from_safetensors(&weights, cfg) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("SKIP - weights: {e}"); return; }
+        };
+        eprintln!("  Loaded in {}ms", t0.elapsed().as_millis());
+        let t1 = std::time::Instant::now();
+        let logits = model.forward_one_gpu(1);
+        eprintln!("  First GPU forward: {}ms", t1.elapsed().as_millis());
+        assert!(logits.is_some(), "forward_one_gpu returned None");
+        let logits = logits.unwrap();
+        assert_eq!(logits.len(), 49152, "wrong vocab_size");
+        assert!(logits.iter().all(|&v| v.is_finite()), "non-finite logit");
+        model.reset();
+        let prompt = vec![1u32, 2, 3, 4, 5];
+        let t2 = std::time::Instant::now();
+        let out = model.generate(&prompt, 20, 0.0);
+        let ms = t2.elapsed().as_millis();
+        let tok_s = 20.0 / (ms as f64 / 1000.0);
+        eprintln!("  20 tokens in {}ms = {:.1} tok/s", ms, tok_s);
+        assert_eq!(out.len(), 20);
+        assert!(out.iter().all(|&t| (t as usize) < 49152));
+        assert!(tok_s > 1.0, "GPU too slow: {tok_s:.1} tok/s");
+    }
+
+    /// GPU throughput benchmark: 100 tokens from SmolLM2-135M with timing report.
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_smollm2_135m_100tok() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let weights = format!("{home}/models/smollm2-135m/model.safetensors");
+        let mut model = match load_model_from_safetensors(&weights, ModelConfig::smollm2_135m()) {
+            Ok(m) => m, Err(e) => { eprintln!("SKIP: {e}"); return; }
+        };
+        // Warm-up
+        let _ = model.forward_one_gpu(1);
+        model.reset();
+        // Benchmark
+        let n = 100usize;
+        let t0 = std::time::Instant::now();
+        let out = model.generate(&[1u32, 2, 3], n, 0.0);
+        let elapsed = t0.elapsed();
+        let tok_s = n as f64 / elapsed.as_secs_f64();
+        eprintln!("");
+        eprintln!("  ATLAS GPU Benchmark - SmolLM2-135M");
+        eprintln!("  Tokens:     {n}");
+        eprintln!("  Elapsed:    {:.3}s", elapsed.as_secs_f64());
+        eprintln!("  Throughput: {:.1} tok/s", tok_s);
+        eprintln!("");
+        assert_eq!(out.len(), n);
+        assert!(tok_s > 5.0, "Throughput below 5 tok/s: {tok_s:.1}");
+    }
+
+
     /// Helper: compute the expected shape and numel for a tensor name given a config.
     fn tensor_shape_for_config(cfg: &ModelConfig, name: &str) -> (Vec<usize>, usize) {
         let d = cfg.d_model;

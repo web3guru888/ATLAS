@@ -224,32 +224,44 @@ __global__ void rmsnorm_kernel(
     float*       __restrict__ out,
     int n, float eps
 ) {
-    /* One block, reduce over n elements using warp shuffles */
+    /* General rmsnorm reduction: works for any n (n<32, n=32, n>32).
+     *
+     * Uses the correct per-warp active mask for __shfl_down_sync so that
+     * partial warps (blockDim.x < 32) don't cause undefined behaviour.
+     * Inter-warp reduction via smem[0] broadcast (no cross-warp shfl). */
     float sum = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         sum += x[i] * x[i];
-    /* warp-reduce */
-    for (int d = 16; d > 0; d >>= 1)
-        sum += __shfl_down_sync(0xffffffff, sum, d);
-    sum = __shfl_sync(0xffffffff, sum, 0);
-    /* inter-warp reduction via shared memory */
+
+    int warp_id   = threadIdx.x / 32;
+    int warp_lane = threadIdx.x % 32;
+    int n_warps   = (blockDim.x + 31) / 32;   /* ceil */
+
+    /* Active mask for THIS warp: threads [warp_id*32 .. min(blockDim, warp_id*32+32)) */
+    int warp_n  = min(32, blockDim.x - warp_id * 32);
+    unsigned active = (warp_n >= 32) ? 0xffffffffu : ((1u << warp_n) - 1u);
+
+    /* Warp-level reduce */
+    for (int d = warp_n / 2; d > 0; d >>= 1)
+        sum += __shfl_down_sync(active, sum, d);
+
+    /* Warp lane-0 writes partial sum to smem */
     extern __shared__ float smem[];
-    if (threadIdx.x % 32 == 0) smem[threadIdx.x / 32] = sum;
+    if (warp_lane == 0) smem[warp_id] = sum;
     __syncthreads();
-    if (threadIdx.x < (blockDim.x / 32)) {
-        sum = smem[threadIdx.x];
-        for (int d = (blockDim.x / 64); d > 0; d >>= 1)
-            sum += __shfl_down_sync(0xffffffff, sum, d);
-        if (threadIdx.x == 0) smem[0] = sum;
+
+    /* Thread 0 accumulates all warps then broadcasts via smem[0] */
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < n_warps; w++)
+            smem[0] += smem[w];
     }
     __syncthreads();
+
     float rms_inv = rsqrtf(smem[0] / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         out[i] = x[i] * rms_inv * w[i];
 }
 
-/* ─── RoPE kernel ────────────────────────────────────────────────────────── */
-/* In-place RoPE for a single head: x[head_dim] rotated at position pos */
 __global__ void rope_apply_kernel(
     float* __restrict__ x,
     int pos, int head_dim, float theta_base
@@ -380,7 +392,8 @@ void atlas_rmsnorm_f32(
     int n, float eps
 ) {
     int threads = MIN(256, n);
-    int smem = (threads / 32) * sizeof(float);
+    int n_warps = (threads + 31) / 32;
+    int smem    = n_warps * (int)sizeof(float);
     rmsnorm_kernel<<<1, threads, smem>>>(x, w, out, n, eps);
     cudaDeviceSynchronize();
 }
