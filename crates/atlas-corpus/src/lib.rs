@@ -24,6 +24,9 @@ pub use train::{
     StepMetrics, EpochMetrics, TrainingMetrics, cross_entropy,
 };
 
+pub mod deep_supervision;
+pub use deep_supervision::{DeepSupervisionConfig, DeepSupervisionTrainer};
+
 use std::collections::HashMap;
 
 use atlas_astra::{Discovery, Observation};
