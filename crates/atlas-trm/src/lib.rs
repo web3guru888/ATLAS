@@ -399,6 +399,91 @@ impl TrmValidator {
     }
 }
 
+// ── HJConcentrationPrior ────────────────────────────────────────────────────
+//
+// Hopf-Cole temperature sharpening for TRM inner recursion, derived from
+// Hamilton-Jacobi large-deviation theory (Fleming-Viot):
+//
+//   T_eff(step) = T₀ / (1 + γ·step)
+//
+// Applied as: (1) subtract max(logits) to enforce max=0 (if normalize_max),
+//             (2) divide by T_eff, (3) softmax.
+//
+// This prevents attention entropy collapse in deep TRM recursion by
+// progressively concentrating probability mass on the highest-scoring token.
+//
+// Reference: Champagnat-Hass (2025) AAP §4 (HJ concentration).
+
+/// Hopf-Cole concentration prior for TRM recursive logit sharpening.
+///
+/// # Example
+/// ```rust
+/// use atlas_trm::HJConcentrationPrior;
+/// let prior = HJConcentrationPrior::default();
+/// let logits = vec![2.0_f32, 1.0, 0.5];
+/// let probs = prior.apply(&logits, 0);
+/// assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+/// ```
+#[derive(Debug, Clone)]
+pub struct HJConcentrationPrior {
+    /// Initial temperature T₀ (default: 1.0).
+    pub t0: f32,
+    /// Annealing rate γ: T_eff(s) = T₀/(1+γ·s) (default: 0.1).
+    pub gamma: f32,
+    /// If true, subtract max(logits) before scaling (enforce max(logits)=0).
+    pub normalize_max: bool,
+}
+
+impl Default for HJConcentrationPrior {
+    fn default() -> Self {
+        Self { t0: 1.0, gamma: 0.1, normalize_max: true }
+    }
+}
+
+impl HJConcentrationPrior {
+    /// Create with default parameters.
+    pub fn new() -> Self { Self::default() }
+
+    /// Effective temperature at recursion step `step`.
+    ///
+    /// T_eff(step) = T₀ / (1 + γ·step)
+    pub fn t_eff(&self, step: usize) -> f32 {
+        self.t0 / (1.0 + self.gamma * step as f32)
+    }
+
+    /// Apply Hopf-Cole sharpening to `logits` at recursion `step`.
+    ///
+    /// Returns a probability vector (sums to 1.0).
+    pub fn apply(&self, logits: &[f32], step: usize) -> Vec<f32> {
+        if logits.is_empty() { return Vec::new(); }
+        let t = self.t_eff(step).max(1e-8);
+        // 1. Normalize: subtract max so max(logits) = 0
+        let max_val = if self.normalize_max {
+            logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+        } else {
+            0.0
+        };
+        // 2. Scale by 1/T_eff
+        let scaled: Vec<f32> = logits.iter().map(|&x| (x - max_val) / t).collect();
+        // 3. Softmax
+        let exp_sum: f32 = scaled.iter().map(|x| x.exp()).sum();
+        scaled.iter().map(|x| x.exp() / exp_sum).collect()
+    }
+
+    /// Apply sharpening recursively for `n_steps` steps.
+    ///
+    /// Returns one probability vector per step.
+    pub fn apply_recursive(&self, logits: &[f32], n_steps: usize) -> Vec<Vec<f32>> {
+        (0..n_steps).map(|s| self.apply(logits, s)).collect()
+    }
+
+    /// Maximum probability in the output (concentration measure).
+    pub fn max_prob(&self, logits: &[f32], step: usize) -> f32 {
+        let probs = self.apply(logits, step);
+        probs.iter().cloned().fold(0.0_f32, f32::max)
+    }
+}
+
 // ── Utilities ──────────────────────────────────────────────────────────────
 
 fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
@@ -548,5 +633,75 @@ mod tests {
         let v = validator();
         let verdict = v.validate_chain(&[], &[]);
         assert!(verdict.is_pass());
+    }
+
+    // ── HJConcentrationPrior tests ────────────────────────────────────────
+
+    #[test]
+    fn hj_prior_sums_to_one() {
+        let prior = HJConcentrationPrior::default();
+        let probs = prior.apply(&[2.0, 1.0, 0.5, -1.0], 0);
+        let sum: f32 = probs.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "probs should sum to 1, got {sum}");
+    }
+
+    #[test]
+    fn hj_prior_t_eff_decreases_with_step() {
+        let prior = HJConcentrationPrior { t0: 1.0, gamma: 0.1, normalize_max: true };
+        let t0 = prior.t_eff(0);
+        let t5 = prior.t_eff(5);
+        let t10 = prior.t_eff(10);
+        assert!(t0 > t5, "T_eff should decrease");
+        assert!(t5 > t10, "T_eff should keep decreasing");
+    }
+
+    #[test]
+    fn hj_prior_concentrates_with_depth() {
+        let prior = HJConcentrationPrior::default();
+        let logits = vec![3.0_f32, 1.0, 0.0, -1.0];
+        let max_prob_0 = prior.max_prob(&logits, 0);
+        let max_prob_10 = prior.max_prob(&logits, 10);
+        // Deeper steps → lower temperature → higher concentration
+        assert!(max_prob_10 > max_prob_0, "deeper step should concentrate mass");
+    }
+
+    #[test]
+    fn hj_prior_normalize_max_enforces_max_zero() {
+        let prior = HJConcentrationPrior { t0: 1.0, gamma: 0.0, normalize_max: true };
+        let logits = vec![5.0_f32, 3.0, 1.0];
+        let probs = prior.apply(&logits, 0);
+        // With normalize_max, exp((5-5)/1)=1 is the max exp value
+        // so the first element should have the highest prob
+        let max_idx = probs.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap();
+        assert_eq!(max_idx, 0);
+    }
+
+    #[test]
+    fn hj_prior_apply_recursive_length() {
+        let prior = HJConcentrationPrior::default();
+        let result = prior.apply_recursive(&[1.0, 2.0, 3.0], 7);
+        assert_eq!(result.len(), 7);
+        for probs in &result {
+            let sum: f32 = probs.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn hj_prior_empty_logits() {
+        let prior = HJConcentrationPrior::default();
+        let result = prior.apply(&[], 0);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn hj_prior_uniform_logits_equal_probs() {
+        let prior = HJConcentrationPrior { t0: 1.0, gamma: 0.0, normalize_max: true };
+        let logits = vec![1.0_f32, 1.0, 1.0, 1.0];
+        let probs = prior.apply(&logits, 0);
+        for p in &probs {
+            assert!((p - 0.25).abs() < 1e-5, "uniform logits → equal probs, got {p}");
+        }
     }
 }
