@@ -139,6 +139,24 @@ impl ModelConfig {
         }
     }
 
+
+    /// TinyLlama-1.1B-Chat-v1.0 (TinyLlama) — LlamaForCausalLM, Apache 2.0
+    /// hidden=2048, layers=22, heads=32, kv_heads=4, ffn=5632, vocab=32000
+    /// rope_theta=10_000, max_seq=2048 — HF: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+    pub fn tinyllama_1b() -> Self {
+        Self {
+            vocab_size:   32000,
+            d_model:      2048,
+            n_layers:     22,
+            n_heads:      32,
+            n_kv_heads:   4,
+            ffn_hidden:   5632,
+            max_seq_len:  2048,
+            rope_theta:   10_000.0,
+            rms_norm_eps: 1e-5,
+        }
+    }
+
     /// Head dimension (d_model / n_heads).
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_heads
@@ -1835,7 +1853,7 @@ mod tests {
     }
 
     /// Comparative GPU benchmark — runs all three SmolLM2 sizes and prints a summary table.
-    /// Requires: ~/models/smollm2-135m/, ~/models/smollm2-360m/, ~/models/smollm2-1b7/
+    /// Requires: ~/models/smollm2-135m/, ~/models/smollm2-360m/, ~/models/smollm2-1b7/, ~/models/tinyllama-1b-chat/
     #[test]
     #[ignore]
     fn gpu_benchmark_smollm2_all_sizes() {
@@ -1854,9 +1872,10 @@ mod tests {
         let mut results: Vec<BenchResult> = Vec::new();
 
         let models: &[(&str, &str, ModelConfig, f32, &str)] = &[
-            ("SmolLM2-135M", "smollm2-135m", ModelConfig::smollm2_135m(), 135.0, "~0.5GB"),
-            ("SmolLM2-360M", "smollm2-360m", ModelConfig::smollm2_360m(), 360.0, "~1.4GB"),
-            ("SmolLM2-1.7B", "smollm2-1b7",  ModelConfig::smollm2_1b7(),  1700.0, "~6.5GB"),
+            ("SmolLM2-135M",   "smollm2-135m",     ModelConfig::smollm2_135m(),  135.0,  "~0.5GB"),
+            ("SmolLM2-360M",   "smollm2-360m",     ModelConfig::smollm2_360m(),  360.0,  "~1.4GB"),
+            ("SmolLM2-1.7B",   "smollm2-1b7",      ModelConfig::smollm2_1b7(),   1700.0, "~6.5GB"),
+            ("TinyLlama-1.1B", "tinyllama-1b-chat", ModelConfig::tinyllama_1b(), 1100.0, "~8.4GB"),
         ];
 
         for (name, dir, cfg, params_m, vram_note) in models {
@@ -1893,7 +1912,7 @@ mod tests {
                 r.name, r.params_m, r.load_ms, r.first_ms, r.tok_s, r.vram_note);
         }
         eprintln!("  ╚══════════════════╩═══════════╩══════════╩═══════════╩══════════════╩══════════╝");
-        eprintln!("  Hardware: Tesla T4 (15GB VRAM) | CUDA 13.0 | ATLAS v3.0.0");
+        eprintln!("  Hardware: NVIDIA A100-SXM4-40GB (40GB HBM2e) | CUDA 13.0 | ATLAS v3.0.0-alpha.1");
         eprintln!("");
 
         assert!(!results.is_empty(), "No models benchmarked");
