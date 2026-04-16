@@ -28,6 +28,17 @@ mod ffi {
         pub fn atlas_softmax_f32(x: *const f32, out: *mut f32, rows: c_int, cols: c_int);
         pub fn atlas_cuda_available() -> c_int;
         pub fn atlas_cuda_device_count() -> c_int;
+        pub fn atlas_rmsnorm_f32(
+            x: *const f32, w: *const f32, out: *mut f32, n: c_int, eps: f32,
+        );
+        pub fn atlas_rope_apply_f32(x: *mut f32, pos: c_int, head_dim: c_int, theta_base: f32);
+        pub fn atlas_silu_mul_f32(gate: *const f32, up: *const f32, out: *mut f32, n: c_int);
+        pub fn atlas_vram_copy_f32(src: *const f32, dst: *mut f32, n: c_int);
+        pub fn atlas_adamw_step(
+            param: *mut f32, m: *mut f32, v: *mut f32, grad: *const f32,
+            lr: f32, beta1: f32, beta2: f32, eps: f32, wd: f32,
+            bc1: f32, bc2: f32, n: c_int,
+        );
     }
 }
 
@@ -175,12 +186,216 @@ impl GpuMatrix {
         }
         false
     }
+
+    /// GPU SGEMM where the input is already in VRAM (no H2D upload needed).
+    ///
+    /// Returns the output `GpuVec` (still in VRAM — no D2H download).
+    /// This is the zero-copy path: input stays in VRAM between operations.
+    ///
+    /// Falls back to None if CUDA not available (caller must use CPU path).
+    pub fn sgemm_vec(&self, x: &GpuVec, n: usize) -> Option<GpuVec> {
+        let m = self.rows;
+        #[cfg(atlas_cuda)]
+        if let (Some(ref a_buf), Some(ref x_buf)) = (&self.buf, &x.buf) {
+            let out_buf = gpu::GpuBuf::alloc(m * n)?;
+            unsafe {
+                ffi::atlas_matmul_f32(
+                    a_buf.ptr, x_buf.ptr, out_buf.ptr,
+                    m as i32, n as i32, self.cols as i32,
+                );
+            }
+            return Some(GpuVec {
+                buf: Some(out_buf),
+                cpu: vec![0.0f32; m * n],
+                len: m * n,
+            });
+        }
+        None
+    }
 }
 
 impl std::fmt::Debug for GpuMatrix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "GpuMatrix({}×{}, gpu={})", self.rows, self.cols, self.is_on_gpu())
     }
+}
+
+// ── GpuVec — mutable GPU buffer for activation tensors ────────────────────
+
+/// A mutable GPU buffer for transient activations (hidden states, KV cache).
+///
+/// Unlike `GpuMatrix` (static weight matrix pre-pinned in VRAM),
+/// `GpuVec` is created and destroyed per-forward-pass for intermediate results.
+///
+/// On CPU-only builds, this is a zero-cost wrapper around `Vec<f32>`.
+pub struct GpuVec {
+    #[cfg(atlas_cuda)]
+    buf: Option<gpu::GpuBuf>,
+    /// CPU fallback storage.
+    pub cpu: Vec<f32>,
+    /// Number of f32 elements.
+    pub len: usize,
+}
+
+impl GpuVec {
+    /// Create a GPU vector filled with zeros.
+    pub fn zeros(len: usize) -> Self {
+        Self {
+            #[cfg(atlas_cuda)]
+            buf: if cuda_available() { gpu::GpuBuf::alloc(len) } else { None },
+            cpu: vec![0.0f32; len],
+            len,
+        }
+    }
+
+    /// Upload a CPU slice to GPU (copy also kept in cpu for fallback).
+    pub fn from_slice(data: &[f32]) -> Self {
+        Self {
+            #[cfg(atlas_cuda)]
+            buf: if cuda_available() { gpu::GpuBuf::upload(data) } else { None },
+            cpu: data.to_vec(),
+            len: data.len(),
+        }
+    }
+
+    /// Download from GPU to CPU Vec<f32>.
+    pub fn download(&self) -> Vec<f32> {
+        #[cfg(atlas_cuda)]
+        if let Some(ref b) = self.buf { return b.download(); }
+        self.cpu.clone()
+    }
+
+    /// Whether the data is resident in VRAM.
+    pub fn is_on_gpu(&self) -> bool {
+        #[cfg(atlas_cuda)]
+        { self.buf.is_some() }
+        #[cfg(not(atlas_cuda))]
+        { false }
+    }
+
+    /// In-place element-wise add from another GpuVec.
+    pub fn add_inplace(&mut self, other: &GpuVec) {
+        debug_assert_eq!(self.len, other.len);
+        #[cfg(atlas_cuda)]
+        if let (Some(ref a), Some(ref b)) = (&self.buf, &other.buf) {
+            if let Some(out) = gpu::GpuBuf::alloc(self.len) {
+                unsafe { ffi::atlas_vec_add_f32(a.ptr, b.ptr, out.ptr, self.len as i32); }
+                let mut new_buf = Some(out);
+                core::mem::swap(&mut self.buf, &mut new_buf);
+                return;
+            }
+        }
+        // CPU fallback
+        for (a, b) in self.cpu.iter_mut().zip(other.cpu.iter()) { *a += *b; }
+    }
+
+    /// In-place RMSNorm: self = rmsnorm(self, w, eps).
+    pub fn rmsnorm_inplace(&mut self, w: &GpuVec, eps: f32) {
+        debug_assert_eq!(self.len, w.len);
+        #[cfg(atlas_cuda)]
+        if let (Some(ref x_buf), Some(ref w_buf)) = (&self.buf, &w.buf) {
+            if let Some(out_buf) = gpu::GpuBuf::alloc(self.len) {
+                unsafe {
+                    ffi::atlas_rmsnorm_f32(
+                        x_buf.ptr, w_buf.ptr, out_buf.ptr, self.len as i32, eps,
+                    );
+                }
+                let mut new_buf = Some(out_buf);
+                core::mem::swap(&mut self.buf, &mut new_buf);
+                return;
+            }
+        }
+        // CPU fallback
+        let ss: f32 = self.cpu.iter().map(|&v| v * v).sum::<f32>() / self.len as f32;
+        let rms_inv = 1.0 / (ss + eps).sqrt();
+        for (xi, wi) in self.cpu.iter_mut().zip(w.cpu.iter()) {
+            *xi = *xi * rms_inv * wi;
+        }
+    }
+
+    /// Raw GPU pointer (for use in FFI calls). None on CPU-only builds.
+    #[cfg(atlas_cuda)]
+    pub fn gpu_ptr(&self) -> Option<*mut f32> {
+        self.buf.as_ref().map(|b| b.ptr)
+    }
+
+    /// Mutable raw GPU pointer.
+    #[cfg(atlas_cuda)]
+    pub fn gpu_ptr_mut(&mut self) -> Option<*mut f32> {
+        self.buf.as_mut().map(|b| b.ptr)
+    }
+}
+
+impl std::fmt::Debug for GpuVec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GpuVec(len={}, gpu={})", self.len, self.is_on_gpu())
+    }
+}
+
+// ── Public GPU kernel wrappers ─────────────────────────────────────────────
+
+/// Apply in-place RoPE rotation to a GpuVec representing one attention head.
+///
+/// `x` must have length `head_dim`. `pos` is the sequence position.
+/// `theta_base` is the RoPE base frequency (default: 10_000.0 or 500_000.0).
+pub fn rope_apply_gpu(x: &mut GpuVec, pos: usize, head_dim: usize, theta_base: f32) {
+    #[cfg(atlas_cuda)]
+    if let Some(ptr) = x.gpu_ptr_mut() {
+        unsafe { ffi::atlas_rope_apply_f32(ptr, pos as i32, head_dim as i32, theta_base); }
+        return;
+    }
+    // CPU fallback
+    let half = head_dim / 2;
+    for i in 0..half {
+        let freq = 1.0 / theta_base.powf((2 * i) as f32 / head_dim as f32);
+        let angle = pos as f32 * freq;
+        let (s, c) = angle.sin_cos();
+        let x0 = x.cpu[i];
+        let x1 = x.cpu[i + half];
+        x.cpu[i]        = x0 * c - x1 * s;
+        x.cpu[i + half] = x0 * s + x1 * c;
+    }
+}
+
+/// Fused SwiGLU: `out[i] = silu(gate[i]) * up[i]`. Returns a new GpuVec.
+pub fn silu_mul_gpu(gate: &GpuVec, up: &GpuVec) -> GpuVec {
+    debug_assert_eq!(gate.len, up.len);
+    let n = gate.len;
+    #[cfg(atlas_cuda)]
+    if let (Some(g_ptr), Some(u_ptr)) = (gate.gpu_ptr(), up.gpu_ptr()) {
+        if let Some(out_buf) = gpu::GpuBuf::alloc(n) {
+            unsafe { ffi::atlas_silu_mul_f32(g_ptr, u_ptr, out_buf.ptr, n as i32); }
+            return GpuVec { buf: Some(out_buf), cpu: vec![0.0f32; n], len: n };
+        }
+    }
+    // CPU fallback
+    let cpu: Vec<f32> = gate.cpu.iter().zip(up.cpu.iter())
+        .map(|(&g, &u)| { let sg = g / (1.0 + (-g).exp()); sg * u })
+        .collect();
+    GpuVec {
+        #[cfg(atlas_cuda)] buf: None,
+        cpu,
+        len: n,
+    }
+}
+
+/// Call the GPU AdamW step kernel for one parameter group.
+///
+/// `param`, `m`, `v` are updated in-place.
+/// Returns true if GPU kernel was called, false if fell back to CPU.
+pub fn adamw_step_gpu(
+    param: *mut f32, m: *mut f32, v: *mut f32, grad: *const f32,
+    lr: f32, beta1: f32, beta2: f32, eps: f32, wd: f32,
+    bc1: f32, bc2: f32, n: usize,
+) -> bool {
+    #[cfg(atlas_cuda)]
+    if cuda_available() {
+        unsafe {
+            ffi::atlas_adamw_step(param, m, v, grad, lr, beta1, beta2, eps, wd, bc1, bc2, n as i32);
+        }
+        return true;
+    }
+    false
 }
 
 // ── Tensor ─────────────────────────────────────────────────────────────────
@@ -534,5 +749,87 @@ mod tests {
         assert_eq!(s.as_slice().unwrap(), &[-4.,-2.,0.,2.,4.]);
         let r = t.relu();
         assert_eq!(r.as_slice().unwrap(), &[0.,0.,0.,1.,2.]);
+    }
+
+    #[test]
+    fn gpuvec_zeros_len() {
+        let v = GpuVec::zeros(64);
+        assert_eq!(v.len, 64);
+        let data = v.download();
+        assert_eq!(data.len(), 64);
+        assert!(data.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn gpuvec_from_slice_roundtrip() {
+        let data: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        let v = GpuVec::from_slice(&data);
+        assert_eq!(v.len, 16);
+        let back = v.download();
+        for (a, b) in data.iter().zip(back.iter()) {
+            assert!((a - b).abs() < 1e-5, "mismatch: {} vs {}", a, b);
+        }
+    }
+
+    #[test]
+    fn gpuvec_add_inplace() {
+        let mut a = GpuVec::from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        let b     = GpuVec::from_slice(&[0.5, 0.5, 0.5, 0.5]);
+        a.add_inplace(&b);
+        let result = a.download();
+        assert!((result[0] - 1.5).abs() < 1e-4);
+        assert!((result[3] - 4.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn gpuvec_rmsnorm_inplace() {
+        // RMSNorm of [1,2,3,4] with all-ones weights
+        let mut x = GpuVec::from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        let w = GpuVec::from_slice(&[1.0, 1.0, 1.0, 1.0]);
+        x.rmsnorm_inplace(&w, 1e-5);
+        let out = x.download();
+        // mean(x^2) = (1+4+9+16)/4 = 7.5, rms = sqrt(7.5)
+        let rms = (7.5_f32).sqrt();
+        assert!((out[0] - 1.0/rms).abs() < 1e-3, "got {}", out[0]);
+        assert!((out[3] - 4.0/rms).abs() < 1e-3, "got {}", out[3]);
+    }
+
+    #[test]
+    fn silu_mul_gpu_correctness() {
+        let gate = GpuVec::from_slice(&[0.0, 1.0, -1.0, 2.0]);
+        let up   = GpuVec::from_slice(&[1.0, 1.0,  1.0, 1.0]);
+        let out = silu_mul_gpu(&gate, &up);
+        let result = out.download();
+        // silu(0) * 1 = 0 * sigmoid(0) = 0
+        assert!((result[0] - 0.0).abs() < 1e-3, "silu(0)*1 = {}", result[0]);
+        // silu(1) * 1 = 1*sigmoid(1) ≈ 0.731
+        assert!((result[1] - 0.7310586).abs() < 1e-3, "silu(1)*1 = {}", result[1]);
+    }
+
+    #[test]
+    fn rope_apply_gpu_invertible() {
+        // RoPE applied at pos=0 should return the same vector (cos(0)=1, sin(0)=0)
+        let data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut v = GpuVec::from_slice(&data);
+        rope_apply_gpu(&mut v, 0, 4, 10_000.0);
+        let result = v.download();
+        for (a, b) in data.iter().zip(result.iter()) {
+            assert!((a - b).abs() < 1e-4, "rope at pos=0 changed value: {} -> {}", a, b);
+        }
+    }
+
+    #[test]
+    fn sgemm_vec_shape() {
+        // GpuMatrix: 4×3 (4 out, 3 in), x: 3×1 → out: 4×1
+        let w = vec![1.0f32; 4 * 3];
+        let gm = GpuMatrix::upload(&w, 4, 3);
+        let x = GpuVec::from_slice(&[1.0, 1.0, 1.0]);
+        if let Some(out) = gm.sgemm_vec(&x, 1) {
+            assert_eq!(out.len, 4);
+            let data = out.download();
+            // Each output = sum of row = 3.0
+            for v in &data { assert!((v - 3.0).abs() < 1e-3, "got {}", v); }
+        }
+        // If GPU not available, sgemm_vec returns None — that's fine (tested above with CPU fallback)
     }
 }

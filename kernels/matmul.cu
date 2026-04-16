@@ -216,6 +216,76 @@ __global__ void quantize_int4_kernel(
     }
 }
 
+/* ─── RMSNorm kernel ─────────────────────────────────────────────────────── */
+/* x[n], w[n] → out[n]   out[i] = x[i] * w[i] / sqrt(mean(x^2) + eps) */
+__global__ void rmsnorm_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ w,
+    float*       __restrict__ out,
+    int n, float eps
+) {
+    /* One block, reduce over n elements using warp shuffles */
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        sum += x[i] * x[i];
+    /* warp-reduce */
+    for (int d = 16; d > 0; d >>= 1)
+        sum += __shfl_down_sync(0xffffffff, sum, d);
+    sum = __shfl_sync(0xffffffff, sum, 0);
+    /* inter-warp reduction via shared memory */
+    extern __shared__ float smem[];
+    if (threadIdx.x % 32 == 0) smem[threadIdx.x / 32] = sum;
+    __syncthreads();
+    if (threadIdx.x < (blockDim.x / 32)) {
+        sum = smem[threadIdx.x];
+        for (int d = (blockDim.x / 64); d > 0; d >>= 1)
+            sum += __shfl_down_sync(0xffffffff, sum, d);
+    }
+    float rms_inv = __rsqrtf(__shfl_sync(0xffffffff, sum, 0) / (float)n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        out[i] = x[i] * rms_inv * w[i];
+}
+
+/* ─── RoPE kernel ────────────────────────────────────────────────────────── */
+/* In-place RoPE for a single head: x[head_dim] rotated at position pos */
+__global__ void rope_apply_kernel(
+    float* __restrict__ x,
+    int pos, int head_dim, float theta_base
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int half = head_dim / 2;
+    if (i >= half) return;
+    float freq = 1.0f / powf(theta_base, (float)(2 * i) / (float)head_dim);
+    float angle = (float)pos * freq;
+    float c = cosf(angle);
+    float s = sinf(angle);
+    float x0 = x[i];
+    float x1 = x[i + half];
+    x[i]        = x0 * c - x1 * s;
+    x[i + half] = x0 * s + x1 * c;
+}
+
+/* ─── Fused SwiGLU: silu(gate) * up ─────────────────────────────────────── */
+__global__ void silu_mul_kernel(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float*       __restrict__ out,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    float silu_g = g / (1.0f + expf(-g));   /* silu(x) = x * sigmoid(x) */
+    out[i] = silu_g * up[i];
+}
+
+/* ─── VRAM→VRAM memcpy helper ────────────────────────────────────────────── */
+/* For KV cache writes that stay in VRAM */
+__global__ void copy_kernel(const float* src, float* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = src[i];
+}
+
 /* ─── C-callable host wrappers ───────────────────────────────────────────── */
 
 extern "C" {
@@ -301,6 +371,38 @@ int atlas_cuda_available(void) {
     int count = 0;
     cudaError_t err = cudaGetDeviceCount(&count);
     return (err == cudaSuccess && count > 0) ? 1 : 0;
+}
+
+void atlas_rmsnorm_f32(
+    const float* x, const float* w, float* out,
+    int n, float eps
+) {
+    int threads = MIN(256, n);
+    int smem = (threads / 32) * sizeof(float);
+    rmsnorm_kernel<<<1, threads, smem>>>(x, w, out, n, eps);
+    cudaDeviceSynchronize();
+}
+
+void atlas_rope_apply_f32(float* x, int pos, int head_dim, float theta_base) {
+    int half = head_dim / 2;
+    int threads = MIN(256, half);
+    int blocks  = (half + threads - 1) / threads;
+    rope_apply_kernel<<<blocks, threads>>>(x, pos, head_dim, theta_base);
+    cudaDeviceSynchronize();
+}
+
+void atlas_silu_mul_f32(const float* gate, const float* up, float* out, int n) {
+    int threads = 256;
+    int blocks  = (n + threads - 1) / threads;
+    silu_mul_kernel<<<blocks, threads>>>(gate, up, out, n);
+    cudaDeviceSynchronize();
+}
+
+void atlas_vram_copy_f32(const float* src, float* dst, int n) {
+    int threads = 256;
+    int blocks  = (n + threads - 1) / threads;
+    copy_kernel<<<blocks, threads>>>(src, dst, n);
+    cudaDeviceSynchronize();
 }
 
 } /* extern "C" */
