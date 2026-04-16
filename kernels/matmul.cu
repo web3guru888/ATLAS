@@ -240,8 +240,10 @@ __global__ void rmsnorm_kernel(
         sum = smem[threadIdx.x];
         for (int d = (blockDim.x / 64); d > 0; d >>= 1)
             sum += __shfl_down_sync(0xffffffff, sum, d);
+        if (threadIdx.x == 0) smem[0] = sum;
     }
-    float rms_inv = rsqrtf(__shfl_sync(0xffffffff, sum, 0) / (float)n + eps);
+    __syncthreads();
+    float rms_inv = rsqrtf(smem[0] / (float)n + eps);
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         out[i] = x[i] * rms_inv * w[i];
 }

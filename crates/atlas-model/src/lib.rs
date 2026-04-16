@@ -669,15 +669,12 @@ impl TransformerBlock {
         // If FFN GPU fails, continue — partial GPU is still better than nothing
     }
 
-    /// Process one token at position `pos`. Dispatches to GPU or CPU.
+    /// Process one token at position `pos` via the CPU path.
+    ///
+    /// The GPU path is available via `forward_token_gpu()` directly — call it
+    /// from `OlmoModel::forward_one_gpu()` which manages the full VRAM lifecycle.
     fn forward_token(&mut self, x: &mut Vec<f32>, pos: usize, rope: &RopeCache) {
-        if atlas_tensor::cuda_available() {
-            let mut gpu_x = atlas_tensor::GpuVec::from_slice(x);
-            self.forward_token_gpu(&mut gpu_x, pos, rope);
-            *x = gpu_x.download();
-        } else {
-            self.forward_token_cpu(x, pos, rope);
-        }
+        self.forward_token_cpu(x, pos, rope);
     }
 }
 
