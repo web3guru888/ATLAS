@@ -2,6 +2,8 @@
 
 Thank you for your interest in ATLAS! This document explains how to build, test, and contribute to the project.
 
+> **ATLAS is an open source contribution from [OpenHub Research](https://openhubresearch.org/) (Thailand)** — authored by Robin Dey. Contributions are welcome from the community under the terms below.
+
 ## Prerequisites
 
 - **Rust 1.75+** (stable toolchain)
@@ -194,3 +196,8 @@ By contributing, you agree that your contributions will be licensed under:
 ## Questions?
 
 Open an issue or reach out to the maintainers. We're happy to help!
+
+---
+
+ATLAS is maintained by **OpenHub Research** (Thailand) — https://openhubresearch.org/  
+Project website: https://atlasagi.org

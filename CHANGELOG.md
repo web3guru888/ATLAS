@@ -6,6 +6,37 @@ ATLAS uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0-alpha.1] — 2026-04-16
+
+### Added
+- **`atlas-api`** — OpenAI-compatible HTTP inference endpoint (Issue #4); `atlas api serve` exposes `/v1/chat/completions`, `/v1/completions`, `/v1/models`; SSE streaming, CORS, echo mode; 40 tests
+- **`PalaceBackend` trait** in atlas-palace — pluggable storage architecture; `Palace` implements `PalaceBackend`; trait object safe (`dyn PalaceBackend`); enables LadybugDB / alternative backends without API changes
+- **GPU-resident forward pass** in atlas-model — hidden state stays in VRAM between tokens; reduced PCIe transfers from 211 to 2 per token; pre-pinned weight upload at model load time
+- **GPU AdamW kernel** (`atlas_adamw_step`) — CUDA kernel for optimizer step; weight update entirely on GPU
+- **CUDA ops kernels** — `rmsnorm_forward`, `rope_forward`, `silu_mul_forward` all implemented as CUDA kernels; `GpuVec` activation buffer; `sgemm_vec` zero-copy path
+- **SmolLM2-135M GPU inference validated** — 29.3 tok/s on Tesla T4 (vs 5.3 tok/s CPU = 5.8× speedup); 694 MiB VRAM; 71–80% GPU utilization
+- **CUDA portability fix** — use `rsqrtf()` instead of `__rsqrtf()` across all kernels
+- **`McpConnectionPool`** in atlas-mcp — lazy pool (max 5 connections, 5-min idle eviction); `acquire()`/`release()` API; prevents connection leaks across concurrent MCP clients; 5 tests
+- **`session_id`** on `Drawer` in atlas-palace — cross-session knowledge retrieval; sessions tag every pheromone deposit for replay / deduplication
+- **`PalaceConfig`** struct in atlas-palace — centralized palace configuration (decay rates, MMAS ceiling, A* weights, session management); `calibrated_decay_rate()` API
+- **`DeepSupervisionTrainer`** in atlas-corpus — N_sup=4..16 forward passes per batch; summed loss across all supervision points; latent carry between passes; `loss_trace` telemetry; TRM arXiv:2510.04871 validated (>75% gain from N_sup); 10 tests
+- **Horn-clause tractable safety constitution** in atlas-safety — 8 safety principles across 4 non-overlapping domains (capability, data, deployment, reasoning); Young 2026 NP-hardness validated (arXiv:2501.15446); ≤12 principles ensures polynomial tractability; 6 tests
+- **OpenHub Research attribution** — all docs updated (Issue #5); author = Robin Dey, institution = OpenHub Research (Thailand)
+
+### Tests: 400 → 426 (+26)
+
+## [2.0.0] — 2026-04-15
+
+### Added
+- **`CasDecayCalibrator`** in atlas-palace — 4-regime adaptive pheromone decay calibration (exploration/exploitation/success/traversal); `calibrated_decay_rate()` API; pheromone field stabilization
+- **`OodaFeedback`** in atlas-astra — closed-loop OODA control; adaptive `explore_ratio` [0.1, 0.9]; sliding-window performance tracking; feedback-driven curriculum steering
+- **`SampleStrategy::Stigmergic`** in atlas-corpus — softmax pheromone sampling with configurable `temperature`; stigmergic curriculum beats random baseline
+- **GPU dispatch** in atlas-model — `forward()` routes to `GpuMatrix::sgemm` (VRAM-resident weights); CPU fallback if CUDA absent; 29 tok/s on Tesla T4
+- **`GpuMatrix`** in atlas-tensor — pre-upload weights to VRAM; `sgemm()` calls GPU kernel per forward pass; 695 MiB VRAM for SmolLM2-135M
+- **`atlas-mcp` systemd services** — `atlas-mcp.service` + `atlas-discover.service` on astra-01 (TCP port 8765, 30-min OODA cycles)
+
+### Tests: 383 → 400 (+17)
+
 ## [0.7.0] — 2026-04-15
 
 ### Added

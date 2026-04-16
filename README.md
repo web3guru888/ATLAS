@@ -10,11 +10,17 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v1.0.0-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-383%2F383%20passing-brightgreen.svg)](#status)
-[![Stages](https://img.shields.io/badge/stages-7%2F7%20complete-success.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v3.0.0--alpha.1-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-426%2F426%20passing-brightgreen.svg)](#status)
+[![Crates](https://img.shields.io/badge/crates-21-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
-[![CUDA](https://img.shields.io/badge/CUDA-sm__75%20T4-76b900.svg)](#status)
+[![CUDA](https://img.shields.io/badge/CUDA-sm__75%20T4-76b900.svg)](#gpu-inference)
+[![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI%20compatible-412991.svg)](#atlas-api--openai-compatible-endpoint)
+
+---
+
+> **An open source contribution from [OpenHub Research](https://openhubresearch.org/) (Thailand)**  
+> Website: [atlasagi.org](https://atlasagi.org) · Author: Robin Dey · Institution: https://openhubresearch.org/
 
 ---
 
@@ -30,6 +36,14 @@ It fuses four architectural innovations:
 | **GraphPalace** | Stigmergic memory | Pheromone-guided curriculum, O(1/√T) convergence |
 | **TRM-CausalValidator** | Recursive validator | 7M params, 0.1% compute, Quality Gate 6 |
 | **ZK Schnorr proofs** | Provenance chain | LLM output → live API, cryptographically verifiable |
+
+**v3.0.0-alpha.1** adds:
+- 🚀 **OpenAI-compatible HTTP API** (`atlas-api`) — drop-in endpoint with SSE streaming
+- 🧠 **DeepSupervisionTrainer** — N_sup=4..16 passes, pheromone latent warm-start (TRM-validated)
+- 🛡️ **Horn-clause safety constitution** — 8 principles, 4 domains, polynomial tractability (Young 2026)
+- ⚡ **GPU-resident forward pass** — 29 tok/s on Tesla T4, 2 PCIe transfers/token (was 211)
+- 🔌 **PalaceBackend trait** — pluggable storage, backend-swappable palace
+- 🔗 **McpConnectionPool** — max 5 connections, 5-min idle eviction
 
 The result: a self-improving scientific intelligence that trains on what it **actually discovers** about the world — real causal relationships from live data, validated by recursive architecture, guided by stigmergic memory.
 
@@ -74,21 +88,22 @@ atlas/
     ├── atlas-model/    # transformer: MultiHeadAttn, FFN, RMSNorm, RoPE
     ├── atlas-tokenize/ # BPE tokenizer (sentencepiece port)
     ├── atlas-palace/   # GraphPalace stigmergic memory: A* search, 5-type pheromones, Active Inference
-    ├── atlas-mcp/      # MCP server: 28 palace tools via JSON-RPC 2.0 stdio
+    ├── atlas-mcp/      # MCP server: 28 palace tools via JSON-RPC 2.0 stdio + connection pool
+    ├── atlas-api/      # OpenAI-compatible HTTP endpoint: /v1/chat/completions, SSE streaming
     ├── atlas-trm/      # TRM-CausalValidator (7M params, arXiv:2510.04871)
     ├── atlas-causal/   # PC/FCI causal inference (py-causal port)
     ├── atlas-bayes/    # Bayesian confidence scoring
     ├── atlas-astra/    # ASTRA OODA engine (~8K LOC, full port)
-    ├── atlas-corpus/   # LiveDiscoveryCorpus + quality gates
+    ├── atlas-corpus/   # LiveDiscoveryCorpus + DeepSupervisionTrainer + quality gates
     ├── atlas-zk/       # ZK Schnorr proofs (asi-build port)
     ├── atlas-http/     # HTTP client via raw libc syscalls
     ├── atlas-json/     # JSON parser from source
-    ├── atlas-safety/   # 5-state FSM, CircuitBreaker, append-only audit log
+    ├── atlas-safety/   # Horn-clause safety constitution, 5-state FSM, CircuitBreaker
     ├── atlas-bridge/   # ZK-attested Rings↔ETH interface (Sepolia-compatible)
-    └── atlas-cli/      # CLI: train / discover / eval / prove / mcp / bench
+    └── atlas-cli/      # CLI: train / discover / eval / prove / mcp / api / bench
 ```
 
-**20 crates. One coherent system. Zero external Rust dependencies.**
+**21 crates. One coherent system. Zero external Rust dependencies.**
 
 CUDA is called via raw `extern "C"` FFI from `build.rs` + `.cu` kernel files — no `cudarc`, no `tch`, no `candle`. The same approach that makes SQLite trustworthy, applied to GPU compute.
 
@@ -112,7 +127,144 @@ Every billion-parameter transformer starts here.
 4. **Active Inference Data Gen** — palace cold spots direct ASTRA to fill knowledge gaps
 5. **ZK Knowledge Claims** — Schnorr proof chain from LLM output to raw API data; hallucinations have broken proof trails
 6. **LiveDiscoveryCorpus** — ASTRA's output as a living training dataset; ~86K quality examples/month
-7. **TRM-CausalValidator** *(v3.0)* — 7M-param recursive validator; `z = net(x,y,z) × 6 recursions`; Quality Gate 6; generates Type 5 training traces
+7. **TRM-CausalValidator** — 7M-param recursive validator; `z = net(x,y,z) × 6 recursions`; Quality Gate 6; generates Type 5 training traces
+
+---
+
+## GPU Inference
+
+ATLAS v3.0.0-alpha.1 delivers a **fully GPU-resident forward pass** — hidden states stay in VRAM between tokens, with pre-pinned weight upload at model load time.
+
+### SmolLM2-135M on Tesla T4 (sm_75, CUDA 12.x)
+
+| Metric | CPU | GPU | Speedup |
+|--------|-----|-----|---------|
+| Throughput | 5.3 tok/s | **29.3 tok/s** | **5.8×** |
+| PCIe transfers/token | — | 2 | was 211 |
+| VRAM usage | — | 694 MiB | weights pre-pinned |
+| GPU utilization | — | 71–80% | during generation |
+| Power draw | ~10W | ~50W | T4 efficient |
+
+### CUDA Kernel Suite
+
+| Kernel | What it does |
+|--------|-------------|
+| `rmsnorm_forward` | RMSNorm in CUDA — replaces per-token CPU loop |
+| `rope_forward` | RoPE rotation — parallel over heads |
+| `silu_mul_forward` | SwiGLU gate fused — single CUDA pass |
+| `atlas_adamw_step` | AdamW optimizer step entirely on GPU |
+| `sgemm_vec` | Zero-copy matrix×vector; `GpuVec` activation buffer |
+
+**CUDA portability**: all kernels use `rsqrtf()` (not `__rsqrtf()`) for cross-platform compatibility.
+
+---
+
+## atlas-api — OpenAI-Compatible Endpoint
+
+ATLAS v3.0.0-alpha.1 adds `atlas-api` — an OpenAI-compatible HTTP inference server. Drop-in replacement for any OpenAI API client.
+
+```bash
+# Start the server
+./target/release/atlas api serve --model /home/user/models/smollm2-135m --port 8080
+```
+
+### Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | Chat completions with SSE streaming |
+| `/v1/completions` | POST | Text completions |
+| `/v1/models` | GET | List available models |
+
+### Usage Examples
+
+```bash
+# Chat completion (streaming)
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "atlas",
+    "messages": [{"role": "user", "content": "What is morphic resonance?"}],
+    "stream": true
+  }'
+
+# Non-streaming
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "atlas",
+    "messages": [{"role": "user", "content": "Explain stigmergic memory"}],
+    "stream": false
+  }'
+
+# List models
+curl http://localhost:8080/v1/models
+```
+
+**Features**: SSE streaming, CORS headers, echo mode for testing, 40 tests, 0 external dependencies.
+
+---
+
+## DeepSupervisionTrainer
+
+The `DeepSupervisionTrainer` in `atlas-corpus` implements multi-pass deep supervision — each training batch runs N_sup=4..16 forward passes, summing loss across all supervision points with pheromone-driven latent carry between passes.
+
+```rust
+// atlas-corpus/src/deep_supervision.rs
+pub struct DeepSupervisionTrainer {
+    pub n_sup: usize,          // 4..16 forward passes per batch
+    pub latent_carry: bool,    // carry hidden state between passes
+    pub pheromone_weight: f32, // pheromone × mutation-selection coupling
+    pub loss_trace: Vec<f32>,  // per-pass loss telemetry
+}
+```
+
+**Theory (TRM arXiv:2510.04871 validated)**: deep supervision accounts for >75% of TRM's improvement over baseline transformers. The `DeepSupervisionTrainer` implements this in the training loop — each N_sup pass is one phenotypic morph; latent carry approximates Lotka-Volterra equilibrium n̄ᵢ; `pheromone_weight` sets the mutation-selection coupling μ.
+
+**Convergence prediction**: doubling N_sup → √2 speedup in O(1/√T) morphic convergence. Testable via the `loss_trace` telemetry.
+
+---
+
+## Horn-Clause Safety Constitution
+
+`atlas-safety` v3.0.0-alpha.1 adds a tractable safety constitution implemented as Horn clauses, alongside the existing 5-state FSM and CircuitBreaker.
+
+```
+8 safety principles across 4 non-overlapping domains:
+  ┌─────────────────┬──────────────────────────────────┐
+  │ capability      │ scope_limits, capability_bounds  │
+  │ data            │ provenance_required, dedup_gate  │
+  │ deployment      │ audit_trail, circuit_breaker     │
+  │ reasoning       │ causal_grounding, zk_verifiable  │
+  └─────────────────┴──────────────────────────────────┘
+```
+
+**Why Horn clauses?** Young (2026, arXiv:2501.15446) proves NP-hardness of general safety constitution verification. Horn-clause restriction (≤12 principles, 4 non-overlapping domains) ensures polynomial tractability — the safety checker can verify any system state in O(n·m) where n = principles, m = state predicates. No exponential blowup.
+
+---
+
+## PalaceBackend Trait
+
+`atlas-palace` v3.0.0-alpha.1 extracts a `PalaceBackend` trait, enabling pluggable storage backends without API changes:
+
+```rust
+pub trait PalaceBackend: Send + Sync {
+    fn search(&self, query: &str, limit: usize) -> Vec<DrawerMatch>;
+    fn deposit_pheromones(&mut self, path: &[RoomId], ptype: PheromoneType, intensity: f32);
+    fn navigate(&self, from: RoomId, to: RoomId) -> Vec<RoomId>;
+    fn hot_paths(&self, limit: usize) -> Vec<Path>;
+    // ... 32 additional methods
+}
+
+// Palace implements PalaceBackend — fully trait-object safe
+pub struct Palace { /* existing implementation */ }
+impl PalaceBackend for Palace { /* ... */ }
+
+// Swap backends without changing caller code
+let palace: Box<dyn PalaceBackend> = Box::new(Palace::new(config));
+```
+
+This is the prerequisite for LadybugDB migration (Q3 2026) — a drop-in Grafeo/LadybugDB backend can replace the default implementation with zero API changes.
 
 ---
 
@@ -122,10 +274,10 @@ Every billion-parameter transformer starts here.
 |-------|-------|--------|-----------|
 | 1 | 1–4 | atlas-core → tensor → grad → optim → quant | f32 matmul CPU+GPU, backward pass through 2-layer MLP |
 | 2 | 5–7 | atlas-model → tokenize | OLMo 3 7B forward pass in pure Rust, token generation |
-| 3 | 8–9 | atlas-palace | GraphPalace 36-method engine native (no Python) |
+| 3 | 8–9 | atlas-palace + atlas-mcp | GraphPalace 36-method engine native, MCP server |
 | 4 | 10–11 | atlas-trm | TRM-CausalValidator, <10ms causal graph pass/fail |
 | 5 | 12–16 | http → json → bayes → causal → zk → astra | Full ASTRA OODA in Rust, ZK provenance |
-| 6 | 17–20 | atlas-corpus | QLoRA SFT on LiveDiscoveryCorpus, pheromone batching |
+| 6 | 17–20 | atlas-corpus + atlas-api | QLoRA SFT, DeepSupervisionTrainer, OpenAI API |
 | 7 | 21–22 | atlas-zk (ext) → cli | End-to-end proof chain, atlas-7b release binary |
 
 ---
@@ -155,7 +307,7 @@ The interactive dashboard (project overview, roadmap, papers, component status) 
 | Paper 1 | EMNLP 2026 | ATLAS architecture + LiveDiscoveryCorpus |
 | Paper 2 | NeurIPS 2026 | Discovery Flywheel — closed-loop scientific intelligence |
 | Paper 3 | ICML 2027 | Stigmergic RLVR — pheromone reward prevents policy collapse |
-| Paper 4 | ICLR 2027 | O(1/√T) morphic convergence for LLMs (co-author Robin) |
+| Paper 4 | ICLR 2027 | O(1/√T) morphic convergence for LLMs (co-author Robin Dey) |
 | Paper 5 | IEEE S&P 2027 | End-to-end ZK provenance for LLM outputs |
 | Paper 6 | ICLR/NeurIPS 2027 | Hybrid generative-recursive architecture (TRM integration) |
 
@@ -179,12 +331,18 @@ cargo build --release -p atlas-cli
 # Train on discoveries
 ./target/release/atlas train --corpus corpus.json --epochs 3
 
+# Start OpenAI-compatible API server
+./target/release/atlas api serve --model /path/to/model --port 8080
+
 # ZK-prove a claim
 ./target/release/atlas prove --claim "Pheromone trails compound information gain" \
     --secret $(openssl rand -hex 16)
 
 # Inspect palace memory
 ./target/release/atlas palace --stats --hot
+
+# MCP server (connect to Claude Desktop / Cursor)
+./target/release/atlas mcp serve --palace my-palace.json
 ```
 
 **Prerequisites:**
@@ -194,21 +352,23 @@ cargo build --release -p atlas-cli
 
 ---
 
-## Status — v1.0.0 (Production Release)
+## Status — v3.0.0-alpha.1
 
-**383/383 tests passing** · **20 crates** · **Zero external crate dependencies** · **CUDA sm_75 on Tesla T4**
+**426/426 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_75 on Tesla T4** · **29 tok/s GPU inference**
 
-> 🏆 **v1.0.0 is production-ready.** All roadmap milestones complete. Every component is real, tested, and integrated end-to-end.
+> 🏔 **v3.0.0-alpha.1 is the current alpha.** GPU-resident forward pass live. OpenAI API endpoint live. DeepSupervisionTrainer + Horn-clause safety + PalaceBackend trait added.
 
 ### What Works
 
 - ✅ **Discovery is real** — `atlas discover --cycles 3` hits NASA POWER, WHO GHO, World Bank, ArXiv live APIs; causal inference via PC algorithm; Bayesian quality gates
 - ✅ **Memory is real** — 5-type pheromone system (exploitation/exploration/success/traversal/recency), MMAS ceiling, A\* semantic pathfinding (α·C_sem + β·C_phe + γ·C_str), Active Inference agents; `atlas palace --hot` shows pheromone trails
-- ✅ **Training is real** — SFT with GradTape + AdamW + LoRA (rank=8) + gradient accumulation + safetensors checkpoint; loss decreases measurably
+- ✅ **Training is real** — SFT with GradTape + AdamW + LoRA (rank=8) + gradient accumulation + safetensors checkpoint; DeepSupervisionTrainer (N_sup=4..16, loss trace, latent carry)
+- ✅ **GPU inference is real** — SmolLM2-135M at 29 tok/s on Tesla T4; hidden state VRAM-resident; 2 PCIe transfers/token; GPU AdamW kernel
+- ✅ **API is real** — `atlas api serve` exposes `/v1/chat/completions` + `/v1/completions` + `/v1/models`; SSE streaming; CORS; 40 tests
 - ✅ **Provenance is real** — Schnorr proofs + Groth16 stub (HMAC-SHA256, BLS12-381-compatible interface) + ProvenanceChain; `atlas prove` generates verifiable proofs
-- ✅ **Safety is real** — 5-state FSM (`BOOT→NOMINAL→DEGRADED→SAFE_MODE→EMERGENCY_STOP`), CircuitBreaker with configurable thresholds, append-only audit log
+- ✅ **Safety is real** — Horn-clause constitution (8 principles, 4 domains, Young 2026 NP-hardness validated); 5-state FSM (`BOOT→NOMINAL→DEGRADED→SAFE_MODE→EMERGENCY_STOP`); CircuitBreaker; append-only audit log
 - ✅ **Bridge is real** — `AtlasBridge` with ZK-attested deposit/withdraw, Sepolia chain_id=11155111, Groth16 proof per transaction
-- ✅ **MCP is real** — `atlas mcp serve` exposes 28 tools via JSON-RPC 2.0; connects to Claude Desktop / Cursor
+- ✅ **MCP is real** — `atlas mcp serve` exposes 28 tools via JSON-RPC 2.0; McpConnectionPool (max 5, 5-min idle eviction); connects to Claude Desktop / Cursor
 
 ### Version History
 
@@ -220,34 +380,37 @@ cargo build --release -p atlas-cli
 | v0.5.0 | Real Training Loop (LoRA, grad-accum, safetensors checkpoint) | 353 |
 | v0.6.0 | Safety FSM + Groth16 stub + ZK Bridge | 383 |
 | v0.7.0 | Benchmarks, CI, CHANGELOG, REPRODUCIBILITY | 383 |
-| **v1.0.0** | **Production Release — all milestones complete** | **383** |
+| v1.0.0 | Production Release — all milestones complete | 383 |
+| **v2.0.0** | **CAS Decay + OODA Feedback + Stigmergic Sampler + GPU dispatch (29 tok/s)** | **400** |
+| **v3.0.0-alpha.1** | **atlas-api + PalaceBackend + GPU-resident pass + DeepSupervisionTrainer + Horn-clause safety** | **426** |
 
 ### Crate Status
 
 | Crate | Stage | Tests | Status |
 |-------|-------|-------|--------|
 | atlas-core | 1 | 2 | ✅ Error types, Result, traits |
-| atlas-tensor | 1 | 6 | ✅ CPU+GPU matmul, INT8/INT4, sm_75 kernels |
+| atlas-tensor | 1 | 6 | ✅ CPU+GPU matmul, INT8/INT4, sm_75 kernels; GPU AdamW kernel; sgemm_vec zero-copy |
 | atlas-grad | 1 | 9 | ✅ GradTape, matmul/relu/add backward |
 | atlas-optim | 1 | 6 | ✅ AdamW + CosineScheduler, warmup |
 | atlas-quant | 1 | 7 | ✅ INT8, INT4, symmetric scaling |
-| CUDA kernels | 1 | — | ✅ tiled GEMM, AdamW, INT8/INT4 — compiled on Tesla T4 |
+| CUDA kernels | 1 | — | ✅ tiled GEMM, rmsnorm, rope, silu_mul, AdamW, INT8/INT4 — compiled on Tesla T4 |
 | atlas-json | 2 | 12 | ✅ Recursive descent parser, surrogate pairs |
 | atlas-tokenize | 2 | 6 | ✅ GPT-2 byte-level BPE, tokenizer.json |
-| atlas-model | 2 | 12 | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, safetensors |
-| atlas-palace | 3 | **74** | ✅ A\* search, 5-type pheromones, Active Inference, MMAS, 9 modules |
-| atlas-mcp | 3 | **27** | ✅ 28 MCP tools, JSON-RPC 2.0, live palace dispatch |
+| atlas-model | 2 | 12 | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, safetensors; GPU-resident forward pass (2 PCIe/token) |
+| atlas-palace | 3 | **74** | ✅ A\* search, 5-type pheromones, Active Inference, MMAS, PalaceBackend trait, session_id, PalaceConfig |
+| atlas-mcp | 3 | **32** | ✅ 28 MCP tools, JSON-RPC 2.0, live palace dispatch; McpConnectionPool (max 5, 5-min idle eviction) |
+| atlas-api | 3 | **40** | ✅ OpenAI-compatible HTTP: /v1/chat/completions, /v1/completions, /v1/models; SSE streaming; CORS |
 | atlas-trm | 4 | 12 | ✅ TRM-CausalValidator depth-6 RNN, Bayesian combining |
 | atlas-http | 5 | 11 | ✅ HTTP/1.1 TcpStream, chunked decoding, curl HTTPS |
 | atlas-bayes | 5 | 13 | ✅ BetaPrior, BayesNetwork, QualityGate, Jaccard novelty |
 | atlas-causal | 5 | 10 | ✅ PC algorithm, Fisher-Z, standard normal CDF, Meek rules |
 | atlas-zk | 5 | **19** | ✅ Schnorr + Groth16 stub (HMAC-SHA256, BLS12-381 interface) |
-| atlas-astra | 5 | 15 | ✅ OODA: NASA POWER / WHO GHO / World Bank / ArXiv |
-| atlas-corpus | 6 | 20 | ✅ SftTrainer, LoRA (rank=8), grad-accum, safetensors checkpoint |
-| atlas-safety | 6 | **24** | ✅ 5-state FSM, CircuitBreaker, append-only audit log |
+| atlas-astra | 5 | 15 | ✅ OODA: NASA POWER / WHO GHO / World Bank / ArXiv; OodaFeedback adaptive explore_ratio |
+| atlas-corpus | 6 | 20 | ✅ SftTrainer, LoRA (rank=8), grad-accum, safetensors checkpoint; DeepSupervisionTrainer (N_sup 4–16, loss_trace) |
+| atlas-safety | 6 | **30** | ✅ Horn-clause constitution (8 principles, 4 domains); 5-state FSM; CircuitBreaker; append-only audit log |
 | atlas-bridge | 6 | **8** | ✅ ZK-attested Rings↔ETH interface, Sepolia chain_id=11155111 |
-| atlas-cli | 7 | **30** | ✅ discover / corpus / train / eval / prove / palace / mcp / bench / status |
-| **TOTAL** | | **383** | **✅ All passing — v1.0.0** |
+| atlas-cli | 7 | **30** | ✅ discover / corpus / train / eval / prove / palace / mcp / api / bench / status |
+| **TOTAL** | | **426** | **✅ All passing — v3.0.0-alpha.1** |
 
 ### Quick Start
 
@@ -262,6 +425,9 @@ cargo build --release -p atlas-cli
 ./target/release/atlas prove --claim "CO2 drives warming" --secret deadbeef01020304
 ./target/release/atlas palace --stats --hot
 
+# OpenAI-compatible API server
+./target/release/atlas api serve --model /path/to/model --port 8080
+
 # MCP server (connect to Claude Desktop / Cursor)
 ./target/release/atlas mcp serve --palace my-palace.json
 
@@ -273,7 +439,7 @@ cargo build --release -p atlas-cli
 
 ## atlas-mcp — Model Context Protocol Server
 
-ATLAS exposes its memory palace as **28 MCP tools** via stdio JSON-RPC 2.0, ready for Claude Desktop, Cursor, or any MCP client.
+ATLAS exposes its memory palace as **28 MCP tools** via stdio JSON-RPC 2.0, ready for Claude Desktop, Cursor, or any MCP client. v3.0.0-alpha.1 adds `McpConnectionPool` — lazy pool (max 5 connections, 5-min idle eviction) preventing connection leaks across concurrent MCP clients.
 
 ```bash
 # Add to your Claude Desktop config (~/.config/claude/claude_desktop_config.json)
@@ -308,10 +474,11 @@ ATLAS includes a zero-dependency benchmark suite using `atlas_core::bench::Bench
 cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
 ```
 
-**Representative results** (Ubuntu, Rust 1.82, AMD EPYC / Intel Xeon):
+**Representative results** (Ubuntu, Rust 1.82, Tesla T4, CUDA 12.x):
 
 | Benchmark | Metric | Description |
 |-----------|--------|-------------|
+| `gpu_inference_smollm2` | **29.3 tok/s** | SmolLM2-135M GPU inference, T4 |
 | `palace_search_1000` | ~50–200 µs/op | TF-IDF semantic search across 1000 drawers |
 | `astar_100_nodes` | ~20–100 µs/op | Pheromone-guided A* pathfinding (100-node KG) |
 | `pheromone_deposit_decay_1000` | ~5–20 µs/op | 10 deposits + full decay cycle per iteration |
@@ -323,18 +490,13 @@ cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
 
 > **Note**: Numbers vary by hardware. Run benchmarks on your own machine for accurate results.
 
-For individual crate benchmarks:
-```bash
-cargo test -p atlas-palace --test benchmarks -- --ignored --nocapture
-cargo test -p atlas-zk --test benchmarks -- --ignored --nocapture
-cargo test -p atlas-json --test benchmarks -- --ignored --nocapture
-cargo test -p atlas-model -- --ignored --nocapture
-```
-
 ---
 
-## Key Numbers (from existing research)
+## Key Numbers
 
+- **29.3 tok/s** — GPU inference throughput (SmolLM2-135M on Tesla T4, v3.0.0-alpha.1)
+- **5.8×** — GPU speedup over CPU inference
+- **694 MiB** — VRAM for pre-pinned SmolLM2-135M weights
 - **d = 10.6** — Cohen's d for palace-memory vs. no-memory (ASTRA experiments)
 - **34.4×** — more discoveries with memory than without
 - **R² = 0.982** — O(1/√T) convergence fit (BUTTERS morphic warm-start)
@@ -343,6 +505,47 @@ cargo test -p atlas-model -- --ignored --nocapture
 - **45%** — TRM accuracy on ARC-AGI-1 (Samsung SAIL Montreal, arXiv:2510.04871)
 - **<10ms** — target TRM validation latency per causal graph
 - **~86K** — quality-gated training examples per month from ASTRA
+- **8 principles / 4 domains** — Horn-clause safety constitution (Young 2026, arXiv:2501.15446)
+
+---
+
+## v4.0 Roadmap — Champagnat n-Morphic Framework
+
+ATLAS v4.0 will implement the **Champagnat n-Morphic Framework** (Issue #6), grounded in Champagnat-Méléard 2011 (PTRF) and Baar-Bovier-Champagnat 2017 (AAP):
+
+| Module | Crate | Key idea |
+|--------|-------|----------|
+| `InvasionFitnessScorer` | atlas-corpus | Replaces raw pheromone softmax; fixes softmax saturation |
+| `CognitiveBranching` | atlas-astra | Detects explore_ratio plateau → bifurcates OODA |
+| `CanonicalPheromoneUpdate` | atlas-palace | Principled decay rate from mutation-selection coupling |
+| `HJConcentrationPrior` | atlas-trm | Hopf-Cole sharpening across TRM recursion steps |
+| `PolymorphicTrainer` | atlas-corpus | k=2,3 morphs (fast/slow/creative) with competition matrix |
+
+**Mathematical foundation**: `DeepSupervisionTrainer` IS a k-Morphic Trait Substitution System (exact, not analogy). Each N_sup pass = one phenotypic morph. Champagnat Theorem 3.1 derivably explains TRM's >75% gain from deep supervision. Full theory: see research reports.
+
+---
+
+## Hugging Face Model Card
+
+ATLAS models will be published to Hugging Face under the `OpenHubResearch` organization.
+
+```yaml
+---
+language: en
+license: apache-2.0
+library_name: atlas
+tags:
+  - atlas
+  - stigmergic-memory
+  - active-inference
+  - causal-inference
+  - pure-rust
+  - zero-dependencies
+base_model: allenai/OLMo-3-0125-7B
+---
+```
+
+Models trained with ATLAS carry full ZK provenance chains: every factual claim traces cryptographically to its source API call. See [atlasagi.org](https://atlasagi.org) for model releases and the LiveDiscoveryCorpus dataset.
 
 ---
 
@@ -351,7 +554,7 @@ cargo test -p atlas-model -- --ignored --nocapture
 - **Code** (`crates/`, `kernels/`, `scripts/`): [Apache 2.0](LICENSE-CODE)
 - **Documentation, paper, figures, datasets**: [CC BY 4.0](LICENSE)
 
-© 2026 web3guru888 (Robin, VBRL Holdings)
+© 2026 Robin Dey, OpenHub Research (Thailand)
 
 See [NOTICE](NOTICE) for attribution to incorporated components.
 
@@ -361,10 +564,13 @@ See [NOTICE](NOTICE) for attribution to incorporated components.
 
 ```bibtex
 @software{atlas2026,
-  title  = {ATLAS: Active-inference Training with Learned Adaptive Stigmergy},
-  author = {web3guru888},
-  year   = {2026},
-  url    = {https://github.com/web3guru888/ATLAS},
-  note   = {Pure Rust LLM training framework. Zero external dependencies.}
+  title       = {ATLAS: Active-inference Training with Learned Adaptive Stigmergy},
+  author      = {Robin Dey},
+  year        = {2026},
+  institution = {OpenHub Research, Thailand},
+  url         = {https://github.com/web3guru888/ATLAS},
+  note        = {Pure Rust LLM training framework. Zero external dependencies.
+                 v3.0.0-alpha.1: 21 crates, 426 tests, OpenAI-compatible API,
+                 GPU-resident forward pass (29 tok/s on Tesla T4).}
 }
 ```

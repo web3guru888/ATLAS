@@ -1,21 +1,25 @@
 ATLAS — Active-inference Training with Learned Adaptive Stigmergy
-Copyright (c) 2026 web3guru888 (Robin, VBRL Holdings)
+© 2026 Robin Dey, OpenHub Research (Thailand). All rights reserved under Apache 2.0.
 
 Licensed under the Apache License, Version 2.0 (code) and
 Creative Commons Attribution 4.0 International (documentation).
+
+Author: Robin Dey
+Institution: OpenHub Research (Thailand) — https://openhubresearch.org/
+Website: https://atlasagi.org
 
 ---
 
 This software incorporates concepts and architectural patterns from:
 
 1. GraphPalace — Stigmergic Memory Palace Engine
-   Copyright (c) 2026 web3guru888
+   Copyright (c) 2026 web3guru888 / OpenHub Research
    https://github.com/web3guru888/GraphPalace
    License: Apache 2.0
    Role: atlas-palace crate (PyO3 bindings stripped, pure Rust retained)
 
 2. BUTTERS — Morphic Resonance Simulation
-   Copyright (c) 2026 BUTTERS Research Group / VBRL Holdings
+   Copyright (c) 2026 Robin Dey / OpenHub Research
    https://github.com/web3guru888/morphic-resonance-sim
    License: CC BY 4.0 (paper), Apache 2.0 (code)
    Role: O(1/√T) convergence result (R²=0.982) underpins pheromone warm-start
@@ -31,6 +35,12 @@ This software incorporates concepts and architectural patterns from:
    https://huggingface.co/allenai/OLMo-3-0125-7B
    License: Apache 2.0
    Role: target model architecture for atlas-model crate
+
+5. SmolLM2-135M — Validated Inference Model
+   Copyright (c) 2024 Hugging Face
+   https://huggingface.co/HuggingFaceTB/SmolLM2-135M
+   License: Apache 2.0
+   Role: GPU inference validation on Tesla T4 (29.3 tok/s, v3.0.0-alpha.1)
 
 ---
 

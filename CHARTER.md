@@ -6,12 +6,16 @@
 > **v2.0 Updated**: 2026-04-15 — ASTRA-dev integration added  
 > **v3.0 Updated**: 2026-04-15 — TRM-CausalValidator added (Pillar 7); efficiency thesis grounded  
 > **v4.0 Updated**: 2026-04-15 — Pure Rust, zero-dependency implementation decision; SQLite philosophy applied to AI infrastructure  
-> **Status**: Architecture Phase  
+> **v5.0 Updated**: 2026-04-16 — v3.0.0-alpha.1 release; OpenHub Research attribution (Issue #5)  
+> **Status**: v3.0.0-alpha.1 — Active Development  
 > **Classification**: Flagship Research Project  
-> **Target hardware**: Single RTX 3090/4090 (24GB VRAM)  
+> **Target hardware**: Single RTX 3090/4090 (24GB VRAM); validated on Tesla T4 (29 tok/s)  
 > **Base model**: OLMo 3 7B (AllenAI, fully open, Apache 2.0)  
 > **Recursive validator**: TRM-CausalValidator (7M params, Samsung SAIL Montreal architecture)  
-> **Implementation language**: Pure Rust — zero Rust crate dependencies
+> **Implementation language**: Pure Rust — zero Rust crate dependencies  
+> **Author**: Robin Dey  
+> **Institution**: OpenHub Research (Thailand) — https://openhubresearch.org/  
+> **Website**: https://atlasagi.org
 
 ---
 
@@ -770,7 +774,7 @@ Every billion-parameter transformer starts here.
 |----------|--------------------|-----------------------|
 | **Portability** | Breaks when deps change | Compiles anywhere with rustc |
 | **Auditability** | ~50K LOC of transitive deps to read | Only atlas code to audit |
-| **Patents** | Contaminated by MIT/Apache-2.0 from all deps | Clean IP — 100% VBRL |
+| **Patents** | Contaminated by MIT/Apache-2.0 from all deps | Clean IP — 100% OpenHub Research |
 | **Deployment** | `cargo install` pulls internet | Single static binary, runs offline |
 | **Speed** | Limited by what crates provide | Tuned exactly to our tensor shapes |
 | **Security** | Supply chain attack surface | Zero supply chain — no attack surface |
@@ -828,7 +832,7 @@ This is not a better fine-tuning recipe. This is a different paradigm for what t
 
 ---
 
-> Document: v4.0  
-> Last updated: 2026-04-15  
+> Document: v5.0  
+> Last updated: 2026-04-16  
 > Next update: after Phase 1 first eval results  
-> Maintained by: FETCH-AGI / Robin / Kyall (VBRL Holdings)
+> Maintained by: FETCH-AGI / Robin Dey (OpenHub Research, Thailand) / Kyall
