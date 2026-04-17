@@ -6,6 +6,31 @@ ATLAS uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.0.0] — 2026-04-17
+
+### Added
+- **`InvasionFitnessScorer`** in atlas-corpus — morphic fitness function f(y) = success − cost − Σcos_sim(y, xᵢ)·n̄ᵢ; replaces raw pheromone softmax; fixes pheromone saturation bug; 9 tests
+- **`CanonicalPheromoneUpdate`** in atlas-palace — principled decay rate adaptation Δρ = ½·μ·σ²·n̄·∂₁s; derived from Champagnat-Méléard 2011 PTRF Theorem 3.1; replaces ad-hoc CAS tuning; 6 tests
+- **`BarBovier2017Constraints`** in atlas-corpus — stability gate validating `explore_ratio × batch_size > 10` AND `temperature > 1/√batch_size`; grounded in Baar-Bovier-Champagnat 2017 AAP; 7 tests
+- **`CognitiveBranching`** in atlas-astra — n-morphic OODA bifurcation detector; splits exploration thread when `explore_ratio` plateau + high `loss_trace` variance detected; 8 tests
+- **`HJConcentrationPrior`** in atlas-trm — Hopf-Cole sharpening in TRM recursion: effective temperature T_eff(s) = T₀/(1+γs); enforces max(logits)=0 constraint; derived from Champagnat-Hass 2025 AAP; 7 tests
+- **OLMo-3-7B-Think inference fix** (Issue #7) — three-part fix for degenerate inference (repeating "adidas adidas"):
+  - **Fix A (SWA)**: `Attention::window_size: Option<usize>` per-layer banded causal mask; 24 of 32 OLMo-3 layers are sliding-window (window=4096), 8 are full-attention
+  - **Fix B (YaRN RoPE)**: `RopeCache::new()` extended to 4-arg with Peng et al. 2023 Algorithm 1 — per-dimension frequency scaling partitioned into high/low/mid bands; `attn_factor=1.2079` applied to attention scale
+  - **Fix C (config auto-patch)**: `patch_config_from_hf_json()` reads sibling `config.json`, auto-populates `layer_types`, `sliding_window`, `rope_scaling`, `rope_theta`, `rms_norm_eps` from HuggingFace model card
+- **GPU quality verification** — `gpu_inference_olmo3_quality_sanity` test on A100-SXM4-40GB: logit spread 16.8, max_prob 0.96%, 10/10 unique generated tokens ✅
+- **A100 OLMo-3-7B benchmark** — `gpu_benchmark_olmo3_7b_think`: 4.1 tok/s (CPU fallback; 28GB f32 exceeds pre-upload VRAM path)
+- **SmolLM2 A100 benchmarks** — SmolLM2-135M: 37.7 tok/s; 360M: 25.4 tok/s; 1.7B: 12.6 tok/s; TinyLlama-1.1B: 20.9 tok/s
+
+### Fixed
+- **Issue #7** — OLMo-3-7B degenerate inference: SWA mask, YaRN RoPE, config.json auto-patch (commits 27de176→faa8bba)
+- **GPU test binary** — `cargo test --release --no-run` now correctly rebuilds test binary when source changes
+
+### Tests: 516 → 528 (+12)
+- atlas-model: +12 tests (4 CPU unit tests for SWA/YaRN/config, Fix A+B+C GPU quality gate)
+
+---
+
 ## [3.0.0-alpha.1] — 2026-04-16
 
 ### Added

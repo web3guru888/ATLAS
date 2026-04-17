@@ -12,8 +12,8 @@ authors:
     affiliation: OpenHub Research
     country: TH
     website: https://openhubresearch.org/
-version: 3.0.0-alpha.1
-date-released: "2026-04-16"
+version: 4.0.0
+date-released: "2026-04-17"
 license: Apache-2.0
 license-url: https://github.com/web3guru888/ATLAS/blob/main/LICENSE
 repository-code: https://github.com/web3guru888/ATLAS
