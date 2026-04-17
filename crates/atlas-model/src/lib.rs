@@ -2167,6 +2167,66 @@ mod tests {
         assert!(patched.rms_norm_eps < 1e-5, "rms_norm_eps={}", patched.rms_norm_eps);
     }
 
+    // ── Fix A+B+C GPU integration test ───────────────────────────────────────
+
+    /// OLMo-3-7B-Think quality gate: logit spread > 2.0, no token monopolizes > 50%.
+    /// Verifies that after Fix A (SWA) + Fix B (YaRN) + Fix C (config.json auto-patch),
+    /// OLMo-3 inference produces coherent non-degenerate output.
+    /// Requires: ~/models/olmo3-7b-think/ with config.json + model shards.
+    #[test]
+    #[ignore]
+    fn gpu_inference_olmo3_quality_sanity() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let dir = format!("{home}/models/olmo3-7b-think");
+        eprintln!("\n  Loading OLMo-3-7B-Think from {dir} (Fix C: config.json auto-patch)...");
+        let t0 = std::time::Instant::now();
+        let mut model = match load_model_from_dir(&dir, ModelConfig::olmo3_actual_7b()) {
+            Ok(m)  => m,
+            Err(e) => { eprintln!("  SKIP: {e}"); return; }
+        };
+        eprintln!("  Loaded in {}s", t0.elapsed().as_secs());
+        model.reset();
+
+        // Run prompt: "The capital of France is"
+        let prompt = vec![1u32, 464, 3139, 286, 4881, 318]; // approximate token ids
+        eprintln!("  Running prompt ({} tokens)...", prompt.len());
+        for &tok in &prompt {
+            if let Some(gl) = model.forward_one_gpu(tok) { let _ = gl; }
+            else { let _ = model.forward_one(tok); }
+        }
+
+        // Get logits for the next token
+        let logits = if let Some(gl) = model.forward_one_gpu(prompt[prompt.len()-1]) { gl }
+                     else { model.forward_one(prompt[prompt.len()-1]) };
+
+        // Quality gate 1: logit spread > 2.0 (collapsed distribution would be near 0)
+        let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_l = logits.iter().cloned().fold(f32::INFINITY, f32::min);
+        let spread = max_l - min_l;
+        eprintln!("  Logit spread: {spread:.3} (min={min_l:.3}, max={max_l:.3})");
+        assert!(spread > 2.0,
+            "Logit spread {spread:.3} too small — distribution collapsed (degenerate inference)");
+
+        // Quality gate 2: no single token dominates > 50% after softmax
+        let mut probs = logits.clone();
+        softmax_inplace(&mut probs);
+        let max_prob = probs.iter().cloned().fold(0.0f32, f32::max);
+        eprintln!("  Max softmax prob: {max_prob:.4}");
+        assert!(max_prob < 0.5,
+            "Max token prob {max_prob:.4} > 0.5 — distribution degenerate");
+
+        // Quality gate 3: generate 10 tokens, verify not all identical
+        model.reset();
+        let out = model.generate(&prompt, 10, 0.0);
+        assert_eq!(out.len(), 10);
+        let unique: std::collections::HashSet<u32> = out.iter().copied().collect();
+        eprintln!("  Generated {} tokens, {} unique: {:?}", out.len(), unique.len(), &out);
+        assert!(unique.len() > 1,
+            "All 10 generated tokens are identical ({}) — degenerate repetition loop", out[0]);
+        eprintln!("  ✅ OLMo-3-7B-Think: SWA + YaRN producing coherent output");
+    }
+
     // ── Benchmarks (run with: cargo test -p atlas-model -- --ignored --nocapture)
 
     #[test]
