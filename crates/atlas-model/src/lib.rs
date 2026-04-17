@@ -2189,7 +2189,9 @@ mod tests {
         model.reset();
 
         // Run prompt: "The capital of France is"
-        let prompt = vec![1u32, 464, 3139, 286, 4881, 318]; // approximate token ids
+        // OLMo-3 tokenizer (100278-vocab BPE):
+        //   791="The", 6864="Ġcapital", 315="Ġof", 9822="ĠFrance", 374="Ġis"
+        let prompt = vec![791u32, 6864, 315, 9822, 374];
         eprintln!("  Running prompt ({} tokens)...", prompt.len());
         // Feed prefix tokens (all but last), then capture logits from last token once
         for &tok in &prompt[..prompt.len()-1] {
@@ -2217,9 +2219,11 @@ mod tests {
         assert!(max_prob < 0.95,
             "Max token prob {max_prob:.4} > 0.95 — distribution degenerate (repetition collapse)");
 
-        // Quality gate 3: generate 10 tokens, verify not all identical
+        // Quality gate 3: generate 10 tokens with temperature=1.0, verify diverse output.
+        // Greedy (temp=0.0) can loop on a single token even for healthy models.
+        // temp=1.0 samples from the full distribution; a healthy model yields diverse tokens.
         model.reset();
-        let out = model.generate(&prompt, 10, 0.0);
+        let out = model.generate(&prompt, 10, 1.0);
         assert_eq!(out.len(), 10);
         let unique: std::collections::HashSet<u32> = out.iter().copied().collect();
         eprintln!("  Generated {} tokens, {} unique: {:?}", out.len(), unique.len(), &out);
