@@ -10,7 +10,7 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v4.0.0-success.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v4.0.2-success.svg)](#status)
 [![Tests](https://img.shields.io/badge/tests-528%2F528%20passing-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-21-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
@@ -44,6 +44,11 @@ It fuses four architectural innovations:
 - 🔀 **CognitiveBranching** — n-morphic OODA bifurcation on plateau detection
 - 🔆 **HJConcentrationPrior** — Hopf-Cole sharpening T_eff(s) = T₀/(1+γs) in TRM recursion
 - 🔧 **Issue #7 fix** — OLMo-3-7B SWA (24/32 sliding layers, window=4096) + YaRN RoPE + config.json auto-patch
+
+**v4.0.2** — BF16 GPU Inference Path (Issue #9):
+- ⚡ **BF16 W16A32** — weights in BF16 (14 GB) vs f32 (28 GB); `GpuBufBf16`, `GpuBufKind`, `upload_bf16()` in atlas-tensor
+- 🔥 **GEMV kernels** — `sgemv_bf16_kernel` + `sgemv_f32_kernel`: one-warp-per-row for N=1 decode; fixes 32× tiled-GEMM inefficiency
+- 🚀 **OLMo-3-7B-Think: 4.1 → 19.9 tok/s** (4.8× speedup, A100-SXM4-40GB, W16A32)
 
 The result: a self-improving scientific intelligence that trains on what it **actually discovers** about the world — real causal relationships from live data, validated by recursive architecture, guided by stigmergic memory.
 
@@ -352,18 +357,18 @@ cargo build --release -p atlas-cli
 
 ---
 
-## Status — v4.0.0
+## Status — v4.0.2
 
 **528/528 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **37.7 tok/s GPU inference**
 
-> 🏔 **v4.0.0 is the current release.** GPU-resident forward pass live. OpenAI API endpoint live. DeepSupervisionTrainer + Horn-clause safety + PalaceBackend trait added.
+> 🏔 **v4.0.2 is the current release.** BF16 GPU inference path live — OLMo-3-7B-Think at 19.9 tok/s (W16A32, 4.8× speedup). GPU-resident forward pass, OpenAI API, DeepSupervisionTrainer, Horn-clause safety, PalaceBackend trait.
 
 ### What Works
 
 - ✅ **Discovery is real** — `atlas discover --cycles 3` hits NASA POWER, WHO GHO, World Bank, ArXiv live APIs; causal inference via PC algorithm; Bayesian quality gates
 - ✅ **Memory is real** — 5-type pheromone system (exploitation/exploration/success/traversal/recency), MMAS ceiling, A\* semantic pathfinding (α·C_sem + β·C_phe + γ·C_str), Active Inference agents; `atlas palace --hot` shows pheromone trails
 - ✅ **Training is real** — SFT with GradTape + AdamW + LoRA (rank=8) + gradient accumulation + safetensors checkpoint; DeepSupervisionTrainer (N_sup=4..16, loss trace, latent carry)
-- ✅ **GPU inference is real** — SmolLM2-135M at 37.7 tok/s on A100-SXM4-40GB; OLMo-3-7B-Think at 4.1 tok/s (CPU fallback, 28GB f32); SWA + YaRN RoPE (Issue #7 fixed)
+- ✅ **GPU inference is real** — SmolLM2-135M at 37.7 tok/s on A100-SXM4-40GB; OLMo-3-7B-Think at **19.9 tok/s** (BF16 GPU, W16A32, 14 GB VRAM — Issue #9 fixed); SWA + YaRN RoPE (Issue #7 fixed)
 - ✅ **API is real** — `atlas api serve` exposes `/v1/chat/completions` + `/v1/completions` + `/v1/models`; SSE streaming; CORS; 40 tests
 - ✅ **Provenance is real** — Schnorr proofs + Groth16 stub (HMAC-SHA256, BLS12-381-compatible interface) + ProvenanceChain; `atlas prove` generates verifiable proofs
 - ✅ **Safety is real** — Horn-clause constitution (8 principles, 4 domains, Young 2026 NP-hardness validated); 5-state FSM (`BOOT→NOMINAL→DEGRADED→SAFE_MODE→EMERGENCY_STOP`); CircuitBreaker; append-only audit log
@@ -384,13 +389,15 @@ cargo build --release -p atlas-cli
 | **v2.0.0** | **CAS Decay + OODA Feedback + Stigmergic Sampler + GPU dispatch (37.7 tok/s on A100)** | **400** |
 | **v3.0.0-α.1** | **atlas-api + PalaceBackend + GPU-resident forward pass + DeepSupervisionTrainer + Horn-clause safety** | **426** |
 | **v4.0.0** | **Champagnat n-morphic framework + Issue #7 fix (SWA + YaRN RoPE + config.json auto-patch for OLMo-3-7B)** | **528** |
+| **v4.0.1** | **Docs + test cleanup for v4.0.0 / Issue #7** | **528** |
+| **v4.0.2** | **BF16 GPU inference path (Issue #9): OLMo-3-7B-Think 4.1 → 19.9 tok/s (4.8×), W16A32, GEMV kernels** | **528** |
 
 ### Crate Status
 
 | Crate | Stage | Tests | Status |
 |-------|-------|-------|--------|
 | atlas-core | 1 | 2 | ✅ Error types, Result, traits |
-| atlas-tensor | 1 | 6 | ✅ CPU+GPU matmul, INT8/INT4, sm_80 kernels (A100); GPU AdamW kernel; sgemm_vec zero-copy |
+| atlas-tensor | 1 | 6 | ✅ CPU+GPU matmul, INT8/INT4, sm_80 kernels (A100); GPU AdamW kernel; sgemm_vec zero-copy; **BF16 GEMV** (`GpuBufBf16`, `sgemv_bf16_kernel`, W16A32 inference path) |
 | atlas-grad | 1 | 9 | ✅ GradTape, matmul/relu/add backward |
 | atlas-optim | 1 | 6 | ✅ AdamW + CosineScheduler, warmup |
 | atlas-quant | 1 | 7 | ✅ INT8, INT4, symmetric scaling |
@@ -479,7 +486,8 @@ cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
 
 | Benchmark | Metric | Description |
 |-----------|--------|-------------|
-| `gpu_inference_smollm2` | **37.7 tok/s** | SmolLM2-135M GPU inference, A100 |
+| `gpu_inference_smollm2` | **37.7 tok/s** | SmolLM2-135M GPU inference (f32), A100-SXM4-40GB |
+| `gpu_benchmark_olmo3_7b_think_bf16` | **19.9 tok/s** | OLMo-3-7B-Think BF16 GPU inference (W16A32), A100-SXM4-40GB |
 | `palace_search_1000` | ~50–200 µs/op | TF-IDF semantic search across 1000 drawers |
 | `astar_100_nodes` | ~20–100 µs/op | Pheromone-guided A* pathfinding (100-node KG) |
 | `pheromone_deposit_decay_1000` | ~5–20 µs/op | 10 deposits + full decay cycle per iteration |
@@ -496,6 +504,7 @@ cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
 ## Key Numbers
 
 - **37.7 tok/s** — GPU inference throughput (SmolLM2-135M on A100-SXM4-40GB, v4.0.0)
+- **19.9 tok/s** — GPU inference throughput (OLMo-3-7B-Think, BF16 W16A32, A100-SXM4-40GB, v4.0.2; was 4.1 tok/s CPU = **4.8× speedup**)
 - **2.4×** — GPU speedup over CPU inference (SmolLM2-1.7B: 12.6 vs 5.2 tok/s)
 - **507 MiB** — VRAM for pre-pinned SmolLM2-135M weights
 - **d = 10.6** — Cohen's d for palace-memory vs. no-memory (ASTRA experiments)
@@ -510,9 +519,9 @@ cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
 
 ---
 
-## v4.0 Roadmap — Champagnat n-Morphic Framework
+## v4.0 — Champagnat n-Morphic Framework ✅ Implemented
 
-ATLAS v4.0 will implement the **Champagnat n-Morphic Framework** (Issue #6), grounded in Champagnat-Méléard 2011 (PTRF) and Baar-Bovier-Champagnat 2017 (AAP):
+ATLAS v4.0 implements the **Champagnat n-Morphic Framework** (Issue #6), grounded in Champagnat-Méléard 2011 (PTRF) and Baar-Bovier-Champagnat 2017 (AAP). All Tier 1 (Sprint 1+2) proposals are live as of v4.0.0:
 
 | Module | Crate | Key idea |
 |--------|-------|----------|
@@ -571,7 +580,7 @@ See [NOTICE](NOTICE) for attribution to incorporated components.
   institution = {OpenHub Research, Thailand},
   url         = {https://github.com/web3guru888/ATLAS},
   note        = {Pure Rust LLM training framework. Zero external dependencies.
-                 v4.0.0: 21 crates, 528 tests, OpenAI-compatible API,
-                 GPU-resident forward pass (37.7 tok/s on A100-SXM4-40GB).}
+                 v4.0.2: 21 crates, 528 tests, OpenAI-compatible API,
+                 BF16 GPU inference — OLMo-3-7B-Think 19.9 tok/s on A100-SXM4-40GB (W16A32).}
 }
 ```

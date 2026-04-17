@@ -6,6 +6,46 @@ ATLAS uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.0.2] — 2026-04-17
+
+### Added
+- **BF16 GPU inference path** (Issue #9) — W16A32: weights stored in BF16 (2 bytes/elem → 14 GB), activations remain f32; halves VRAM footprint vs f32 (28 GB)
+- **`GpuBufBf16`** in atlas-tensor — cudaMalloc/cudaMemcpy/cudaFree for `*mut u16` (BF16 = top 16 bits of f32, exact bit pattern, no precision loss)
+- **`GpuBufKind`** enum — `{ F32(GpuBuf), BF16(GpuBufBf16) }` discriminated union; `GpuMatrix.buf` now stores either precision; `is_bf16()` predicate
+- **`GpuMatrix::upload_bf16()`** — uploads raw BF16 bit patterns (`&[u16]`) to VRAM; returns `GpuBufKind::BF16`
+- **`sgemv_bf16_kernel`** CUDA kernel — one-warp-per-row GEMV for N=1 autoregressive decode: dequantizes BF16 on the fly, warp-reduce via `__shfl_down_sync`, `__ldg` on activation vector
+- **`sgemv_f32_kernel`** CUDA kernel — matching one-warp-per-row GEMV for F32 weights; fixes 32× inefficiency in tiled GEMM for N=1 (31/32 threads multiply against zero in TILE=32 grid)
+- **`atlas_sgemm_bf16_f32()`** FFI wrapper — dispatches to `sgemv_bf16_kernel` (N=1) or `sgemm_bf16_kernel` (N>1)
+- **`make_linear_bf16_aware()`** — if CUDA available and tensor is BF16-origin, converts f32 back to BF16 bit patterns and calls `upload_bf16()`; drops BF16 Vec after GPU upload to reclaim RAM
+- **`load_model_from_dir()`** — `HashSet<String>` tracking BF16 tensor names across all shards; routes to `make_linear_bf16_aware()` for each weight tensor
+- **`OlmoModel::gpu_weight_dtype_counts()`** — returns (bf16_count, f32_count) across all layer matrices for diagnostics
+- **`gpu_benchmark_olmo3_7b_think_bf16`** test (ignored) — validates full BF16 path end-to-end on A100
+- **`gpu_bf16_gemv_parity`** test (ignored) — validates BF16 GEMV kernel output matches CPU reference
+
+### Fixed
+- **Issue #9** — OLMo-3-7B-Think GPU throughput: 4.1 tok/s (CPU, f32 too large for pre-upload) → **19.9 tok/s** (GPU BF16, W16A32); **4.8× speedup** on A100-SXM4-40GB
+- **Tiled GEMM for N=1**: added GEMV fast path in `atlas_matmul_f32` (was using 32× wasteful tiled kernel for single-token decode)
+- **nvcc forward declaration**: `bf16u_to_f32` helper moved before GEMV kernels that reference it
+
+### Performance
+- OLMo-3-7B-Think on A100-SXM4-40GB: **4.1 → 19.9 tok/s** (4.8× speedup)
+- 224/224 OLMo-3-7B weight matrices now resident in BF16 VRAM
+- First-token latency: 33 ms | Load time: 109s
+
+### Tests: 528 / 528 (unchanged — existing GPU tests still pass)
+
+---
+
+## [4.0.1] — 2026-04-17
+
+### Changed
+- Docs, README, CHANGELOG, and CITATION.cff updated to reflect v4.0.0 / Issue #7
+- GPU quality gate test adjusted for tokenizer-agnostic validation
+
+### Tests: 528 / 528
+
+---
+
 ## [4.0.0] — 2026-04-17
 
 ### Added
