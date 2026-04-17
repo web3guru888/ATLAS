@@ -2442,6 +2442,59 @@ mod tests {
     }
 
     /// Load real SmolLM2-135M weights and run GPU inference end-to-end.
+    /// Issue #9: BF16 GEMV kernel correctness — GPU vs CPU parity.
+    ///
+    /// Directly calls GpuMatrix::upload_bf16 + sgemm_vec (N=1 GEMV path) and
+    /// compares against CPU matmul. Validates the sgemv_bf16_kernel.
+    #[test]
+    #[ignore]
+    fn gpu_bf16_gemv_parity() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        use atlas_tensor::GpuVec;
+
+        // Use a size that exercises the warp-reduce and multiple warps
+        let M = 128usize;  // output rows
+        let K = 256usize;  // input cols
+
+        // Random-ish f32 weight matrix
+        let w_f32: Vec<f32> = (0..M*K)
+            .map(|i| ((i * 6977 + 1231) % 10000) as f32 / 10000.0 - 0.5)
+            .collect();
+
+        // Convert f32 → BF16 (lossless for these values which are in BF16 range)
+        let w_bf16: Vec<u16> = w_f32.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
+
+        // f32 input vector
+        let x_f32: Vec<f32> = (0..K)
+            .map(|i| ((i * 3571 + 421) % 10000) as f32 / 10000.0 - 0.5)
+            .collect();
+
+        // CPU reference: y_ref[m] = Σ w_f32[m*K+k] * x_f32[k]
+        let mut y_ref = vec![0.0f32; M];
+        for m in 0..M {
+            for k in 0..K {
+                y_ref[m] += w_f32[m * K + k] * x_f32[k];
+            }
+        }
+
+        // GPU BF16 GEMV
+        let gpu_mat = atlas_tensor::GpuMatrix::upload_bf16(&w_bf16, M, K);
+        assert!(gpu_mat.is_bf16(), "expected BF16 GPU matrix");
+        let x_gpu = GpuVec::from_slice(&x_f32);
+        let y_gpu_vec = gpu_mat.sgemm_vec(&x_gpu, 1).expect("sgemm_vec returned None");
+        let y_gpu = y_gpu_vec.download();
+
+        // Compare (BF16→F32 introduces small rounding; allow 1% relative error)
+        let max_err = y_ref.iter().zip(y_gpu.iter())
+            .map(|(&r, &g)| (r - g).abs())
+            .fold(0.0f32, f32::max);
+        let max_abs = y_ref.iter().map(|&v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+        let rel_err = max_err / max_abs;
+        eprintln!("  BF16 GEMV {M}×{K}: max_abs_err={max_err:.4e} rel_err={rel_err:.4e}");
+        assert!(rel_err < 0.01,
+            "BF16 GEMV GPU/CPU mismatch: rel_err={rel_err:.4e} (expected <1%)");
+    }
+
     /// Requires: ~/models/smollm2-135m/model.safetensors
     #[test]
     #[ignore]

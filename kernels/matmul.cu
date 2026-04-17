@@ -293,6 +293,60 @@ __global__ void silu_mul_kernel(
     out[i] = silu_g * up[i];
 }
 
+/* ─── Efficient GEMV kernels for autoregressive inference (N=1) ─────────── */
+/*                                                                            */
+/* The tiled GEMM above is designed for large batch/prefill (N >> 1).        */
+/* For N=1 (one token at a time, the typical autoregressive decode step),    */
+/* one warp per row is optimal:                                               */
+/*   - All 32 threads stride over K, accumulate, then warp-reduce to lane 0. */
+/*   - Fully coalesced global memory access.                                  */
+/*   - x vector (~16 KB for d=4096) fits in L1/L2 cache and is shared.      */
+
+#define GEMV_ROWS_PER_BLOCK 8   /* warps (rows) per thread block */
+
+/* F32 GEMV: y[M] = A[M×K] (f32) × x[K] (f32) */
+__global__ void sgemv_f32_kernel(
+    const float* __restrict__ A,
+    const float* __restrict__ x,
+    float*       __restrict__ y,
+    int M, int K
+) {
+    int row = blockIdx.x * GEMV_ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= M) return;
+
+    const float* A_row = A + (ptrdiff_t)row * K;
+    float acc = 0.0f;
+    for (int k = threadIdx.x; k < K; k += 32)
+        acc += A_row[k] * __ldg(x + k);   /* __ldg: load via read-only cache */
+
+    /* Warp reduction: sum all 32 lanes into lane 0 */
+    for (int d = 16; d > 0; d >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, d);
+
+    if (threadIdx.x == 0) y[row] = acc;
+}
+
+/* BF16 weight × F32 activation GEMV: y[M] = A[M×K] (bf16) × x[K] (f32) */
+__global__ void sgemv_bf16_kernel(
+    const uint16_t* __restrict__ A,
+    const float*    __restrict__ x,
+    float*          __restrict__ y,
+    int M, int K
+) {
+    int row = blockIdx.x * GEMV_ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= M) return;
+
+    const uint16_t* A_row = A + (ptrdiff_t)row * K;
+    float acc = 0.0f;
+    for (int k = threadIdx.x; k < K; k += 32)
+        acc += bf16u_to_f32(A_row[k]) * __ldg(x + k);
+
+    for (int d = 16; d > 0; d >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, d);
+
+    if (threadIdx.x == 0) y[row] = acc;
+}
+
 /* ─── BF16 weight × F32 activation tiled GEMM (W16A32) ──────────────────── */
 /*                                                                            */
 /* BF16 is exactly the upper 16 bits of IEEE 754 f32.                        */
@@ -359,9 +413,17 @@ void atlas_matmul_f32(
     const float* A, const float* B, float* C,
     int M, int N, int K
 ) {
-    dim3 block(TILE, TILE);
-    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
-    matmul_tiled_kernel<<<grid, block>>>(A, B, C, M, N, K);
+    if (N == 1) {
+        /* Efficient GEMV path for autoregressive single-token decoding.
+         * ~32× fewer wasted FMAs vs tiled GEMM for N=1. */
+        dim3 block(32, GEMV_ROWS_PER_BLOCK);
+        dim3 grid((M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
+        sgemv_f32_kernel<<<grid, block>>>(A, B, C, M, K);
+    } else {
+        dim3 block(TILE, TILE);
+        dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+        matmul_tiled_kernel<<<grid, block>>>(A, B, C, M, N, K);
+    }
     cudaDeviceSynchronize();
 }
 
@@ -471,18 +533,24 @@ void atlas_vram_copy_f32(const float* src, float* dst, int n) {
     cudaDeviceSynchronize();
 }
 
-/* BF16 weight × F32 activation GEMM (W16A32).
- * A_bf16[M,K]: BF16 weights (uint16_t).
- * B[K,N]: F32 activations.
- * C[M,N]: F32 output.
- * Uses tiled GEMM with inline BF16→F32 conversion in shared memory. */
+/* BF16 weight × F32 activation GEMM / GEMV (W16A32).
+ * Dispatches to efficient GEMV kernel for N=1 (autoregressive decoding)
+ * or tiled GEMM for N>1 (prefill/batch). */
 void atlas_sgemm_bf16_f32(
     const uint16_t* A_bf16, const float* B, float* C,
     int M, int N, int K
 ) {
-    dim3 block(TILE, TILE);
-    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
-    sgemm_bf16_kernel<<<grid, block>>>(A_bf16, B, C, M, N, K);
+    if (N == 1) {
+        /* BF16 GEMV: one warp per row, coalesced loads, warp-reduce.
+         * ~32× fewer wasted FMAs vs tiled GEMM for N=1. */
+        dim3 block(32, GEMV_ROWS_PER_BLOCK);
+        dim3 grid((M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
+        sgemv_bf16_kernel<<<grid, block>>>(A_bf16, B, C, M, K);
+    } else {
+        dim3 block(TILE, TILE);
+        dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+        sgemm_bf16_kernel<<<grid, block>>>(A_bf16, B, C, M, N, K);
+    }
     cudaDeviceSynchronize();
 }
 
