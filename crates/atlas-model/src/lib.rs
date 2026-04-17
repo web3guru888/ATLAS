@@ -22,6 +22,36 @@ use atlas_tensor::Tensor;
 
 // ── Model configuration ────────────────────────────────────────────────────
 
+/// Per-layer attention type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayerType {
+    /// Full causal self-attention (attends to all prior tokens).
+    Full,
+    /// Sliding window attention: only attend to the last `sliding_window` tokens.
+    Sliding,
+}
+
+/// RoPE frequency-scaling configuration (Fix B: YaRN).
+#[derive(Debug, Clone)]
+pub enum RopeScaling {
+    /// Standard RoPE — no scaling (Llama, SmolLM2, TinyLlama).
+    None,
+    /// YaRN extended-context scaling (Peng et al. 2023, arXiv:2309.00071).
+    /// Used by OLMo-3 to extend context from 8K → 65K.
+    Yarn {
+        /// Context extension factor (e.g. 8.0 for 8× context extension).
+        factor: f32,
+        /// Original max position embeddings before extension.
+        orig_max_pos: usize,
+        /// Attention score scale multiplier (applied to QK^T / √d).
+        attn_factor: f32,
+        /// High-frequency boundary β_fast (default 32).
+        beta_fast: f32,
+        /// Low-frequency boundary β_slow (default 1).
+        beta_slow: f32,
+    },
+}
+
 /// Transformer model configuration.
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -37,57 +67,73 @@ pub struct ModelConfig {
     pub n_kv_heads: usize,
     /// FFN intermediate dimension (SwiGLU gate + up proj).
     pub ffn_hidden: usize,
-    /// Maximum sequence length.
+    /// Maximum sequence length (KV cache capacity).
     pub max_seq_len: usize,
     /// RoPE base frequency.
     pub rope_theta: f32,
     /// RMSNorm epsilon.
     pub rms_norm_eps: f32,
+    /// Per-layer attention type (Fix A: SWA). Empty = all Full.
+    /// Length must equal `n_layers` or be empty.
+    pub layer_types: Vec<LayerType>,
+    /// Sliding window size for SWA layers (Fix A). `None` = no SWA.
+    pub sliding_window: Option<usize>,
+    /// RoPE scaling (Fix B: YaRN). `RopeScaling::None` = standard RoPE.
+    pub rope_scaling: RopeScaling,
 }
 
 impl ModelConfig {
     /// Llama 3 8B / Llama 3.1 8B configuration (GQA, vocab=128256).
     pub fn llama3_8b() -> Self {
         Self {
-            vocab_size:   128_256,
-            d_model:      4096,
-            n_layers:     32,
-            n_heads:      32,
-            n_kv_heads:   8,
-            ffn_hidden:   14_336,
-            max_seq_len:  4096,
-            rope_theta:   500_000.0,
-            rms_norm_eps: 1e-5,
+            vocab_size:    128_256,
+            d_model:       4096,
+            n_layers:      32,
+            n_heads:       32,
+            n_kv_heads:    8,
+            ffn_hidden:    14_336,
+            max_seq_len:   4096,
+            rope_theta:    500_000.0,
+            rms_norm_eps:  1e-5,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 
     /// OLMo 3 1B (OLMo-2-0325-1B) configuration.
     pub fn olmo3_1b() -> Self {
         Self {
-            vocab_size:   100_352,
-            d_model:      2048,
-            n_layers:     16,
-            n_heads:      16,
-            n_kv_heads:   16,
-            ffn_hidden:   8192,
-            max_seq_len:  4096,
-            rope_theta:   500_000.0,
-            rms_norm_eps: 1e-5,
+            vocab_size:    100_352,
+            d_model:       2048,
+            n_layers:      16,
+            n_heads:       16,
+            n_kv_heads:    16,
+            ffn_hidden:    8192,
+            max_seq_len:   4096,
+            rope_theta:    500_000.0,
+            rms_norm_eps:  1e-5,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 
     /// Llama 3.2 1B configuration.
     pub fn llama32_1b() -> Self {
         Self {
-            vocab_size:   128_256,
-            d_model:      2048,
-            n_layers:     16,
-            n_heads:      32,
-            n_kv_heads:   8,
-            ffn_hidden:   8192,
-            max_seq_len:  131_072,
-            rope_theta:   500_000.0,
-            rms_norm_eps: 1e-5,
+            vocab_size:    128_256,
+            d_model:       2048,
+            n_layers:      16,
+            n_heads:       32,
+            n_kv_heads:    8,
+            ffn_hidden:    8192,
+            max_seq_len:   131_072,
+            rope_theta:    500_000.0,
+            rms_norm_eps:  1e-5,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 
@@ -95,15 +141,18 @@ impl ModelConfig {
     /// hidden=2048, layers=24, heads=32, kv_heads=32, ffn=8192, vocab=49152
     pub fn smollm2_1b7() -> Self {
         Self {
-            vocab_size:   49152,
-            d_model:      2048,
-            n_layers:     24,
-            n_heads:      32,
-            n_kv_heads:   32,
-            ffn_hidden:   8192,
-            max_seq_len:  8192,
-            rope_theta:   130_000.0,
-            rms_norm_eps: 1e-5,
+            vocab_size:    49152,
+            d_model:       2048,
+            n_layers:      24,
+            n_heads:       32,
+            n_kv_heads:    32,
+            ffn_hidden:    8192,
+            max_seq_len:   8192,
+            rope_theta:    130_000.0,
+            rms_norm_eps:  1e-5,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 
@@ -111,15 +160,18 @@ impl ModelConfig {
     /// hidden=960, layers=32, heads=15, kv_heads=5, ffn=2560, vocab=49152
     pub fn smollm2_360m() -> Self {
         Self {
-            vocab_size:   49152,
-            d_model:      960,
-            n_layers:     32,
-            n_heads:      15,
-            n_kv_heads:   5,
-            ffn_hidden:   2560,
-            max_seq_len:  8192,
-            rope_theta:   100_000.0,
-            rms_norm_eps: 1e-5,
+            vocab_size:    49152,
+            d_model:       960,
+            n_layers:      32,
+            n_heads:       15,
+            n_kv_heads:    5,
+            ffn_hidden:    2560,
+            max_seq_len:   8192,
+            rope_theta:    100_000.0,
+            rms_norm_eps:  1e-5,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 
@@ -127,15 +179,18 @@ impl ModelConfig {
     /// hidden=576, layers=30, heads=9, kv_heads=3, ffn=1536, vocab=49152
     pub fn smollm2_135m() -> Self {
         Self {
-            vocab_size:   49152,
-            d_model:      576,
-            n_layers:     30,
-            n_heads:      9,
-            n_kv_heads:   3,
-            ffn_hidden:   1536,
-            max_seq_len:  8192,
-            rope_theta:   10_000.0,
-            rms_norm_eps: 1e-5,
+            vocab_size:    49152,
+            d_model:       576,
+            n_layers:      30,
+            n_heads:       9,
+            n_kv_heads:    3,
+            ffn_hidden:    1536,
+            max_seq_len:   8192,
+            rope_theta:    10_000.0,
+            rms_norm_eps:  1e-5,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 
@@ -145,15 +200,18 @@ impl ModelConfig {
     /// rope_theta=10_000, max_seq=2048 — HF: TinyLlama/TinyLlama-1.1B-Chat-v1.0
     pub fn tinyllama_1b() -> Self {
         Self {
-            vocab_size:   32000,
-            d_model:      2048,
-            n_layers:     22,
-            n_heads:      32,
-            n_kv_heads:   4,
-            ffn_hidden:   5632,
-            max_seq_len:  2048,
-            rope_theta:   10_000.0,
-            rms_norm_eps: 1e-5,
+            vocab_size:    32000,
+            d_model:       2048,
+            n_layers:      22,
+            n_heads:       32,
+            n_kv_heads:    4,
+            ffn_hidden:    5632,
+            max_seq_len:   2048,
+            rope_theta:    10_000.0,
+            rms_norm_eps:  1e-5,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 
@@ -162,32 +220,39 @@ impl ModelConfig {
     /// Post-norm + QK-norm architecture. HF: allenai/OLMo-2-1124-7B (FP32, 29GB)
     pub fn olmo2_7b() -> Self {
         Self {
-            vocab_size:   100352,
-            d_model:      4096,
-            n_layers:     32,
-            n_heads:      32,
-            n_kv_heads:   32,
-            ffn_hidden:   11008,
-            max_seq_len:  4096,
-            rope_theta:   500_000.0,
-            rms_norm_eps: 1e-6,
+            vocab_size:    100352,
+            d_model:       4096,
+            n_layers:      32,
+            n_heads:       32,
+            n_kv_heads:    32,
+            ffn_hidden:    11008,
+            max_seq_len:   4096,
+            rope_theta:    500_000.0,
+            rms_norm_eps:  1e-6,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 
     /// OLMo-3-1025-7B / OLMo-3-7B-Instruct / OLMo-3-7B-Think (AllenAI)
     /// Architecture: Olmo3ForCausalLM — post-norm + QK-norm (identical structure to OLMo-2)
     /// hidden=4096, layers=32, heads=32/32, ffn=11008, vocab=100278 (BF16, 14.6GB, 3 shards)
+    /// SWA + YaRN are auto-populated by load_model_from_dir() reading config.json (Fix C).
     pub fn olmo3_actual_7b() -> Self {
         Self {
-            vocab_size:   100278,
-            d_model:      4096,
-            n_layers:     32,
-            n_heads:      32,
-            n_kv_heads:   32,
-            ffn_hidden:   11008,
-            max_seq_len:  4096,
-            rope_theta:   500_000.0,
-            rms_norm_eps: 1e-6,
+            vocab_size:    100278,
+            d_model:       4096,
+            n_layers:      32,
+            n_heads:       32,
+            n_kv_heads:    32,
+            ffn_hidden:    11008,
+            max_seq_len:   4096,
+            rope_theta:    500_000.0,
+            rms_norm_eps:  1e-6,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 
@@ -234,15 +299,18 @@ impl ModelConfig {
     /// Tiny 2-layer 64-dim model for testing (no GPU required).
     pub fn tiny() -> Self {
         Self {
-            vocab_size:   256,
-            d_model:      64,
-            n_layers:     2,
-            n_heads:      4,
-            n_kv_heads:   2,
-            ffn_hidden:   128,
-            max_seq_len:  128,
-            rope_theta:   10_000.0,
-            rms_norm_eps: 1e-5,
+            vocab_size:    256,
+            d_model:       64,
+            n_layers:      2,
+            n_heads:       4,
+            n_kv_heads:    2,
+            ffn_hidden:    128,
+            max_seq_len:   128,
+            rope_theta:    10_000.0,
+            rms_norm_eps:  1e-5,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
         }
     }
 }
@@ -277,32 +345,68 @@ fn softmax_inplace(x: &mut [f32]) {
 
 // ── RoPE (Rotary Position Embedding) ──────────────────────────────────────
 
-/// Precomputed cosine/sine tables for RoPE.
+/// Precomputed cosine/sine tables for RoPE (standard and YaRN).
 struct RopeCache {
     /// cos[pos][i] for i in 0..head_dim/2
     cos: Vec<Vec<f32>>,
     /// sin[pos][i]
     sin: Vec<Vec<f32>>,
+    /// Attention score multiplier from YaRN `attention_factor` (1.0 for standard RoPE).
+    /// Applied as: scale = attn_scale_factor / sqrt(head_dim).
+    pub attn_scale_factor: f32,
 }
 
 impl RopeCache {
-    fn new(head_dim: usize, max_seq: usize, theta: f32) -> Self {
+    /// Build RoPE tables. Supports standard RoPE and YaRN extended-context scaling.
+    ///
+    /// YaRN (Peng et al. 2023, arXiv:2309.00071) partitions RoPE dimensions into
+    /// three frequency bands and scales each differently:
+    /// - High-freq dims (short wavelength): no scaling
+    /// - Low-freq dims (long wavelength): full interpolation (÷ factor)
+    /// - Mid-freq dims: linear ramp between 1 and factor
+    fn new(head_dim: usize, max_seq: usize, theta: f32, scaling: &RopeScaling) -> Self {
         let half = head_dim / 2;
+        let two_pi = 2.0 * std::f32::consts::PI;
+
+        // Compute per-dimension frequencies (potentially YaRN-scaled).
+        let freqs: Vec<f32> = (0..half).map(|i| {
+            let base_freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+            match scaling {
+                RopeScaling::None => base_freq,
+                RopeScaling::Yarn { factor, orig_max_pos, beta_fast, beta_slow, .. } => {
+                    let wavelength = two_pi / base_freq;
+                    // Boundaries from Peng et al. Algorithm 1
+                    let low  = *orig_max_pos as f32 / (two_pi * beta_slow);  // low-freq
+                    let high = *orig_max_pos as f32 / (two_pi * beta_fast);  // high-freq
+                    if wavelength < high {
+                        // High-frequency dims: use original frequency
+                        base_freq
+                    } else if wavelength > low {
+                        // Low-frequency dims: full interpolation
+                        base_freq / factor
+                    } else {
+                        // Mid-frequency: linear ramp between no-scaling and full-scaling
+                        let alpha = (wavelength - high) / (low - high);
+                        base_freq / (alpha * factor + (1.0 - alpha))
+                    }
+                }
+            }
+        }).collect();
+
+        let attn_scale_factor = match scaling {
+            RopeScaling::Yarn { attn_factor, .. } => *attn_factor,
+            RopeScaling::None => 1.0,
+        };
+
         let mut cos = Vec::with_capacity(max_seq);
         let mut sin = Vec::with_capacity(max_seq);
         for pos in 0..max_seq {
-            let mut c = Vec::with_capacity(half);
-            let mut s = Vec::with_capacity(half);
-            for i in 0..half {
-                let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
-                let angle = pos as f32 * freq;
-                c.push(angle.cos());
-                s.push(angle.sin());
-            }
+            let c: Vec<f32> = freqs.iter().map(|&f| (pos as f32 * f).cos()).collect();
+            let s: Vec<f32> = freqs.iter().map(|&f| (pos as f32 * f).sin()).collect();
             cos.push(c);
             sin.push(s);
         }
-        Self { cos, sin }
+        Self { cos, sin, attn_scale_factor }
     }
 
     /// Apply RoPE to a head's query or key vector at `pos`.
@@ -468,11 +572,14 @@ struct Attention {
     n_heads:    usize,
     n_kv_heads: usize,
     head_dim:   usize,
-    scale:      f32,      // 1/sqrt(head_dim)
+    scale:      f32,      // attn_scale_factor / sqrt(head_dim); YaRN multiplies attn_scale_factor
     kv_cache:   KvCache,
     /// OLMo-2 QK-norm weights (empty = disabled)
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
+    /// Fix A: Sliding Window Attention — maximum look-back distance (tokens).
+    /// `None` = full causal attention. Set from `ModelConfig::sliding_window` for SWA layers.
+    window_size: Option<usize>,
 }
 
 impl Attention {
@@ -488,10 +595,11 @@ impl Attention {
             n_heads:    cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim,
-            scale:      1.0 / (head_dim as f32).sqrt(),
+            scale:      1.0 / (head_dim as f32).sqrt(), // adjusted later if YaRN
             kv_cache:   KvCache::new(cfg.n_kv_heads, head_dim, cfg.max_seq_len),
             q_norm:     Vec::new(),
             k_norm:     Vec::new(),
+            window_size: None, // set by OlmoModel::new() for SWA layers (Fix A)
         }
     }
 
@@ -532,11 +640,17 @@ impl Attention {
             let kv_h = h / group;
             let q_h = &q[h*self.head_dim..(h+1)*self.head_dim];
 
-            // Compute attention scores for all positions seen so far
+            // Compute attention scores for all positions seen so far.
+            // Fix A (SWA): positions outside the sliding window get -∞ → zero weight.
             for t in 0..=pos {
-                let k_t = self.kv_cache.key(t, kv_h);
-                let score: f32 = q_h.iter().zip(k_t.iter()).map(|(&qi, &ki)| qi * ki).sum();
-                attn_scores[t] = score * self.scale;
+                let masked = self.window_size.map_or(false, |w| pos - t >= w);
+                if masked {
+                    attn_scores[t] = f32::NEG_INFINITY;
+                } else {
+                    let k_t = self.kv_cache.key(t, kv_h);
+                    let score: f32 = q_h.iter().zip(k_t.iter()).map(|(&qi, &ki)| qi * ki).sum();
+                    attn_scores[t] = score * self.scale;
+                }
             }
             softmax_inplace(&mut attn_scores[..pos+1]);
 
@@ -604,7 +718,8 @@ impl Attention {
             self.kv_cache.write_val(pos, h, &v[h*self.head_dim..(h+1)*self.head_dim]);
         }
 
-        // Attention scores + weighted value sum (CPU)
+        // Attention scores + weighted value sum (CPU).
+        // Fix A (SWA): positions outside sliding window get -∞ → zero weight after softmax.
         let group = self.n_heads / self.n_kv_heads;
         let mut out_cpu = vec![0.0f32; d];
         let mut scores  = vec![0.0f32; pos + 1];
@@ -612,9 +727,14 @@ impl Attention {
             let kv_h = h / group;
             let q_h = &q[h*self.head_dim..(h+1)*self.head_dim];
             for t in 0..=pos {
-                let k_t = self.kv_cache.key(t, kv_h);
-                let score: f32 = q_h.iter().zip(k_t.iter()).map(|(&qi, &ki)| qi*ki).sum();
-                scores[t] = score * self.scale;
+                let masked = self.window_size.map_or(false, |w| pos - t >= w);
+                if masked {
+                    scores[t] = f32::NEG_INFINITY;
+                } else {
+                    let k_t = self.kv_cache.key(t, kv_h);
+                    let score: f32 = q_h.iter().zip(k_t.iter()).map(|(&qi, &ki)| qi*ki).sum();
+                    scores[t] = score * self.scale;
+                }
             }
             softmax_inplace(&mut scores[..pos+1]);
             let o_h = &mut out_cpu[h*self.head_dim..(h+1)*self.head_dim];
@@ -797,11 +917,26 @@ impl OlmoModel {
     /// Create a new randomly-initialized model.
     pub fn new(cfg: ModelConfig) -> Self {
         let head_dim = cfg.d_model / cfg.n_heads;
-        let rope = RopeCache::new(head_dim, cfg.max_seq_len, cfg.rope_theta);
+        // Fix B: build RopeCache with YaRN scaling if configured.
+        let rope = RopeCache::new(head_dim, cfg.max_seq_len, cfg.rope_theta, &cfg.rope_scaling);
         let embed = Embedding::new(cfg.vocab_size, cfg.d_model, 0);
-        let layers: Vec<_> = (0..cfg.n_layers)
+        let mut layers: Vec<_> = (0..cfg.n_layers)
             .map(|i| TransformerBlock::new(&cfg, i))
             .collect();
+        // Fix B: multiply attention scale by YaRN attn_factor (1.0 for standard RoPE).
+        if (rope.attn_scale_factor - 1.0).abs() > 1e-6 {
+            for layer in &mut layers {
+                layer.attn.scale *= rope.attn_scale_factor;
+            }
+        }
+        // Fix A: wire sliding window size for each SWA layer.
+        for (i, layer) in layers.iter_mut().enumerate() {
+            let is_sliding = cfg.layer_types.get(i)
+                .map_or(false, |lt| *lt == LayerType::Sliding);
+            if is_sliding {
+                layer.attn.window_size = cfg.sliding_window;
+            }
+        }
         let norm = vec![1.0f32; cfg.d_model];
         // Weight tying: lm_head shares embed weights (copy for simplicity)
         let lm_head = Linear::from_data(
@@ -1242,6 +1377,72 @@ pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoM
 }
 
 
+/// Fix C: parse a HuggingFace `config.json` and overlay architecture parameters
+/// onto `cfg`. Only fields present in the JSON are updated; caller defaults are kept.
+///
+/// Reads: `layer_types`, `sliding_window`, `rope_scaling`, `rope_theta`, `rms_norm_eps`.
+/// Does NOT update `max_seq_len` (KV cache sizing is caller-controlled).
+fn patch_config_from_hf_json(mut cfg: ModelConfig, config_path: &std::path::Path) -> Result<ModelConfig> {
+    let text = std::fs::read_to_string(config_path)
+        .map_err(|e| AtlasError::Io(format!("config.json read: {e}")))?;
+    let json = atlas_json::Json::parse(&text)
+        .map_err(|e| AtlasError::Parse(format!("config.json parse: {e}")))?;
+
+    // layer_types: ["sliding_attention", "full_attention", ...]
+    if let Some(lt_arr) = json.get("layer_types").and_then(|v| v.as_array()) {
+        cfg.layer_types = lt_arr.iter().map(|v| {
+            match v.as_str() {
+                Some("sliding_attention") => LayerType::Sliding,
+                _ => LayerType::Full,
+            }
+        }).collect();
+        eprintln!("[config.json] layer_types: {} layers ({} sliding, {} full)",
+            cfg.layer_types.len(),
+            cfg.layer_types.iter().filter(|t| **t == LayerType::Sliding).count(),
+            cfg.layer_types.iter().filter(|t| **t == LayerType::Full).count());
+    }
+
+    // sliding_window
+    if let Some(sw) = json.get("sliding_window").and_then(|v| v.as_usize()) {
+        cfg.sliding_window = Some(sw);
+        eprintln!("[config.json] sliding_window: {sw}");
+    }
+
+    // rope_scaling: {"rope_type": "yarn", "factor": 8.0, ...}
+    if let Some(rs) = json.get("rope_scaling") {
+        if let Some(t) = rs.get("rope_type").and_then(|v| v.as_str()) {
+            if t == "yarn" {
+                let factor   = rs.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let orig_max = rs.get("original_max_position_embeddings")
+                    .and_then(|v| v.as_usize()).unwrap_or(cfg.max_seq_len);
+                let attn_f   = rs.get("attention_factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                let beta_f   = rs.get("beta_fast").and_then(|v| v.as_f64()).unwrap_or(32.0) as f32;
+                let beta_s   = rs.get("beta_slow").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                eprintln!("[config.json] rope_scaling: YaRN factor={factor} orig_max={orig_max} \
+                           attn_factor={attn_f:.4} beta_fast={beta_f} beta_slow={beta_s}");
+                cfg.rope_scaling = RopeScaling::Yarn {
+                    factor, orig_max_pos: orig_max, attn_factor: attn_f,
+                    beta_fast: beta_f, beta_slow: beta_s,
+                };
+            }
+        }
+    }
+
+    // rope_theta
+    if let Some(theta) = json.get("rope_theta").and_then(|v| v.as_f64()) {
+        cfg.rope_theta = theta as f32;
+        eprintln!("[config.json] rope_theta: {}", cfg.rope_theta);
+    }
+
+    // rms_norm_eps
+    if let Some(eps) = json.get("rms_norm_eps").and_then(|v| v.as_f64()) {
+        cfg.rms_norm_eps = eps as f32;
+        eprintln!("[config.json] rms_norm_eps: {}", cfg.rms_norm_eps);
+    }
+
+    Ok(cfg)
+}
+
 /// Load a sharded model from a directory.
 /// Reads model.safetensors.index.json and loads all referenced shards.
 /// Falls back to model.safetensors if no index file is found.
@@ -1249,6 +1450,15 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
     use std::path::Path;
     use std::fs;
     use std::collections::{HashMap, HashSet};
+
+    // Fix C: auto-patch ModelConfig from on-disk config.json if present.
+    let config_json_path = Path::new(dir).join("config.json");
+    let cfg = if config_json_path.exists() {
+        eprintln!("[load_model_from_dir] patching config from {}", config_json_path.display());
+        patch_config_from_hf_json(cfg, &config_json_path)?
+    } else {
+        cfg
+    };
 
     let index_path = Path::new(dir).join("model.safetensors.index.json");
     if !index_path.exists() {
@@ -1390,7 +1600,7 @@ mod tests {
 
     #[test]
     fn rope_cache_identity_at_zero() {
-        let cache = RopeCache::new(16, 32, 10000.0);
+        let cache = RopeCache::new(16, 32, 10000.0, &RopeScaling::None);
         // At pos=0 all angles are 0, so cos=1, sin=0: x unchanged
         let orig = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
                         9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0];
@@ -1751,6 +1961,212 @@ mod tests {
         let _ = std::fs::remove_file(tmp);
     }
 
+    // ── Fix B: YaRN RoPE unit tests ───────────────────────────────────────────
+
+    /// YaRN scales low-frequency dimensions (long wavelength) by 1/factor, leaves
+    /// high-frequency dimensions (short wavelength) unscaled, and ramps linearly for mid.
+    /// Verify against reference for OLMo-3 params: factor=8, orig_max=8192, beta_fast=32, beta_slow=1.
+    #[test]
+    fn yarn_rope_scale_factors_olmo3() {
+        let head_dim = 128usize;     // OLMo-3 head dim = 4096/32
+        let theta    = 500_000.0f32;
+        let factor   = 8.0f32;
+        let orig_max = 8192usize;
+        let beta_fast = 32.0f32;
+        let beta_slow = 1.0f32;
+        let attn_factor = 1.2079f32;
+        let two_pi = 2.0 * std::f32::consts::PI;
+        let low_bound  = orig_max as f32 / (two_pi * beta_slow);
+        let high_bound = orig_max as f32 / (two_pi * beta_fast);
+
+        let yarn = RopeScaling::Yarn { factor, orig_max_pos: orig_max,
+                                       attn_factor, beta_fast, beta_slow };
+        let std_rope = RopeScaling::None;
+
+        let yarn_cache = RopeCache::new(head_dim, 256, theta, &yarn);
+        let std_cache  = RopeCache::new(head_dim, 256, theta, &std_rope);
+
+        // attn_scale_factor: YaRN cache should return 1.2079, standard should return 1.0
+        assert!((yarn_cache.attn_scale_factor - attn_factor).abs() < 1e-4,
+            "attn_scale_factor={} expected {attn_factor}", yarn_cache.attn_scale_factor);
+        assert!((std_cache.attn_scale_factor - 1.0).abs() < 1e-6,
+            "std attn_scale_factor should be 1.0");
+
+        let half = head_dim / 2;
+        let mut n_unscaled = 0usize;  // high-freq: YaRN ≈ standard
+        let mut n_scaled   = 0usize;  // low-freq:  YaRN ≈ standard / factor
+
+        for i in 0..half {
+            let base_freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+            let wavelength = two_pi / base_freq;
+
+            // Compare at pos=100 (arbitrary non-zero position)
+            let pos = 100usize;
+            let yarn_cos = yarn_cache.cos[pos][i];
+            let std_cos  = std_cache.cos[pos][i];
+
+            if wavelength < high_bound {
+                // High-freq: no scaling — angles should be equal
+                let diff = (yarn_cos - std_cos).abs();
+                assert!(diff < 1e-4,
+                    "dim {i} (high-freq wavelength={wavelength:.1}): YaRN cos != std cos, diff={diff:.6}");
+                n_unscaled += 1;
+            } else if wavelength > low_bound {
+                // Low-freq: full interpolation — YaRN angle = std_angle / factor
+                let std_angle  = pos as f32 * base_freq;
+                let yarn_angle = pos as f32 * (base_freq / factor);
+                let expected_cos = yarn_angle.cos();
+                let diff = (yarn_cos - expected_cos).abs();
+                assert!(diff < 1e-4,
+                    "dim {i} (low-freq wavelength={wavelength:.1}): YaRN cos diff={diff:.6}");
+                // YaRN and standard should be measurably different (unless the angle wraps to same)
+                let angle_diff = (yarn_angle - std_angle).abs();
+                if angle_diff > 0.01 {
+                    assert!((yarn_cos - std_cos).abs() > 1e-5,
+                        "dim {i}: low-freq but YaRN≈standard (angle_diff={angle_diff:.4})");
+                }
+                n_scaled += 1;
+            }
+            // Mid-freq: intermediate — just verify the cache produces finite values
+            assert!(yarn_cos.is_finite(), "dim {i}: non-finite YaRN cos");
+        }
+        eprintln!("  yarn_rope: {n_unscaled} high-freq (no-scale), {n_scaled} low-freq (÷{factor}) dims");
+        assert!(n_unscaled > 0, "no high-frequency dimensions found");
+        assert!(n_scaled   > 0, "no low-frequency dimensions found");
+    }
+
+    // ── Fix A: Sliding Window Attention unit tests ────────────────────────────
+
+    /// SWA banded mask: with window_size=W, position `pos` must not attend to position `t`
+    /// when `pos - t >= W`. Verify by checking that an SWA model with window_size=1
+    /// produces identical output regardless of whether previous tokens differ in the KV cache.
+    #[test]
+    fn swa_banded_mask_blocks_out_of_window_positions() {
+        // Build a tiny model with SWA window_size=1 on ALL layers.
+        let mut cfg = ModelConfig::tiny(); // vocab=256, d=64, layers=2, heads=4, kv=2
+        cfg.layer_types = vec![LayerType::Sliding; cfg.n_layers];
+        cfg.sliding_window = Some(1); // each token attends only to itself (position t == pos)
+
+        // Model A: generate [10, 20] then ask for token at pos=2
+        let mut m_a = OlmoModel::new(cfg.clone());
+        m_a.forward_one(10);
+        m_a.forward_one(20);
+        let logits_a = m_a.forward_one(30);
+
+        // Model B: generate [99, 77] then ask for the same token at pos=2
+        // With window=1, pos=2 only attends to pos=2 itself, so prior tokens don't matter.
+        let mut m_b = OlmoModel::new(cfg);
+        m_b.forward_one(99); // different from m_a
+        m_b.forward_one(77); // different from m_a
+        let logits_b = m_b.forward_one(30); // same token at same position
+
+        assert_eq!(logits_a.len(), logits_b.len());
+        let max_diff = logits_a.iter().zip(logits_b.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-5,
+            "SWA window=1: logits differ (max_diff={max_diff:.6}) — out-of-window tokens leaked");
+    }
+
+    /// Full causal attention produces different output than SWA when prior tokens differ.
+    /// This is the counter-test proving the SWA isolation above is not trivially true.
+    #[test]
+    fn full_attn_differs_when_prior_tokens_differ() {
+        let cfg = ModelConfig::tiny(); // no SWA — full attention
+
+        let mut m_a = OlmoModel::new(cfg.clone());
+        m_a.forward_one(10);
+        m_a.forward_one(20);
+        let logits_a = m_a.forward_one(30);
+
+        let mut m_b = OlmoModel::new(cfg);
+        m_b.forward_one(99); // different from m_a
+        m_b.forward_one(77); // different from m_a
+        let logits_b = m_b.forward_one(30); // same token at same position
+
+        let max_diff = logits_a.iter().zip(logits_b.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // Full attention DOES see prior tokens, so logits should differ.
+        assert!(max_diff > 1e-5,
+            "Full-attn: logits identical despite different prior tokens — attention is broken");
+    }
+
+    // ── Fix C: config.json parsing unit tests ────────────────────────────────
+
+    /// Verify that patch_config_from_hf_json() correctly extracts OLMo-3-style fields.
+    #[test]
+    fn config_json_parsing_olmo3_fields() {
+        // Write a synthetic config.json with OLMo-3 fields
+        let json = r#"{
+            "vocab_size": 100278,
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 32,
+            "sliding_window": 4096,
+            "rope_theta": 500000.0,
+            "rms_norm_eps": 1e-06,
+            "layer_types": [
+                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+                "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"
+            ],
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "factor": 8.0,
+                "original_max_position_embeddings": 8192,
+                "attention_factor": 1.2079441541679836,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0
+            }
+        }"#;
+
+        let tmp = "/tmp/atlas_test_config.json";
+        std::fs::write(tmp, json).unwrap();
+
+        let cfg = ModelConfig::olmo3_actual_7b();
+        let patched = patch_config_from_hf_json(cfg, std::path::Path::new(tmp)).unwrap();
+        let _ = std::fs::remove_file(tmp);
+
+        // layer_types: 32 entries, 8 full (at indices 3,7,11,...,31), 24 sliding
+        assert_eq!(patched.layer_types.len(), 32,
+            "layer_types length = {}", patched.layer_types.len());
+        let n_full    = patched.layer_types.iter().filter(|t| **t == LayerType::Full).count();
+        let n_sliding = patched.layer_types.iter().filter(|t| **t == LayerType::Sliding).count();
+        assert_eq!(n_full,    8,  "expected 8 full-attention layers");
+        assert_eq!(n_sliding, 24, "expected 24 sliding-attention layers");
+        // Full layers at 3,7,11,...,31
+        for &idx in &[3usize, 7, 11, 15, 19, 23, 27, 31] {
+            assert_eq!(patched.layer_types[idx], LayerType::Full,
+                "layer {idx} should be Full");
+        }
+
+        // sliding_window
+        assert_eq!(patched.sliding_window, Some(4096), "sliding_window = {:?}", patched.sliding_window);
+
+        // rope_scaling
+        match &patched.rope_scaling {
+            RopeScaling::Yarn { factor, orig_max_pos, attn_factor, beta_fast, beta_slow } => {
+                assert!((*factor - 8.0).abs() < 1e-4, "factor={factor}");
+                assert_eq!(*orig_max_pos, 8192, "orig_max_pos={orig_max_pos}");
+                assert!((*attn_factor - 1.2079).abs() < 1e-3, "attn_factor={attn_factor}");
+                assert!((*beta_fast - 32.0).abs() < 1e-4, "beta_fast={beta_fast}");
+                assert!((*beta_slow - 1.0).abs() < 1e-4, "beta_slow={beta_slow}");
+            }
+            other => panic!("expected RopeScaling::Yarn, got {other:?}"),
+        }
+
+        // rope_theta and rms_norm_eps
+        assert!((patched.rope_theta - 500_000.0).abs() < 1.0, "rope_theta={}", patched.rope_theta);
+        assert!(patched.rms_norm_eps < 1e-5, "rms_norm_eps={}", patched.rms_norm_eps);
+    }
+
     // ── Benchmarks (run with: cargo test -p atlas-model -- --ignored --nocapture)
 
     #[test]
@@ -1772,7 +2188,7 @@ mod tests {
     fn bench_rope_2048() {
         use atlas_core::bench::Bench;
         let head_dim = 128; // typical head dim for 2048-dim model with 16 heads
-        let cache = RopeCache::new(head_dim, 4096, 500_000.0);
+        let cache = RopeCache::new(head_dim, 4096, 500_000.0, &RopeScaling::None);
         let b = Bench::run("rope_128dim_apply", 50_000, || {
             let mut x: Vec<f32> = (0..head_dim).map(|i| (i as f32) * 0.01).collect();
             cache.apply(&mut x, 42);
@@ -2253,6 +2669,150 @@ mod tests {
         eprintln!("  Hardware: NVIDIA A100-SXM4-40GB | CUDA 13.0 | ATLAS v4.0");
         assert!(!results.is_empty());
     }
+
+    // ── Issue #7 tests: Fix C (config.json), Fix B (YaRN), Fix A (SWA) ──────
+
+    /// Fix C: patch_config_from_hf_json reads layer_types, sliding_window, YaRN, rope_theta.
+    #[test]
+    fn test_olmo3_config_parsed() {
+        let config_json = r#"{
+            "layer_types": ["sliding_attention","sliding_attention","sliding_attention","full_attention",
+                            "sliding_attention","sliding_attention","sliding_attention","full_attention"],
+            "sliding_window": 4096,
+            "rope_theta": 500000,
+            "rms_norm_eps": 1e-6,
+            "rope_scaling": {
+                "rope_type": "yarn",
+                "factor": 8.0,
+                "original_max_position_embeddings": 8192,
+                "attention_factor": 1.2079441541679836,
+                "beta_fast": 32.0,
+                "beta_slow": 1.0
+            }
+        }"#;
+        let tmp = "/tmp/atlas_test_config.json";
+        std::fs::write(tmp, config_json).unwrap();
+        let base_cfg = ModelConfig::tiny();
+        let cfg = patch_config_from_hf_json(base_cfg, std::path::Path::new(tmp)).unwrap();
+        let _ = std::fs::remove_file(tmp);
+
+        assert_eq!(cfg.layer_types.len(), 8);
+        assert_eq!(cfg.layer_types[0], LayerType::Sliding);
+        assert_eq!(cfg.layer_types[3], LayerType::Full);
+        assert_eq!(cfg.layer_types.iter().filter(|t| **t == LayerType::Sliding).count(), 6);
+        assert_eq!(cfg.layer_types.iter().filter(|t| **t == LayerType::Full).count(), 2);
+        assert_eq!(cfg.sliding_window, Some(4096));
+        assert!((cfg.rope_theta - 500_000.0).abs() < 1.0, "rope_theta={}", cfg.rope_theta);
+        assert!((cfg.rms_norm_eps - 1e-6_f32).abs() < 1e-10_f32, "eps={}", cfg.rms_norm_eps);
+        match &cfg.rope_scaling {
+            RopeScaling::Yarn { factor, orig_max_pos, attn_factor, beta_fast, beta_slow } => {
+                assert!((factor - 8.0).abs() < 1e-5, "factor={factor}");
+                assert_eq!(*orig_max_pos, 8192);
+                assert!((attn_factor - 1.2079).abs() < 1e-3, "attn_factor={attn_factor}");
+                assert!((beta_fast - 32.0).abs() < 1e-5);
+                assert!((beta_slow - 1.0).abs() < 1e-5);
+            }
+            other => panic!("expected Yarn, got {other:?}"),
+        }
+    }
+
+    /// Fix B: YaRN high-freq dims unchanged, low-freq dims scaled 1/factor.
+    /// Verifies Peng et al. Algorithm 1 boundary conditions.
+    #[test]
+    fn test_yarn_rope_scale_factors() {
+        let head_dim = 128usize;
+        let theta    = 500_000.0f32;
+        let half     = head_dim / 2;
+        let two_pi   = 2.0 * std::f32::consts::PI;
+        let factor   = 8.0f32;
+        let orig_max = 8192usize;
+        let beta_fast = 32.0f32;
+        let beta_slow = 1.0f32;
+        let attn_f    = 1.2079f32;
+
+        let scaling = RopeScaling::Yarn {
+            factor, orig_max_pos: orig_max, attn_factor: attn_f, beta_fast, beta_slow,
+        };
+        let yarn_cache = RopeCache::new(head_dim, 16, theta, &scaling);
+        let std_cache  = RopeCache::new(head_dim, 16, theta, &RopeScaling::None);
+
+        let low_boundary  = orig_max as f32 / (two_pi * beta_slow);
+        let high_boundary = orig_max as f32 / (two_pi * beta_fast);
+
+        for i in 0..half {
+            let base_freq  = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+            let wavelength = two_pi / base_freq;
+            // At pos=1 the angle = freq (small enough to use acos safely)
+            // Instead compare the raw cos/sin at pos=2 to avoid acos precision issues
+            // For high-freq: yarn_cos[2][i] ≈ std_cos[2][i]
+            // For low-freq:  yarn angle = std angle / factor → cos values differ
+            if wavelength < high_boundary {
+                let diff = (yarn_cache.cos[2][i] - std_cache.cos[2][i]).abs();
+                assert!(diff < 0.05, "dim {i} (high-freq): cos diff={diff:.4}");
+            } else if wavelength > low_boundary && i > 0 {
+                // Low-freq: scaled angle = std_angle / factor
+                // Check that yarn_cache rotates slower than std_cache
+                // cos(x/factor) > cos(x) for x in (0,pi) since smaller angle → closer to 1
+                let yarn_c = yarn_cache.cos[2][i];
+                let std_c  = std_cache.cos[2][i];
+                assert!(yarn_c >= std_c - 0.01,
+                    "dim {i} (low-freq): YaRN should rotate slower; yarn={yarn_c:.4} std={std_c:.4}");
+            }
+        }
+        assert!((yarn_cache.attn_scale_factor - attn_f).abs() < 1e-5);
+        assert!((std_cache.attn_scale_factor - 1.0).abs() < 1e-6);
+    }
+
+    /// Fix A: SWA window wiring and output sanity.
+    #[test]
+    fn test_swa_banded_mask() {
+        let mut cfg = ModelConfig::tiny();
+        cfg.layer_types    = vec![LayerType::Sliding, LayerType::Full];
+        cfg.sliding_window = Some(2);
+        let mut model = OlmoModel::new(cfg);
+
+        // Wiring check
+        assert_eq!(model.layers[0].attn.window_size, Some(2), "layer 0 must be SWA(2)");
+        assert_eq!(model.layers[1].attn.window_size, None,    "layer 1 must be full-attn");
+
+        // Forward through 5 tokens — must not panic and output must be finite
+        model.reset();
+        let seq = model.forward(&[0u32, 1, 2, 3, 4], 0);
+        assert_eq!(seq.shape(), [5, 256]);
+        assert!(seq.data.iter().all(|&v| v.is_finite()), "SWA output has non-finite values");
+
+        // Generate 5 tokens without crash
+        model.reset();
+        let out = model.generate(&[0u32, 1, 2], 5, 0.0);
+        assert_eq!(out.len(), 5);
+        assert!(out.iter().all(|&t| (t as usize) < 256));
+    }
+
+    /// Fix A: window=1 → each token only attends to itself.
+    /// Long-context logits must equal single-token logits (masked history is invisible).
+    #[test]
+    fn test_swa_window_isolates_attention() {
+        let mut cfg = ModelConfig::tiny();
+        cfg.layer_types    = vec![LayerType::Sliding, LayerType::Sliding];
+        cfg.sliding_window = Some(1);
+        let mut m1 = OlmoModel::new(cfg.clone());
+        let mut m2 = OlmoModel::new(cfg);
+
+        // m1: process tokens 0, 1, 2 then 3 (window=1 → pos 3 only sees itself)
+        m1.reset();
+        for t in [0u32, 1, 2] { let _ = m1.forward_one(t); }
+        let logits_long = m1.forward_one(3);
+
+        // m2: process only token 3
+        m2.reset();
+        let logits_short = m2.forward_one(3);
+
+        let max_err = logits_long.iter().zip(logits_short.iter())
+            .map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_err < 1e-4,
+            "window=1: long-ctx must equal short-ctx; max_err={max_err:.2e}");
+    }
+
     fn tensor_shape_for_config(cfg: &ModelConfig, name: &str) -> (Vec<usize>, usize) {
         let d = cfg.d_model;
         let kv = cfg.kv_dim();
