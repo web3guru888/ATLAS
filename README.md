@@ -10,8 +10,8 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v4.0.2-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-528%2F528%20passing-brightgreen.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v4.0.3-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-532%2F532%20passing-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-21-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__80%20A100-76b900.svg)](#gpu-inference)
@@ -49,6 +49,11 @@ It fuses four architectural innovations:
 - ⚡ **BF16 W16A32** — weights in BF16 (14 GB) vs f32 (28 GB); `GpuBufBf16`, `GpuBufKind`, `upload_bf16()` in atlas-tensor
 - 🔥 **GEMV kernels** — `sgemv_bf16_kernel` + `sgemv_f32_kernel`: one-warp-per-row for N=1 decode; fixes 32× tiled-GEMM inefficiency
 - 🚀 **OLMo-3-7B-Think: 4.1 → 19.9 tok/s** (4.8× speedup, A100-SXM4-40GB, W16A32)
+
+**v4.0.3** — Math Integrity Fixes (Issue #11):
+- 🧮 **`CanonicalPheromoneUpdate` λ decay** — replaced linear formula `base_rate × (1 − canonical_term)` (went negative when term > 1, dead gradient at clamp boundary) with `base_rate × exp(−canonical_term)`: always positive, smooth, zero-gradient fidelity, hardware-safe for v6 ASIC spec
+- 🏆 **`InvasionFitnessScorer` competition kernel** — fixed negative Lotka-Volterra coefficients: raw `cosine_sim ∈ [−1, 1]` was giving fitness bonuses to anti-correlated strategies (mutualism, not competition); replaced with `α_ij = ReLU(cos_sim − 0.2)` — threshold at 4σ above noise floor in d=384 embedding space; `competition_threshold` added to `InvasionFitnessConfig`
+- ✅ **532/532 tests** (+4 new regression tests); GPU validated: 47/47 A100 model tests, OLMo-3-7B-Think still **19.9 tok/s**
 
 The result: a self-improving scientific intelligence that trains on what it **actually discovers** about the world — real causal relationships from live data, validated by recursive architecture, guided by stigmergic memory.
 
@@ -142,13 +147,13 @@ ATLAS v4.0.0 delivers a **fully GPU-resident forward pass** — hidden states st
 
 ### A100-SXM4-40GB Benchmark (sm_80, CUDA 12.9)
 
-| Model | Params | GPU tok/s | CPU tok/s | Speedup | VRAM |
-|-------|--------|-----------|-----------|---------|------|
-| SmolLM2-135M | 135M | **37.7** | 29.3 (T4 CPU) | **1.3×** | 507 MiB |
-| SmolLM2-360M | 360M | **25.4** | — | — | ~1.4 GB |
-| SmolLM2-1.7B | 1.7B | **12.6** | 5.2 | **2.4×** | ~6.5 GB |
-| TinyLlama-1.1B | 1.1B | **20.9** | — | — | ~8.4 GB |
-| OLMo-3-7B-Think | 7B | 4.1 (CPU) | 4.1 | — | ~28 GB (RAM) |
+| Model | Params | GPU tok/s | VRAM | Notes |
+|-------|--------|-----------|------|-------|
+| SmolLM2-135M | 135M | **37.7** | 507 MiB | f32, sm_80 |
+| SmolLM2-360M | 360M | **25.4** | ~1.4 GB | f32 |
+| SmolLM2-1.7B | 1.7B | **12.6** | ~6.5 GB | f32, 2.4× over CPU |
+| TinyLlama-1.1B | 1.1B | **20.9** | ~8.4 GB | f32 |
+| OLMo-3-7B-Think | 7B | **19.9** | ~14 GB | **BF16 W16A32** (v4.0.2+); was 4.1 tok/s CPU |
 
 ### CUDA Kernel Suite
 
@@ -357,11 +362,11 @@ cargo build --release -p atlas-cli
 
 ---
 
-## Status — v4.0.2
+## Status — v4.0.3
 
-**528/528 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **37.7 tok/s GPU inference**
+**532/532 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **19.9 tok/s OLMo-3-7B-Think (BF16)**
 
-> 🏔 **v4.0.2 is the current release.** BF16 GPU inference path live — OLMo-3-7B-Think at 19.9 tok/s (W16A32, 4.8× speedup). GPU-resident forward pass, OpenAI API, DeepSupervisionTrainer, Horn-clause safety, PalaceBackend trait.
+> 🏔 **v4.0.3 is the current release.** Math integrity fixes: `CanonicalPheromoneUpdate` exp decay (λ never negative) + `InvasionFitnessScorer` ReLU competition threshold (no mutualism). GPU-validated: 532/532 workspace + 47/47 A100 model tests. OLMo-3-7B-Think 19.9 tok/s confirmed.
 
 ### What Works
 
@@ -391,6 +396,7 @@ cargo build --release -p atlas-cli
 | **v4.0.0** | **Champagnat n-morphic framework + Issue #7 fix (SWA + YaRN RoPE + config.json auto-patch for OLMo-3-7B)** | **528** |
 | **v4.0.1** | **Docs + test cleanup for v4.0.0 / Issue #7** | **528** |
 | **v4.0.2** | **BF16 GPU inference path (Issue #9): OLMo-3-7B-Think 4.1 → 19.9 tok/s (4.8×), W16A32, GEMV kernels** | **528** |
+| **v4.0.3** | **Math integrity (Issue #11): λ exp decay + ReLU competition threshold. 47/47 GPU model tests.** | **532** |
 
 ### Crate Status
 
@@ -405,7 +411,7 @@ cargo build --release -p atlas-cli
 | atlas-json | 2 | 12 | ✅ Recursive descent parser, surrogate pairs |
 | atlas-tokenize | 2 | 6 | ✅ GPT-2 byte-level BPE, tokenizer.json |
 | atlas-model | 2 | **27** | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, SWA, YaRN RoPE, config.json auto-patch; GPU-resident forward pass |
-| atlas-palace | 3 | **74** | ✅ A\* search, 5-type pheromones, Active Inference, MMAS, PalaceBackend trait, session_id, PalaceConfig |
+| atlas-palace | 3 | **79** | ✅ A\* search, 5-type pheromones, Active Inference, MMAS, PalaceBackend trait, session_id, PalaceConfig; v4.0.3: `CanonicalPheromoneUpdate` uses `exp(−x)` decay (always positive, smooth, hardware-safe) |
 | atlas-mcp | 3 | **32** | ✅ 28 MCP tools, JSON-RPC 2.0, live palace dispatch; McpConnectionPool (max 5, 5-min idle eviction) |
 | atlas-api | 3 | **40** | ✅ OpenAI-compatible HTTP: /v1/chat/completions, /v1/completions, /v1/models; SSE streaming; CORS |
 | atlas-trm | 4 | 12 | ✅ TRM-CausalValidator depth-6 RNN, Bayesian combining |
@@ -414,11 +420,11 @@ cargo build --release -p atlas-cli
 | atlas-causal | 5 | 10 | ✅ PC algorithm, Fisher-Z, standard normal CDF, Meek rules |
 | atlas-zk | 5 | **19** | ✅ Schnorr + Groth16 stub (HMAC-SHA256, BLS12-381 interface) |
 | atlas-astra | 5 | 15 | ✅ OODA: NASA POWER / WHO GHO / World Bank / ArXiv; OodaFeedback adaptive explore_ratio |
-| atlas-corpus | 6 | 20 | ✅ SftTrainer, LoRA (rank=8), grad-accum, safetensors checkpoint; DeepSupervisionTrainer (N_sup 4–16, loss_trace) |
+| atlas-corpus | 6 | **79** | ✅ SftTrainer, LoRA (rank=8), grad-accum, safetensors checkpoint; DeepSupervisionTrainer (N_sup 4–16, loss_trace); v4.0.3: `InvasionFitnessScorer` uses `ReLU(cos_sim − 0.2)` competition (α_ij ≥ 0, no mutualism) |
 | atlas-safety | 6 | **30** | ✅ Horn-clause constitution (8 principles, 4 domains); 5-state FSM; CircuitBreaker; append-only audit log |
 | atlas-bridge | 6 | **8** | ✅ ZK-attested Rings↔ETH interface, Sepolia chain_id=11155111 |
 | atlas-cli | 7 | **30** | ✅ discover / corpus / train / eval / prove / palace / mcp / api / bench / status |
-| **TOTAL** | | **528** | **✅ All passing — v4.0.0** |
+| **TOTAL** | | **532** | **✅ All passing — v4.0.3** |
 
 ### Quick Start
 
@@ -525,9 +531,9 @@ ATLAS v4.0 implements the **Champagnat n-Morphic Framework** (Issue #6), grounde
 
 | Module | Crate | Key idea |
 |--------|-------|----------|
-| `InvasionFitnessScorer` | atlas-corpus | Replaces raw pheromone softmax; fixes softmax saturation |
+| `InvasionFitnessScorer` | atlas-corpus | Replaces raw pheromone softmax; α_ij = ReLU(cos_sim − 0.2) — Lotka-Volterra valid (v4.0.3) |
 | `CognitiveBranching` | atlas-astra | Detects explore_ratio plateau → bifurcates OODA |
-| `CanonicalPheromoneUpdate` | atlas-palace | Principled decay rate from mutation-selection coupling |
+| `CanonicalPheromoneUpdate` | atlas-palace | Principled decay λ = base_rate × exp(−canonical_term) — always positive, smooth (v4.0.3) |
 | `HJConcentrationPrior` | atlas-trm | Hopf-Cole sharpening across TRM recursion steps |
 | `PolymorphicTrainer` | atlas-corpus | k=2,3 morphs (fast/slow/creative) with competition matrix |
 
@@ -537,7 +543,9 @@ ATLAS v4.0 implements the **Champagnat n-Morphic Framework** (Issue #6), grounde
 
 ## Hugging Face Model Card
 
-ATLAS models will be published to Hugging Face under the `OpenHubResearch` organization.
+ATLAS models are published to Hugging Face under the [`openhubresearch`](https://huggingface.co/openhubresearch) organization.
+
+**First release**: `openhubresearch/ATLAS-OLMo-3-7B-Think-v4` — OLMo-3-7B-Think run through the ATLAS v4.0.3 n-morphic framework with BF16 inference (19.9 tok/s A100-SXM4-40GB, W16A32, 532/532 tests, 47/47 GPU model tests).
 
 ```yaml
 ---
@@ -551,11 +559,13 @@ tags:
   - causal-inference
   - pure-rust
   - zero-dependencies
+  - champagnat-morphic
+  - bf16-inference
 base_model: allenai/OLMo-3-0125-7B
 ---
 ```
 
-Models trained with ATLAS carry full ZK provenance chains: every factual claim traces cryptographically to its source API call. See [atlasagi.org](https://atlasagi.org) for model releases and the LiveDiscoveryCorpus dataset.
+Models run through ATLAS carry the full n-morphic framework: `InvasionFitnessScorer` (Lotka-Volterra valid competition), `CanonicalPheromoneUpdate` (principled adaptive decay), `BarBovier2017Constraints` (stability gates), `CognitiveBranching` (OODA bifurcation), and `HJConcentrationPrior` (Hopf-Cole sharpening). See [atlasagi.org](https://atlasagi.org) for model releases and the LiveDiscoveryCorpus dataset.
 
 ---
 
@@ -580,7 +590,8 @@ See [NOTICE](NOTICE) for attribution to incorporated components.
   institution = {OpenHub Research, Thailand},
   url         = {https://github.com/web3guru888/ATLAS},
   note        = {Pure Rust LLM training framework. Zero external dependencies.
-                 v4.0.2: 21 crates, 528 tests, OpenAI-compatible API,
-                 BF16 GPU inference — OLMo-3-7B-Think 19.9 tok/s on A100-SXM4-40GB (W16A32).}
+                 v4.0.3: 21 crates, 532 tests, Champagnat n-morphic framework,
+                 BF16 GPU inference — OLMo-3-7B-Think 19.9 tok/s on A100-SXM4-40GB (W16A32).
+                 Math-validated: exp decay (Issue #11) + Lotka-Volterra competition fix.}
 }
 ```
