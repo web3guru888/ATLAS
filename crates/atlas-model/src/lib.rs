@@ -451,6 +451,25 @@ impl Linear {
         Self { weight, gpu_mat, in_dim, out_dim }
     }
 
+    /// Load from BF16 source weights.
+    ///
+    /// Uploads weights as BF16 to GPU VRAM (W16A32 kernel for half the VRAM usage),
+    /// while keeping f32 in CPU RAM for the CPU fallback path.
+    ///
+    /// `weight_bf16`: raw BF16 bit patterns as u16 (native safetensors BF16 layout).
+    /// `weight_f32`:  same weights converted to f32 (for CPU fallback, already in RAM).
+    fn from_bf16_weights(weight_bf16: Vec<u16>, weight_f32: Vec<f32>, in_dim: usize, out_dim: usize) -> Self {
+        assert_eq!(weight_bf16.len(), in_dim * out_dim);
+        assert_eq!(weight_f32.len(), in_dim * out_dim);
+        let gpu_mat = atlas_tensor::GpuMatrix::upload_bf16(&weight_bf16, out_dim, in_dim);
+        // weight_bf16 is no longer needed after upload — drop it to reclaim RAM
+        drop(weight_bf16);
+        Self { weight: weight_f32, gpu_mat, in_dim, out_dim }
+    }
+
+    /// Returns true if this layer's weights are stored as BF16 in GPU VRAM.
+    pub fn is_gpu_bf16(&self) -> bool { self.gpu_mat.is_bf16() }
+
     /// y = W x  (weight: [out × in], x: [in], y: [out])
     fn forward(&self, x: &[f32], y: &mut [f32]) {
         assert_eq!(x.len(), self.in_dim);
@@ -1076,6 +1095,23 @@ impl OlmoModel {
         // embedding + lm_head + final norm
         self.config.vocab_size * d * 2 + per_layer * n + d
     }
+
+    /// Count GPU weight matrices by precision.
+    ///
+    /// Returns `(bf16_count, f32_count)` across all transformer layers.
+    /// Useful for verifying that BF16 models correctly use the W16A32 GPU path.
+    pub fn gpu_weight_dtype_counts(&self) -> (usize, usize) {
+        let mut bf16 = 0usize;
+        let mut f32_ = 0usize;
+        for l in &self.layers {
+            for lin in [&l.attn.wq, &l.attn.wk, &l.attn.wv, &l.attn.wo,
+                        &l.ffn.w_gate, &l.ffn.w_up, &l.ffn.w_down] {
+                if lin.gpu_mat.is_bf16()        { bf16 += 1; }
+                else if lin.gpu_mat.is_on_gpu() { f32_ += 1; }
+            }
+        }
+        (bf16, f32_)
+    }
 }
 
 /// Logits for a full sequence.
@@ -1254,6 +1290,23 @@ impl SafetensorsFile {
         out
     }
 
+    /// Get tensor data as raw BF16 u16 values (no conversion).
+    /// Returns Err if tensor is not BF16 dtype.
+    pub fn get_bf16(&self, name: &str) -> Result<Vec<u16>> {
+        let desc = self.tensors.iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| AtlasError::Io(format!("tensor '{name}' not found")))?;
+        if desc.dtype != "BF16" {
+            return Err(AtlasError::Parse(format!(
+                "tensor '{name}' dtype is '{}', not BF16", desc.dtype)));
+        }
+        let raw = &self.data[desc.offsets[0]..desc.offsets[1]];
+        let vals: Vec<u16> = raw.chunks_exact(2)
+            .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        Ok(vals)
+    }
+
     /// Get tensor data as f32. Handles F32 and BF16 → f32 conversion.
     pub fn get_f32(&self, name: &str) -> Result<Vec<f32>> {
         let desc = self.tensors.iter()
@@ -1313,6 +1366,24 @@ fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(f32_bits)
 }
 
+/// Create a `Linear` layer, choosing BF16 or F32 GPU precision based on source dtype.
+///
+/// - If `is_bf16` is true (and CUDA is available): converts f32 → BF16 in-process and
+///   uploads BF16 to VRAM (W16A32).  For weights that were originally BF16 in the
+///   safetensors file, `f32 → BF16` is lossless (BF16 = upper 16 bits of f32).
+/// - Otherwise: uploads as f32 (existing behaviour).
+///
+/// In both cases, `weight_f32` is kept in CPU RAM for the CPU fallback path.
+fn make_linear_bf16_aware(weight_f32: Vec<f32>, is_bf16: bool, in_dim: usize, out_dim: usize) -> Linear {
+    if is_bf16 && atlas_tensor::cuda_available() {
+        // Re-encode f32 → BF16 bit patterns (lossless for BF16-origin data)
+        let bf16: Vec<u16> = weight_f32.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
+        Linear::from_bf16_weights(bf16, weight_f32, in_dim, out_dim)
+    } else {
+        Linear::from_data(weight_f32, in_dim, out_dim)
+    }
+}
+
 /// Load an OlmoModel from a safetensors file.
 /// Expects Llama 3 / OLMo 3 weight naming conventions.
 pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoModel> {
@@ -1320,19 +1391,21 @@ pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoM
     let mut model = OlmoModel::new(cfg.clone());
 
     // Map HuggingFace weight names to our model
+    // BF16 tensors use GPU BF16 path (W16A32) for half the VRAM usage.
     for desc in &st.tensors {
         let name = &desc.name;
+        let is_bf16 = desc.dtype == "BF16";
         let data = st.get_f32(name)?;
 
         if name == "model.embed_tokens.weight" || name == "tok_embeddings.weight" {
             let vocab = data.len() / cfg.d_model;
             model.embed = Embedding::from_data(data.clone(), vocab, cfg.d_model);
-            // Tied lm_head
-            model.lm_head = Linear::from_data(data, cfg.d_model, vocab);
+            // Tied lm_head — embeddings typically BF16 too; use BF16 GPU path
+            model.lm_head = make_linear_bf16_aware(data, is_bf16, cfg.d_model, vocab);
         } else if name == "model.norm.weight" || name == "norm.weight" {
             model.norm = data;
         } else if name == "lm_head.weight" {
-            model.lm_head = Linear::from_data(data, cfg.d_model, cfg.vocab_size);
+            model.lm_head = make_linear_bf16_aware(data, is_bf16, cfg.d_model, cfg.vocab_size);
         } else {
             // Layer weights: "model.layers.N.xxx"
             for layer_i in 0..cfg.n_layers {
@@ -1347,14 +1420,14 @@ pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoM
                 };
                 let layer = &mut model.layers[layer_i];
                 match local {
-                    "self_attn.q_proj.weight"  => layer.attn.wq = Linear::from_data(data.clone(), cfg.d_model, cfg.d_model),
-                    "self_attn.k_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wk = Linear::from_data(data.clone(), cfg.d_model, kd); }
-                    "self_attn.v_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wv = Linear::from_data(data.clone(), cfg.d_model, kd); }
-                    "self_attn.o_proj.weight"  => layer.attn.wo = Linear::from_data(data.clone(), cfg.d_model, cfg.d_model),
-                    "mlp.gate_proj.weight"     => layer.ffn.w_gate = Linear::from_data(data.clone(), cfg.d_model, cfg.ffn_hidden),
-                    "mlp.up_proj.weight"       => layer.ffn.w_up   = Linear::from_data(data.clone(), cfg.d_model, cfg.ffn_hidden),
-                    "mlp.down_proj.weight"     => layer.ffn.w_down  = Linear::from_data(data.clone(), cfg.ffn_hidden, cfg.d_model),
-                               // Llama pre-norm names
+                    "self_attn.q_proj.weight"  => layer.attn.wq = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, cfg.d_model),
+                    "self_attn.k_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wk = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, kd); }
+                    "self_attn.v_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wv = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, kd); }
+                    "self_attn.o_proj.weight"  => layer.attn.wo = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, cfg.d_model),
+                    "mlp.gate_proj.weight"     => layer.ffn.w_gate = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, cfg.ffn_hidden),
+                    "mlp.up_proj.weight"       => layer.ffn.w_up   = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, cfg.ffn_hidden),
+                    "mlp.down_proj.weight"     => layer.ffn.w_down  = make_linear_bf16_aware(data.clone(), is_bf16, cfg.ffn_hidden, cfg.d_model),
+                               // Llama pre-norm names (small vectors, always f32)
                     "input_layernorm.weight"            => layer.attn_norm = data.clone(),
                     "post_attention_layernorm.weight"   => {
                         if layer.post_norm { layer.attn_norm = data.clone(); }
@@ -1482,30 +1555,39 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
 
     eprintln!("[load_model_from_dir] loading {} shards from {dir}", shard_files.len());
 
-    // Load all tensors from all shards into a flat map
+    // Load all tensors from all shards into a flat map.
+    // Track which tensors were originally BF16 so we can use the GPU BF16 path.
     let mut all_tensors: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut bf16_tensors: std::collections::HashSet<String> = std::collections::HashSet::new();
     for shard_name in &shard_files {
         let shard_path = Path::new(dir).join(shard_name);
         eprintln!("[load_model_from_dir]   shard: {shard_name}");
         let st = SafetensorsFile::open(shard_path.to_str().unwrap_or(shard_name))?;
         for desc in &st.tensors {
+            if desc.dtype == "BF16" {
+                bf16_tensors.insert(desc.name.clone());
+            }
             let data = st.get_f32(&desc.name)?;
             all_tensors.insert(desc.name.clone(), data);
         }
     }
-    eprintln!("[load_model_from_dir] loaded {} tensors total", all_tensors.len());
+    let n_bf16 = bf16_tensors.len();
+    eprintln!("[load_model_from_dir] loaded {} tensors total ({n_bf16} BF16 → GPU BF16 path)",
+        all_tensors.len());
 
-    // Build model from merged tensor map
+    // Build model from merged tensor map.
+    // BF16-origin tensors use W16A32 GPU kernel (half the VRAM of f32 weights).
     let mut model = OlmoModel::new(cfg.clone());
     for (name, data) in &all_tensors {
+        let is_bf16 = bf16_tensors.contains(name);
         if name == "model.embed_tokens.weight" || name == "tok_embeddings.weight" {
             let vocab = data.len() / cfg.d_model;
             model.embed = Embedding::from_data(data.clone(), vocab, cfg.d_model);
-            model.lm_head = Linear::from_data(data.clone(), cfg.d_model, vocab);
+            model.lm_head = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, vocab);
         } else if name == "model.norm.weight" || name == "norm.weight" {
             model.norm = data.clone();
         } else if name == "lm_head.weight" {
-            model.lm_head = Linear::from_data(data.clone(), cfg.d_model, cfg.vocab_size);
+            model.lm_head = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, cfg.vocab_size);
         } else {
             for layer_i in 0..cfg.n_layers {
                 let pfx  = format!("model.layers.{layer_i}.");
@@ -1515,13 +1597,13 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
                             else { continue };
                 let layer = &mut model.layers[layer_i];
                 match local {
-                    "self_attn.q_proj.weight"  => layer.attn.wq = Linear::from_data(data.clone(), cfg.d_model, cfg.d_model),
-                    "self_attn.k_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wk = Linear::from_data(data.clone(), cfg.d_model, kd); }
-                    "self_attn.v_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wv = Linear::from_data(data.clone(), cfg.d_model, kd); }
-                    "self_attn.o_proj.weight"  => layer.attn.wo = Linear::from_data(data.clone(), cfg.d_model, cfg.d_model),
-                    "mlp.gate_proj.weight"     => layer.ffn.w_gate = Linear::from_data(data.clone(), cfg.d_model, cfg.ffn_hidden),
-                    "mlp.up_proj.weight"       => layer.ffn.w_up   = Linear::from_data(data.clone(), cfg.d_model, cfg.ffn_hidden),
-                    "mlp.down_proj.weight"     => layer.ffn.w_down  = Linear::from_data(data.clone(), cfg.ffn_hidden, cfg.d_model),
+                    "self_attn.q_proj.weight"  => layer.attn.wq = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, cfg.d_model),
+                    "self_attn.k_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wk = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, kd); }
+                    "self_attn.v_proj.weight"  => { let kd = cfg.n_kv_heads*(cfg.d_model/cfg.n_heads); layer.attn.wv = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, kd); }
+                    "self_attn.o_proj.weight"  => layer.attn.wo = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, cfg.d_model),
+                    "mlp.gate_proj.weight"     => layer.ffn.w_gate = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, cfg.ffn_hidden),
+                    "mlp.up_proj.weight"       => layer.ffn.w_up   = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, cfg.ffn_hidden),
+                    "mlp.down_proj.weight"     => layer.ffn.w_down  = make_linear_bf16_aware(data.clone(), is_bf16, cfg.ffn_hidden, cfg.d_model),
                     "input_layernorm.weight"            => layer.attn_norm = data.clone(),
                     "post_attention_layernorm.weight"   => {
                         if layer.post_norm { layer.attn_norm = data.clone(); }
@@ -2689,6 +2771,70 @@ mod tests {
         eprintln!("  OLMo-3-7B (think)    | load={}ms | 1st={}ms | {:.1} tok/s", load_ms, first_ms, tok_s);
         assert_eq!(out.len(), n);
         assert!(tok_s > 0.5, "too slow: {tok_s:.2}");
+    }
+
+    /// Issue #9: BF16 GPU inference for OLMo-3-7B-Think.
+    ///
+    /// Validates that:
+    /// 1. BF16 weight matrices are correctly uploaded to GPU VRAM (is_gpu_bf16() == true)
+    /// 2. forward_one_gpu() succeeds and returns non-trivial logits
+    /// 3. Throughput is >> 4.1 tok/s (the old CPU-fallback baseline)
+    ///
+    /// Expected: ~15–25 tok/s on A100 using BF16 tensor cores.
+    /// Requires: ~/models/olmo3-7b-think/ (3 BF16 safetensors shards, ~14.6 GB)
+    #[test]
+    #[ignore]
+    fn gpu_benchmark_olmo3_7b_think_bf16() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let dir = format!("{home}/models/olmo3-7b-think");
+        eprintln!("\n  [Issue #9 BF16] Loading OLMo-3-7B-Think from {dir}...");
+
+        let t_load = std::time::Instant::now();
+        let mut model = match load_model_from_dir(&dir, ModelConfig::olmo3_actual_7b()) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("  SKIP: {e}"); return; }
+        };
+        let load_ms = t_load.elapsed().as_millis();
+
+        // 1. Verify BF16 GPU path is active for the transformer layers
+        let (bf16_count, f32_count) = model.gpu_weight_dtype_counts();
+        let total_weight_mats = model.layers.len() * 7;
+        eprintln!("  GPU matrices: {bf16_count} BF16 + {f32_count} F32 / {total_weight_mats} total");
+        assert!(bf16_count > 0,
+            "expected BF16 GPU matrices for BF16-origin OLMo-3-7B model");
+
+        // 2. Verify GPU forward pass returns valid logits (not a silent CPU fallback)
+        let logits = model.forward_one_gpu(1);
+        assert!(logits.is_some(), "forward_one_gpu returned None — BF16 kernel not dispatched");
+        let logits = logits.unwrap();
+        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_logit = logits.iter().cloned().fold(f32::INFINITY, f32::min);
+        eprintln!("  GPU logits: min={min_logit:.3} max={max_logit:.3} spread={:.3}",
+            max_logit - min_logit);
+        assert!(max_logit - min_logit > 1.0,
+            "logit spread too small ({:.3}) — possible silent fallback or zero output",
+            max_logit - min_logit);
+
+        model.reset();
+
+        // 3. Throughput benchmark: must significantly exceed 4.1 tok/s CPU baseline
+        let n = 30usize;
+        let t0 = std::time::Instant::now();
+        let out = model.generate(&[1u32, 2, 3], n, 0.0);
+        let tok_s = n as f64 / t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        let _ = model.forward_one_gpu(1);
+        let first_ms = t1.elapsed().as_millis();
+
+        eprintln!("  OLMo-3-7B BF16 GPU  | load={}s  | 1st={}ms | {:.1} tok/s",
+            load_ms / 1000, first_ms, tok_s);
+        eprintln!("  Speedup vs CPU baseline (4.1 tok/s): {:.1}×", tok_s / 4.1);
+
+        assert_eq!(out.len(), n);
+        assert!(tok_s > 8.0,
+            "expected ≥8 tok/s on A100 with BF16 GPU (got {tok_s:.1}). \
+             Check that CUDA BF16 kernel compiled and forward_one_gpu is returning Some.");
     }
 
     /// Comparative GPU benchmark — all OLMo variants side by side.

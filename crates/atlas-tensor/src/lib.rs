@@ -39,6 +39,12 @@ mod ffi {
             lr: f32, beta1: f32, beta2: f32, eps: f32, wd: f32,
             bc1: f32, bc2: f32, n: c_int,
         );
+        /// BF16 weight × F32 activation GEMM (W16A32).
+        /// A_bf16[M,K] stored as uint16_t (BF16 bit pattern), B[K,N] F32, C[M,N] F32.
+        pub fn atlas_sgemm_bf16_f32(
+            a_bf16: *const u16, b: *const f32, c: *mut f32,
+            m: c_int, n: c_int, k: c_int,
+        );
     }
 }
 
@@ -118,6 +124,60 @@ mod gpu {
             }
         }
     }
+
+    /// GPU buffer for BF16 weights (u16, 2 bytes/element).
+    /// Used by `GpuBufKind::BF16` to store weight matrices in half the VRAM of f32.
+    pub struct GpuBufBf16 {
+        pub ptr: *mut u16,
+        pub len: usize,
+    }
+    unsafe impl Send for GpuBufBf16 {}
+    unsafe impl Sync for GpuBufBf16 {}
+    impl std::fmt::Debug for GpuBufBf16 {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GpuBufBf16 {{ ptr: {:?}, len: {} }}", self.ptr, self.len)
+        }
+    }
+    impl GpuBufBf16 {
+        pub fn alloc(len: usize) -> Option<Self> {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let err = unsafe { cudaMalloc(&mut ptr, len * 2) }; // 2 bytes per BF16
+            if err != 0 { return None; }
+            Some(Self { ptr: ptr as *mut u16, len })
+        }
+        pub fn upload(data: &[u16]) -> Option<Self> {
+            let buf = Self::alloc(data.len())?;
+            let err = unsafe {
+                cudaMemcpy(
+                    buf.ptr as *mut c_void,
+                    data.as_ptr() as *const c_void,
+                    data.len() * 2, // 2 bytes per u16
+                    CUDA_MEMCPY_H2D,
+                )
+            };
+            if err != 0 { return None; }
+            Some(buf)
+        }
+    }
+    impl Drop for GpuBufBf16 {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                unsafe { cudaFree(self.ptr as *mut c_void); }
+            }
+        }
+    }
+
+    /// Discriminated union: either an f32 or a BF16 GPU weight buffer.
+    /// `GpuMatrix` holds `Option<GpuBufKind>` so it can store either precision.
+    pub enum GpuBufKind {
+        /// Full f32 weights in VRAM (4 bytes/element).
+        F32(GpuBuf),
+        /// BF16 weights in VRAM (2 bytes/element).  W16A32: activations stay f32.
+        BF16(GpuBufBf16),
+    }
+    impl GpuBufKind {
+        pub fn is_bf16(&self) -> bool { matches!(self, GpuBufKind::BF16(_)) }
+    }
 }
 
 
@@ -125,35 +185,66 @@ mod gpu {
 
 /// A matrix pre-uploaded to GPU VRAM (upload once, multiply many times).
 ///
-/// On CUDA builds: the data lives in VRAM and is reused across `sgemm()` calls.
-/// Input vectors are uploaded per call; only the tiny x-vector moves on the bus.
+/// Supports two precisions:
+///   - **F32** (4 bytes/elem): default for small models or CPU-only builds.
+///   - **BF16** (2 bytes/elem): for large BF16 models (e.g. OLMo-3-7B: 14 GB vs 28 GB).
+///     Uses W16A32 arithmetic — weights in BF16, activations in F32.
+///     Conversion BF16→F32 is done inline in the CUDA kernel (no precision loss for
+///     weights that were originally stored as BF16).
 ///
 /// On CPU-only builds (no `atlas_cuda` cfg): this is a zero-overhead no-op;
 /// `sgemm()` always returns `false` and the caller uses its own CPU path.
 pub struct GpuMatrix {
     #[cfg(atlas_cuda)]
-    buf: Option<gpu::GpuBuf>,
+    buf: Option<gpu::GpuBufKind>,
     pub rows: usize,   // output dimension
     pub cols: usize,   // input dimension
 }
 
 impl GpuMatrix {
-    /// Upload a row-major f32 matrix [rows × cols] to GPU VRAM.
+    /// Upload a row-major **f32** matrix [rows × cols] to GPU VRAM.
     /// Falls back gracefully if CUDA is not available.
     pub fn upload(data: &[f32], rows: usize, cols: usize) -> Self {
         debug_assert_eq!(data.len(), rows * cols);
         Self {
             #[cfg(atlas_cuda)]
-            buf: if cuda_available() { gpu::GpuBuf::upload(data) } else { None },
+            buf: if cuda_available() {
+                gpu::GpuBuf::upload(data).map(gpu::GpuBufKind::F32)
+            } else { None },
             rows,
             cols,
         }
     }
 
-    /// Whether the matrix is resident in GPU VRAM.
+    /// Upload a row-major **BF16** matrix [rows × cols] to GPU VRAM.
+    ///
+    /// `data` contains BF16 bit patterns as `u16` (native BF16 representation).
+    /// Uses W16A32: weights in BF16 VRAM, activations remain f32.
+    /// Falls back gracefully if CUDA is not available.
+    pub fn upload_bf16(data: &[u16], rows: usize, cols: usize) -> Self {
+        debug_assert_eq!(data.len(), rows * cols);
+        Self {
+            #[cfg(atlas_cuda)]
+            buf: if cuda_available() {
+                gpu::GpuBufBf16::upload(data).map(gpu::GpuBufKind::BF16)
+            } else { None },
+            rows,
+            cols,
+        }
+    }
+
+    /// Whether the matrix is resident in GPU VRAM (any precision).
     pub fn is_on_gpu(&self) -> bool {
         #[cfg(atlas_cuda)]
         { self.buf.is_some() }
+        #[cfg(not(atlas_cuda))]
+        { false }
+    }
+
+    /// Whether the matrix uses BF16 precision in VRAM.
+    pub fn is_bf16(&self) -> bool {
+        #[cfg(atlas_cuda)]
+        { self.buf.as_ref().map_or(false, |b| b.is_bf16()) }
         #[cfg(not(atlas_cuda))]
         { false }
     }
@@ -162,6 +253,7 @@ impl GpuMatrix {
     ///
     /// Weight matrix is already in VRAM. Only `rhs` (the input activations)
     /// is uploaded per call — typically a tiny x-vector (k floats).
+    /// Dispatches to the BF16 or F32 kernel based on the stored weight precision.
     ///
     /// Returns `true` if GPU was used; caller should fall back to CPU if `false`.
     pub fn sgemm(&self, rhs: &[f32], k: usize, n: usize, out: &mut [f32]) -> bool {
@@ -173,11 +265,19 @@ impl GpuMatrix {
         if let Some(ref a_buf) = self.buf {
             if let Some(b_buf) = gpu::GpuBuf::upload(rhs) {
                 if let Some(c_buf) = gpu::GpuBuf::alloc(m * n) {
-                    unsafe {
-                        ffi::atlas_matmul_f32(
-                            a_buf.ptr, b_buf.ptr, c_buf.ptr,
-                            m as i32, n as i32, k as i32,
-                        );
+                    match a_buf {
+                        gpu::GpuBufKind::F32(f32_buf) => unsafe {
+                            ffi::atlas_matmul_f32(
+                                f32_buf.ptr, b_buf.ptr, c_buf.ptr,
+                                m as i32, n as i32, k as i32,
+                            );
+                        },
+                        gpu::GpuBufKind::BF16(bf16_buf) => unsafe {
+                            ffi::atlas_sgemm_bf16_f32(
+                                bf16_buf.ptr, b_buf.ptr, c_buf.ptr,
+                                m as i32, n as i32, k as i32,
+                            );
+                        },
                     }
                     out.copy_from_slice(&c_buf.download());
                     return true;
@@ -191,6 +291,7 @@ impl GpuMatrix {
     ///
     /// Returns the output `GpuVec` (still in VRAM — no D2H download).
     /// This is the zero-copy path: input stays in VRAM between operations.
+    /// Dispatches to BF16 or F32 kernel based on weight precision.
     ///
     /// Falls back to None if CUDA not available (caller must use CPU path).
     pub fn sgemm_vec(&self, x: &GpuVec, n: usize) -> Option<GpuVec> {
@@ -198,11 +299,19 @@ impl GpuMatrix {
         #[cfg(atlas_cuda)]
         if let (Some(ref a_buf), Some(ref x_buf)) = (&self.buf, &x.buf) {
             let out_buf = gpu::GpuBuf::alloc(m * n)?;
-            unsafe {
-                ffi::atlas_matmul_f32(
-                    a_buf.ptr, x_buf.ptr, out_buf.ptr,
-                    m as i32, n as i32, self.cols as i32,
-                );
+            match a_buf {
+                gpu::GpuBufKind::F32(f32_buf) => unsafe {
+                    ffi::atlas_matmul_f32(
+                        f32_buf.ptr, x_buf.ptr, out_buf.ptr,
+                        m as i32, n as i32, self.cols as i32,
+                    );
+                },
+                gpu::GpuBufKind::BF16(bf16_buf) => unsafe {
+                    ffi::atlas_sgemm_bf16_f32(
+                        bf16_buf.ptr, x_buf.ptr, out_buf.ptr,
+                        m as i32, n as i32, self.cols as i32,
+                    );
+                },
             }
             return Some(GpuVec {
                 buf: Some(out_buf),
@@ -216,7 +325,15 @@ impl GpuMatrix {
 
 impl std::fmt::Debug for GpuMatrix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "GpuMatrix({}×{}, gpu={})", self.rows, self.cols, self.is_on_gpu())
+        #[cfg(atlas_cuda)]
+        let dtype = match &self.buf {
+            Some(gpu::GpuBufKind::F32(_))  => "f32",
+            Some(gpu::GpuBufKind::BF16(_)) => "bf16",
+            None => "cpu",
+        };
+        #[cfg(not(atlas_cuda))]
+        let dtype = "cpu";
+        write!(f, "GpuMatrix({}×{}, {})", self.rows, self.cols, dtype)
     }
 }
 

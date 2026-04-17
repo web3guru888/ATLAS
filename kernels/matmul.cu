@@ -293,6 +293,57 @@ __global__ void silu_mul_kernel(
     out[i] = silu_g * up[i];
 }
 
+/* ─── BF16 weight × F32 activation tiled GEMM (W16A32) ──────────────────── */
+/*                                                                            */
+/* BF16 is exactly the upper 16 bits of IEEE 754 f32.                        */
+/* Conversion: f32 = __uint_as_float((uint32_t)bf16 << 16)                   */
+/* No cuda_bf16.h required — portable across sm_75+.                         */
+/*                                                                            */
+/* A_bf16[M×K] in BF16 (uint16_t) × B[K×N] in F32 → C[M×N] in F32.         */
+/* Memory savings vs F32: weights use ½ VRAM (14 GB instead of 28 GB for 7B) */
+
+static __device__ __forceinline__ float bf16u_to_f32(uint16_t h) {
+    return __uint_as_float(((uint32_t)h) << 16);
+}
+
+__global__ void sgemm_bf16_kernel(
+    const uint16_t* __restrict__ A_bf16,   /* weights  [M × K] in BF16 */
+    const float*    __restrict__ B,         /* input    [K × N] in F32  */
+    float*          __restrict__ C,         /* output   [M × N] in F32  */
+    int M, int N, int K
+) {
+    __shared__ float sA[TILE][TILE + 1]; /* +1 avoids bank conflicts */
+    __shared__ float sB[TILE][TILE + 1];
+
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+    float acc = 0.0f;
+
+    for (int t = 0; t < (K + TILE - 1) / TILE; t++) {
+        /* Load tile of A: convert BF16 → F32 on the fly (no precision loss
+         * for BF16-origin weights; upper 16 bits of f32 = bf16 pattern) */
+        int aCol = t * TILE + threadIdx.x;
+        sA[threadIdx.y][threadIdx.x] = (row < M && aCol < K)
+            ? bf16u_to_f32(A_bf16[row * K + aCol]) : 0.0f;
+
+        /* Load tile of B (already F32) */
+        int bRow = t * TILE + threadIdx.y;
+        sB[threadIdx.y][threadIdx.x] = (bRow < K && col < N)
+            ? B[bRow * N + col] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int k = 0; k < TILE; k++) {
+            acc = __fmaf_rn(sA[threadIdx.y][k], sB[k][threadIdx.x], acc);
+        }
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = acc;
+}
+
 /* ─── VRAM→VRAM memcpy helper ────────────────────────────────────────────── */
 /* For KV cache writes that stay in VRAM */
 __global__ void copy_kernel(const float* src, float* dst, int n) {
@@ -417,6 +468,21 @@ void atlas_vram_copy_f32(const float* src, float* dst, int n) {
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
     copy_kernel<<<blocks, threads>>>(src, dst, n);
+    cudaDeviceSynchronize();
+}
+
+/* BF16 weight × F32 activation GEMM (W16A32).
+ * A_bf16[M,K]: BF16 weights (uint16_t).
+ * B[K,N]: F32 activations.
+ * C[M,N]: F32 output.
+ * Uses tiled GEMM with inline BF16→F32 conversion in shared memory. */
+void atlas_sgemm_bf16_f32(
+    const uint16_t* A_bf16, const float* B, float* C,
+    int M, int N, int K
+) {
+    dim3 block(TILE, TILE);
+    dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
+    sgemm_bf16_kernel<<<grid, block>>>(A_bf16, B, C, M, N, K);
     cudaDeviceSynchronize();
 }
 
