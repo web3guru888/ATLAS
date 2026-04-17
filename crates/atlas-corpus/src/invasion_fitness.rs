@@ -32,13 +32,29 @@ pub struct InvasionFitnessConfig {
     pub success_weight: f32,
     /// Weight on cost term (default: 0.5).
     pub cost_weight: f32,
-    /// Weight on competition term Σ cos_sim·n̄ (default: 1.0).
+    /// Weight on competition term Σ α_{ij}·n̄ (default: 1.0).
     pub competition_weight: f32,
+    /// Minimum cosine similarity below which competition is treated as zero.
+    ///
+    /// Default: 0.2 — approximately 4σ above the noise floor for random unit vectors
+    /// in d=384 embedding space (std ≈ 1/√384 ≈ 0.051). Morphs with cos_sim below
+    /// this threshold occupy sufficiently different semantic regions that competition
+    /// is negligible. Negative cos_sim → α_{ij} = 0 (no mutualism).
+    ///
+    /// Lotka-Volterra coexistence requires α_{ij} ≥ 0. Negative competition coefficients
+    /// (from raw cos_sim) modelled mutualism, not competition — always wrong here.
+    /// Fix (Issue #11): α_{ij} = ReLU(cos_sim − competition_threshold).
+    pub competition_threshold: f32,
 }
 
 impl Default for InvasionFitnessConfig {
     fn default() -> Self {
-        Self { success_weight: 1.0, cost_weight: 0.5, competition_weight: 1.0 }
+        Self {
+            success_weight: 1.0,
+            cost_weight: 0.5,
+            competition_weight: 1.0,
+            competition_threshold: 0.2,
+        }
     }
 }
 
@@ -55,6 +71,7 @@ impl Default for InvasionFitnessConfig {
 ///         embedding: vec![0.0, 1.0], pheromone_weight: 0.5 },
 /// ];
 /// let fitness = scorer.score(&candidate, &residents);
+/// // Orthogonal embeddings: cos_sim=0 < threshold=0.2 → zero competition → high fitness
 /// assert!(fitness > 0.0);
 /// ```
 #[derive(Debug, Clone)]
@@ -73,13 +90,29 @@ impl InvasionFitnessScorer {
     ///
     /// f(y) = success_weight·success(y)
     ///        − cost_weight·cost(y)
-    ///        − competition_weight · Σᵢ cos_sim(emb(y), emb(xᵢ)) · n̄ᵢ
+    ///        − competition_weight · Σᵢ α_{ij} · n̄ᵢ
+    ///
+    /// where α_{ij} = ReLU(cos_sim(emb(y), emb(xᵢ)) − competition_threshold).
+    ///
+    /// The ReLU threshold (default 0.2) ensures:
+    /// - α_{ij} ≥ 0 always (Lotka-Volterra coexistence requirement).
+    /// - Anti-correlated embeddings (cos_sim < 0) do NOT boost fitness (no mutualism).
+    /// - Near-orthogonal noise-level similarity is suppressed (< 4σ in d=384 space).
+    ///
+    /// Issue #11 fix: the old formula used raw cos_sim ∈ [−1, 1], allowing negative
+    /// α_{ij} which rewarded anti-correlated strategies — physically wrong.
     pub fn score(&self, candidate: &FitnessItem, residents: &[FitnessItem]) -> f32 {
         let success = self.config.success_weight * candidate.success_rate;
         let cost = self.config.cost_weight * candidate.cost;
         let competition: f32 = self.config.competition_weight
             * residents.iter()
-                .map(|r| cosine_sim(&candidate.embedding, &r.embedding) * r.pheromone_weight)
+                .map(|r| {
+                    let sim = cosine_sim(&candidate.embedding, &r.embedding);
+                    // α_{ij} = ReLU(cos_sim − τ): clip to zero below threshold.
+                    // Guarantees α_{ij} ≥ 0 (Lotka-Volterra: no mutualism).
+                    let alpha = (sim - self.config.competition_threshold).max(0.0);
+                    alpha * r.pheromone_weight
+                })
                 .sum::<f32>();
         success - cost - competition
     }
@@ -198,5 +231,46 @@ mod tests {
         let f = scorer.score(&candidate, &[]);
         // expected = 1.0×0.8 − 0.5×0.2 − 0.0 = 0.7
         assert!((f - 0.7).abs() < 1e-6, "expected 0.7, got {f}");
+    }
+
+    // ── Issue #11 regression tests — Bug 2: competition coefficients ──────────
+
+    /// Anti-correlated embeddings (cos_sim = −1) must NOT produce a fitness bonus.
+    /// Old code: competition = −1.0 × weight → negative → ADDS to fitness (wrong).
+    /// Fixed code: alpha = ReLU(−1 − 0.2) = 0 → zero competition.
+    #[test]
+    fn competition_never_negative_for_anticorrelated_embeddings() {
+        let scorer = InvasionFitnessScorer::default_scorer();
+        let candidate     = item(0.5, 0.1, vec![-1.0, 0.0], 1.0);
+        let resident      = item(0.5, 0.1, vec![ 1.0, 0.0], 2.0); // exactly opposite
+
+        let f_with_opposite = scorer.score(&candidate, &[resident]);
+        let f_no_residents  = scorer.score(&candidate, &[]);
+
+        // Anti-correlated resident must never BOOST fitness above the no-competition baseline.
+        assert!(f_with_opposite <= f_no_residents + f32::EPSILON,
+            "anti-correlated resident boosted fitness: with={f_with_opposite:.6}, \
+             no_residents={f_no_residents:.6} — old mutualism bug still present");
+    }
+
+    /// Embeddings with cos_sim below the threshold (default 0.2) must produce
+    /// exactly zero competition — they occupy different enough semantic regions.
+    #[test]
+    fn competition_threshold_suppresses_near_orthogonal_noise() {
+        let scorer = InvasionFitnessScorer::default_scorer();
+        // cos_sim([1,0,0,0], [0.1, 0.995, 0, 0]) ≈ 0.1/sqrt(1) = 0.1 < threshold 0.2
+        let candidate = item(0.8, 0.1, vec![1.0, 0.0, 0.0, 0.0], 1.0);
+        let resident  = item(0.5, 0.2, vec![0.1, 0.995, 0.0, 0.0], 1.0);
+
+        let sim = cosine_sim(&candidate.embedding, &resident.embedding);
+        assert!(sim < 0.2, "test setup: cos_sim={sim:.4} should be below threshold 0.2");
+
+        let f_near_orthogonal = scorer.score(&candidate, &[resident]);
+        let f_no_residents    = scorer.score(&candidate, &[]);
+
+        // Below-threshold resident → zero alpha → no competition effect.
+        assert!((f_near_orthogonal - f_no_residents).abs() < 1e-5,
+            "below-threshold resident should not affect fitness: \
+             near_orth={f_near_orthogonal:.6}, no_res={f_no_residents:.6}");
     }
 }

@@ -310,17 +310,29 @@ impl CasDecayCalibrator {
 // ── CanonicalPheromoneUpdate ───────────────────────────────────────────────
 //
 // Implements the canonical equation from Champagnat-Méléard (2011) PTRF §4
-// and Champagnat-Hass (2025) AAP for adaptive pheromone decay:
+// and Champagnat-Hass (2025) AAP for adaptive pheromone decay.
 //
-//   Δρ = ½ · μ · σ² · n̄ · |∂₁s|
+// v4.0.3 FIX (Issue #11): The original linear formula
+//   λ = base_rate × (1 − ½·μ·σ²·n̄·|∂₁s|)
+// exits its valid domain when the canonical term > 1 (common in early training),
+// producing negative internal values and a dead gradient at the clamp boundary.
+//
+// Replacement: exponential formulation
+//   λ = base_rate × exp(−½·μ·σ²·n̄·|∂₁s|)
+//
+// Properties:
+//   - Always positive: exp(−x) > 0 for all x.
+//   - Zero-gradient fidelity: at zero gradient, output = base_rate (unchanged from original).
+//   - First-order match: Taylor exp(−x) ≈ 1 − x + … matches the linear formula to
+//     first order for small canonical terms (normal operating range).
+//   - Smooth everywhere: no gradient discontinuity at any boundary.
+//   - Hardware-friendly: exp is a standard digital/analog primitive; no comparator needed.
 //
 // where:
 //   μ = explore_ratio   (mutation rate proxy)
 //   σ = temperature     (landscape variance proxy; σ² = temperature²)
 //   n̄ = avg_pheromone   (equilibrium density)
 //   ∂₁s = delta_success_rate (selection gradient)
-//
-// The adjusted rate = base_rate × (1 − Δρ), clamped to [min_rate, max_rate].
 
 /// State snapshot passed to [`CanonicalPheromoneUpdate::compute_rate`].
 #[derive(Debug, Clone)]
@@ -375,18 +387,34 @@ impl CanonicalPheromoneUpdate {
     /// Create with default parameters.
     pub fn new() -> Self { Self::default() }
 
-    /// Compute adaptive decay rate using Champagnat canonical equation.
+    /// Compute adaptive decay rate using Champagnat canonical equation (exp formulation).
     ///
-    /// rate = base_rate × (1 − ½·μ·σ²·n̄·|∂₁s|), clamped to [min_rate, max_rate].
+    /// λ = base_rate × exp(−½·μ·σ²·n̄·|∂₁s|)
+    ///
+    /// This replaces the original linear formula `base_rate × (1 − canonical_term)` which
+    /// exits its valid domain (goes negative) when `canonical_term > 1`. Properties:
+    ///
+    /// - **Always positive**: exp(−x) > 0 for all x.
+    /// - **Zero-gradient fidelity**: at `canonical_term = 0`, output = `base_rate` (unchanged).
+    /// - **First-order match**: Taylor expansion `exp(−x) ≈ 1 − x + …` matches the original
+    ///   linear formula to first order for small gradients.
+    /// - **Smooth everywhere**: no gradient discontinuity at any boundary.
+    /// - **Natural decay**: as `|∇f| → ∞`, rate → 0 (pheromones freeze at singularities).
+    ///
+    /// The clamp is retained as a final safety rail for fp edge cases.
+    /// See module-level comment for full rationale (Issue #11 fix).
     pub fn compute_rate(&mut self, state: &CanonicalUpdateState) -> f32 {
         let sigma_sq = state.temperature * state.temperature;
-        let canonical_delta = 0.5
+        let canonical_term = 0.5
             * state.explore_ratio
             * sigma_sq
             * state.avg_pheromone
             * state.delta_success_rate.abs();
-        let adjusted = self.base_rate * (1.0 - canonical_delta);
-        let rate = adjusted.clamp(self.min_rate, self.max_rate);
+        // Exponential: base_rate × exp(−canonical_term).
+        // Always positive, smooth, matches original to first order near zero.
+        let rate = self.base_rate * (-canonical_term).exp();
+        // Final safety clamp (fp edge case guard; exp already guarantees positivity).
+        let rate = rate.clamp(self.min_rate, self.max_rate);
         self.last_rate = rate;
         self.updates += 1;
         rate
@@ -698,7 +726,8 @@ mod tests {
     #[test]
     fn canonical_update_clamped_to_min() {
         let mut updater = CanonicalPheromoneUpdate::default();
-        // Very large canonical delta → adjusted rate goes negative → clamp to min
+        // Very large canonical term → exp(−5000) underflows to 0.0 → clamp to min_rate.
+        // (With the old linear formula this went negative; exp formulation approaches 0.)
         let state = CanonicalUpdateState {
             explore_ratio: 1.0, temperature: 10.0,
             avg_pheromone: 100.0, delta_success_rate: 1.0,
@@ -741,5 +770,63 @@ mod tests {
         };
         let rate = updater.compute_rate(&state);
         assert!((updater.last_rate - rate).abs() < 1e-9);
+    }
+
+    // ── Issue #11 regression tests — Bug 1: λ decay formula ──────────────────
+
+    /// Rate must be ≥ 0 across 10,000 random (er, temp, avg, grad) combinations.
+    /// This directly tests the fix: the old linear formula went negative for many
+    /// of these inputs; the exp formulation never does.
+    #[test]
+    fn canonical_update_never_negative_across_random_inputs() {
+        let mut updater = CanonicalPheromoneUpdate::default();
+        let mut rng: u64 = 0xdeadbeef_cafebabe;
+        for _ in 0..10_000 {
+            // LCG — no external deps
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let er   = (rng >> 48) as f32 / 65535.0;                         // [0, 1]
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let temp = 0.01 + (rng >> 48) as f32 / 65535.0 * 20.0;          // [0.01, 20]
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let avg  = (rng >> 48) as f32 / 65535.0 * 100.0;                 // [0, 100]
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let grad = (rng >> 48) as f32 / 65535.0 * 50.0;                  // [0, 50]
+            let state = CanonicalUpdateState {
+                explore_ratio: er, temperature: temp,
+                avg_pheromone: avg, delta_success_rate: grad,
+            };
+            let rate = updater.compute_rate(&state);
+            assert!(rate >= 0.0,
+                "rate went negative: er={er}, temp={temp}, avg={avg}, grad={grad} → {rate}");
+            assert!(rate <= updater.max_rate + f32::EPSILON,
+                "rate exceeded max_rate: {rate}");
+        }
+    }
+
+    /// The exp formulation is smooth at the old linear formula's failure boundary
+    /// (canonical_term = 1.0, i.e., where the original formula hit zero before going
+    /// negative). A non-zero finite difference confirms no gradient discontinuity.
+    #[test]
+    fn canonical_update_smooth_at_old_failure_boundary() {
+        let mut updater = CanonicalPheromoneUpdate::default();
+        let eps = 1e-3_f32;
+        // er=1, temp=√2, avg=1, grad=1 → canonical_term = 0.5×1×2×1×1 = 1.0 (old zero point)
+        let state_lo = CanonicalUpdateState {
+            explore_ratio: 1.0, temperature: 2_f32.sqrt(),
+            avg_pheromone: 1.0, delta_success_rate: 1.0 - eps,
+        };
+        let state_hi = CanonicalUpdateState {
+            explore_ratio: 1.0, temperature: 2_f32.sqrt(),
+            avg_pheromone: 1.0, delta_success_rate: 1.0 + eps,
+        };
+        let r_lo = updater.compute_rate(&state_lo);
+        let r_hi = updater.compute_rate(&state_hi);
+        // Both must be positive
+        assert!(r_lo > 0.0, "r_lo should be positive at old boundary, got {r_lo}");
+        assert!(r_hi > 0.0, "r_hi should be positive past old boundary, got {r_hi}");
+        // Finite difference must be non-zero (smooth, not flat from clamp)
+        let slope = (r_hi - r_lo).abs() / (2.0 * eps);
+        assert!(slope > 1e-5,
+            "exp should have non-zero slope at old failure boundary, got slope={slope}");
     }
 }

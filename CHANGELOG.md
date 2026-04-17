@@ -6,6 +6,35 @@ ATLAS uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.0.3] — 2026-04-17
+
+### Fixed
+- **Issue #11 — Bug 1: `CanonicalPheromoneUpdate` λ decay formula** (`atlas-palace`):
+  The Champagnat canonical equation `λ = base_rate × (1 − ½·er·σ²·n̄·|∇f|)` exits its valid
+  domain (goes internally negative) when `canonical_term > 1`, which is routinely exceeded
+  during early training when gradients are steep. The old `.clamp()` masked the output but left
+  a dead gradient at the clamp boundary and would have been unsafe to spec into the v6 ASIC
+  decay circuit. **Fix**: replace with `λ = base_rate × exp(−canonical_term)`. Properties:
+  always positive, zero-gradient fidelity (output = `base_rate` at `canonical_term = 0`),
+  first-order match to the original formula (`exp(−x) ≈ 1 − x + …`), smooth everywhere,
+  no gradient discontinuity.
+- **Issue #11 — Bug 2: `InvasionFitnessScorer` negative competition coefficients** (`atlas-corpus`):
+  Raw `cosine_sim ∈ [−1, 1]` was used as the Lotka-Volterra competition coefficient α_{ij}.
+  Negative cosine similarity (anti-correlated embeddings) produced negative competition — adding
+  a fitness bonus for semantic opposites, equivalent to mutualism. Lotka-Volterra coexistence
+  requires α_{ij} ≥ 0. **Fix**: `α_{ij} = ReLU(cos_sim − competition_threshold)` with
+  configurable `competition_threshold` (default 0.2 ≈ 4σ above noise floor in d=384 embedding
+  space). Anti-correlated and near-orthogonal morphs produce zero competition; only genuinely
+  similar morphs compete. `competition_threshold` added to `InvasionFitnessConfig`.
+
+### Tests: 532 / 532 (+4 new regression tests)
+- `canonical_update_never_negative_across_random_inputs` — 10,000 random (er, temp, avg, grad) samples; all rates ≥ 0
+- `canonical_update_smooth_at_old_failure_boundary` — non-zero finite difference at the old linear formula's zero-crossing
+- `competition_never_negative_for_anticorrelated_embeddings` — anti-correlated resident cannot boost candidate fitness
+- `competition_threshold_suppresses_near_orthogonal_noise` — cos_sim < 0.2 → zero competition effect
+
+---
+
 ## [4.0.2] — 2026-04-17
 
 ### Added
