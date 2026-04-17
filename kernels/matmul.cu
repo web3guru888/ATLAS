@@ -293,6 +293,15 @@ __global__ void silu_mul_kernel(
     out[i] = silu_g * up[i];
 }
 
+/* ─── BF16 conversion helper ──────────────────────────────────────────────── */
+/* BF16 is exactly the upper 16 bits of IEEE 754 f32.                         */
+/* Conversion: f32 = __uint_as_float((uint32_t)bf16 << 16)                    */
+/* No cuda_bf16.h required — portable across sm_75+.                          */
+
+static __device__ __forceinline__ float bf16u_to_f32(uint16_t h) {
+    return __uint_as_float(((uint32_t)h) << 16);
+}
+
 /* ─── Efficient GEMV kernels for autoregressive inference (N=1) ─────────── */
 /*                                                                            */
 /* The tiled GEMM above is designed for large batch/prefill (N >> 1).        */
@@ -349,16 +358,8 @@ __global__ void sgemv_bf16_kernel(
 
 /* ─── BF16 weight × F32 activation tiled GEMM (W16A32) ──────────────────── */
 /*                                                                            */
-/* BF16 is exactly the upper 16 bits of IEEE 754 f32.                        */
-/* Conversion: f32 = __uint_as_float((uint32_t)bf16 << 16)                   */
-/* No cuda_bf16.h required — portable across sm_75+.                         */
-/*                                                                            */
 /* A_bf16[M×K] in BF16 (uint16_t) × B[K×N] in F32 → C[M×N] in F32.         */
 /* Memory savings vs F32: weights use ½ VRAM (14 GB instead of 28 GB for 7B) */
-
-static __device__ __forceinline__ float bf16u_to_f32(uint16_t h) {
-    return __uint_as_float(((uint32_t)h) << 16);
-}
 
 __global__ void sgemm_bf16_kernel(
     const uint16_t* __restrict__ A_bf16,   /* weights  [M × K] in BF16 */
