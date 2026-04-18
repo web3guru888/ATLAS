@@ -296,8 +296,11 @@ fn handle_chat_nonstream(
     let (content, prompt_tokens, completion_tokens) =
         run_inference(state, prompt, req.max_tokens, &config);
 
-    // Think budget: if <think> found but never closed, truncate and close it.
+    // Strip think blocks from output — users shouldn't see raw <think> text.
+    // 1. Close unclosed blocks (think budget)
+    // 2. Remove all <think>...</think> blocks from the final output
     let content = enforce_think_budget(&content, 100);
+    let content = strip_think_blocks(&content);
 
     let model_id = state.lock().unwrap().model_id.clone();
     let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
@@ -325,6 +328,34 @@ fn enforce_think_budget(text: &str, budget_words: usize) -> String {
         }
     }
     text.to_string()
+}
+
+/// Strip all `<think>...</think>` blocks from the output text.
+///
+/// Small models often generate `<think>` blocks despite system prompt
+/// instructions not to. This post-processing ensures clean output.
+fn strip_think_blocks(text: &str) -> String {
+    let mut result = String::new();
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<think>") {
+        // Add everything before the think block
+        result.push_str(&remaining[..start]);
+        // Find the end of the think block
+        if let Some(end) = remaining[start..].find("</think>") {
+            remaining = &remaining[start + end + 8..]; // len("</think>") = 8
+        } else {
+            // No closing tag — discard everything from <think> onwards
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        // If stripping removed everything, return a minimal response
+        return text.to_string();
+    }
+    trimmed.to_string()
 }
 
 fn handle_chat_stream(
@@ -392,13 +423,13 @@ fn handle_chat_stream(
     let mut token_count: usize = 0;
     let mut write_ok = true;
 
-    // Think budget: track <think> blocks and force-close after a limit.
-    // This prevents small models from endlessly rambling in think blocks.
-    let think_budget: usize = 100; // max tokens inside <think> before force-close
+    // Think block suppression: track <think> blocks and hide them from the
+    // client. Small models often generate <think> despite system prompts;
+    // we silently consume think tokens and only stream visible content.
+    let think_budget: usize = 100; // max tokens inside <think> before we stop
     let mut accumulated_text = String::new();
     let mut in_think_block = false;
     let mut think_tokens: usize = 0;
-    let mut think_closed = false;
 
     model.generate_streaming(
         &prompt_tokens,
@@ -417,37 +448,27 @@ fn handle_chat_stream(
 
             accumulated_text.push_str(&text);
 
-            // Track think block state
+            // Track think block state — suppress all content inside <think>...</think>
             if !in_think_block && accumulated_text.contains("<think>") {
                 in_think_block = true;
                 think_tokens = 0;
+                // Don't send <think> or anything inside it
+                return true;
             }
             if in_think_block {
+                think_tokens += 1;
                 if accumulated_text.contains("</think>") {
                     in_think_block = false;
-                    think_closed = true;
-                } else {
-                    think_tokens += 1;
-                    if think_tokens > think_budget && !think_closed {
-                        // Force-close the think block
-                        let close_chunk = StreamChunk {
-                            id: id_owned.clone(),
-                            model: model_id.clone(),
-                            delta: "\n</think>\n\n".to_string(),
-                            done: false,
-                            finish_reason: None,
-                        };
-                        if write_sse_chunk(stream, &close_chunk.to_sse()).is_err() {
-                            write_ok = false;
-                            return false;
-                        }
-                        think_closed = true;
-                        in_think_block = false;
-                        // Don't emit the current token — it was part of the ramble.
-                        // Continue generating so the model can produce an actual answer.
-                        return true;
-                    }
+                    // Think block closed — resume sending visible content
+                    return true;
                 }
+                if think_tokens > think_budget {
+                    // Budget exceeded — stop suppressing, let remaining tokens through
+                    in_think_block = false;
+                    return true;
+                }
+                // Still inside think block — suppress this token
+                return true;
             }
 
             let finish_reason: Option<&'static str> = if token_count >= max_tokens {
@@ -722,5 +743,34 @@ mod tests {
         inject_default_system_prompt(&mut messages);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "Custom system");
+    }
+
+    #[test]
+    fn strip_think_blocks_removes_closed() {
+        let text = "<think>\nsome thinking\n</think>\n\nMadrid is the capital.";
+        let result = strip_think_blocks(text);
+        assert_eq!(result, "Madrid is the capital.");
+    }
+
+    #[test]
+    fn strip_think_blocks_removes_multiple() {
+        let text = "<think>thought 1</think>Hello <think>thought 2</think>world!";
+        let result = strip_think_blocks(text);
+        assert_eq!(result, "Hello world!");
+    }
+
+    #[test]
+    fn strip_think_blocks_no_blocks() {
+        let text = "Just a normal response.";
+        let result = strip_think_blocks(text);
+        assert_eq!(result, text);
+    }
+
+    #[test]
+    fn strip_think_blocks_unclosed_discards() {
+        let text = "<think>rambling without end";
+        let result = strip_think_blocks(text);
+        // Falls back to original since stripping leaves empty
+        assert_eq!(result, text);
     }
 }
