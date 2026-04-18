@@ -648,6 +648,20 @@ impl Attention {
         self.wk.forward(x, &mut k);
         self.wv.forward(x, &mut v);
 
+        // OLMo-2/3 QK-norm: per-head RMSNorm on Q and K BEFORE RoPE
+        if !self.q_norm.is_empty() {
+            for h in 0..self.n_heads {
+                let s = h * self.head_dim;
+                rmsnorm_inplace(&mut q[s..s+self.head_dim], &self.q_norm[s..s+self.head_dim], 1e-6);
+            }
+        }
+        if !self.k_norm.is_empty() {
+            for h in 0..self.n_kv_heads {
+                let s = h * self.head_dim;
+                rmsnorm_inplace(&mut k[s..s+self.head_dim], &self.k_norm[s..s+self.head_dim], 1e-6);
+            }
+        }
+
         // Apply RoPE to each Q head
         for h in 0..self.n_heads {
             rope.apply(&mut q[h*self.head_dim..(h+1)*self.head_dim], pos);
@@ -725,14 +739,17 @@ impl Attention {
         let     v = v_gpu.download();
 
         // OLMo-2 QK-norm: per-head RMSNorm on Q and K before RoPE
+        // Each head has its own norm weights: q_norm[h*head_dim..(h+1)*head_dim]
         if !self.q_norm.is_empty() {
             for h in 0..self.n_heads {
-                rmsnorm_inplace(&mut q[h*self.head_dim..(h+1)*self.head_dim], &self.q_norm, 1e-6);
+                let s = h * self.head_dim;
+                rmsnorm_inplace(&mut q[s..s+self.head_dim], &self.q_norm[s..s+self.head_dim], 1e-6);
             }
         }
         if !self.k_norm.is_empty() {
             for h in 0..self.n_kv_heads {
-                rmsnorm_inplace(&mut k[h*self.head_dim..(h+1)*self.head_dim], &self.k_norm, 1e-6);
+                let s = h * self.head_dim;
+                rmsnorm_inplace(&mut k[s..s+self.head_dim], &self.k_norm[s..s+self.head_dim], 1e-6);
             }
         }
 
@@ -860,17 +877,29 @@ impl TransformerBlock {
 
     /// CPU-only path for one token at position `pos`. x: [d_model] → modified in-place.
     fn forward_token_cpu(&mut self, x: &mut Vec<f32>, pos: usize, rope: &RopeCache) {
-        // Attention sub-layer with pre-norm residual
-        let mut x_norm = x.clone();
-        rmsnorm_inplace(&mut x_norm, &self.attn_norm, self.eps);
-        let attn_out = self.attn.forward_token(&x_norm, pos, rope);
-        for (xi, &ai) in x.iter_mut().zip(attn_out.iter()) { *xi += ai; }
+        if self.post_norm {
+            // OLMo-2/3 post-norm: no pre-norm, norm output only, then add residual
+            let attn_out = self.attn.forward_token(x, pos, rope);
+            let mut normed = attn_out;
+            rmsnorm_inplace(&mut normed, &self.attn_norm, self.eps);
+            for (xi, &ni) in x.iter_mut().zip(normed.iter()) { *xi += ni; }
 
-        // FFN sub-layer with pre-norm residual
-        let mut x_norm2 = x.clone();
-        rmsnorm_inplace(&mut x_norm2, &self.ffn_norm, self.eps);
-        let ffn_out = self.ffn.forward(&x_norm2);
-        for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) { *xi += fi; }
+            let ffn_out = self.ffn.forward(x);
+            let mut normed = ffn_out;
+            rmsnorm_inplace(&mut normed, &self.ffn_norm, self.eps);
+            for (xi, &ni) in x.iter_mut().zip(normed.iter()) { *xi += ni; }
+        } else {
+            // Llama pre-norm: norm before attention and FFN
+            let mut x_norm = x.clone();
+            rmsnorm_inplace(&mut x_norm, &self.attn_norm, self.eps);
+            let attn_out = self.attn.forward_token(&x_norm, pos, rope);
+            for (xi, &ai) in x.iter_mut().zip(attn_out.iter()) { *xi += ai; }
+
+            let mut x_norm2 = x.clone();
+            rmsnorm_inplace(&mut x_norm2, &self.ffn_norm, self.eps);
+            let ffn_out = self.ffn.forward(&x_norm2);
+            for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) { *xi += fi; }
+        }
     }
 
     /// GPU transformer block: RMSNorm, attention projections, and FFN on GPU.
@@ -884,22 +913,29 @@ impl TransformerBlock {
         use atlas_tensor::GpuVec;
 
         if self.post_norm {
-            // ── OLMo-2 post-norm path ──────────────────────────────────────────
+            // ── OLMo-2/3 post-norm path ────────────────────────────────────────
+            // Reference: HuggingFace Olmo2DecoderLayer.forward()
+            //   attn_out = self_attn(x)                      ← no pre-norm
+            //   attn_out = post_attention_layernorm(attn_out) ← norm OUTPUT only
+            //   x = residual + attn_out                      ← residual AFTER norm
+            //   (same pattern for FFN)
             if let Some(attn_out) = self.attn.forward_token_gpu(x, pos, rope) {
-                x.add_inplace(&attn_out);
+                let norm_w = GpuVec::from_slice(&self.attn_norm);
+                let mut normed = attn_out;
+                normed.rmsnorm_inplace(&norm_w, self.eps);
+                x.add_inplace(&normed);
             } else {
                 let mut x_cpu = x.download();
                 self.forward_token_cpu(&mut x_cpu, pos, rope);
                 *x = GpuVec::from_slice(&x_cpu);
                 return;
             }
-            let norm_w = GpuVec::from_slice(&self.attn_norm);
-            x.rmsnorm_inplace(&norm_w, self.eps);
             if let Some(ffn_out) = self.ffn.forward_gpu(x) {
-                x.add_inplace(&ffn_out);
+                let ffn_norm_w = GpuVec::from_slice(&self.ffn_norm);
+                let mut normed = ffn_out;
+                normed.rmsnorm_inplace(&ffn_norm_w, self.eps);
+                x.add_inplace(&normed);
             }
-            let ffn_norm_w = GpuVec::from_slice(&self.ffn_norm);
-            x.rmsnorm_inplace(&ffn_norm_w, self.eps);
         } else {
             // ── Llama pre-norm path (default) ─────────────────────────────────
             let norm_w = GpuVec::from_slice(&self.attn_norm);
@@ -1595,6 +1631,15 @@ pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoM
     let st = SafetensorsFile::open(path)?;
     let mut model = OlmoModel::new(cfg.clone());
 
+    // Pre-detect architecture features from tensor names (iteration-order-independent).
+    let has_separate_lm_head = st.tensors.iter().any(|d| d.name == "lm_head.weight");
+    let is_post_norm = st.tensors.iter().any(|d| d.name.contains("post_feedforward_layernorm"));
+    if is_post_norm {
+        for layer in &mut model.layers {
+            layer.post_norm = true;
+        }
+    }
+
     // Map HuggingFace weight names to our model
     // BF16 tensors use GPU BF16 path (W16A32) for half the VRAM usage.
     for desc in &st.tensors {
@@ -1605,8 +1650,10 @@ pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoM
         if name == "model.embed_tokens.weight" || name == "tok_embeddings.weight" {
             let vocab = data.len() / cfg.d_model;
             model.embed = Embedding::from_data(data.clone(), vocab, cfg.d_model);
-            // Tied lm_head — embeddings typically BF16 too; use BF16 GPU path
-            model.lm_head = make_linear_bf16_aware(data, is_bf16, cfg.d_model, vocab);
+            // Only tie lm_head to embed if there's no separate lm_head.weight
+            if !has_separate_lm_head {
+                model.lm_head = make_linear_bf16_aware(data, is_bf16, cfg.d_model, vocab);
+            }
         } else if name == "model.norm.weight" || name == "norm.weight" {
             model.norm = data;
         } else if name == "lm_head.weight" {
@@ -1638,10 +1685,9 @@ pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoM
                         if layer.post_norm { layer.attn_norm = data.clone(); }
                         else               { layer.ffn_norm  = data.clone(); }
                     }
-                    // OLMo-2 post-norm specific names
+                    // OLMo-2/3 post-norm specific names (post_norm pre-set above)
                     "post_feedforward_layernorm.weight" => {
-                        layer.post_norm = true;
-                        layer.ffn_norm  = data.clone();
+                        layer.ffn_norm = data.clone();
                     }
                     "self_attn.q_norm.weight"           => layer.attn.q_norm = data.clone(),
                     "self_attn.k_norm.weight"           => layer.attn.k_norm = data.clone(),
@@ -1788,13 +1834,36 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
 
     // Build model from merged tensor map.
     // BF16-origin tensors use W16A32 GPU kernel (half the VRAM of f32 weights).
+    //
+    // Pre-detect architecture features BEFORE iterating the HashMap, because
+    // HashMap iteration order is arbitrary and some weight assignments depend
+    // on knowing the architecture variant up front.
+    //
+    // Fix 1: only tie lm_head to embed_tokens if there is NO separate lm_head.weight.
+    //   OLMo-3 has `tie_word_embeddings: false` — it ships a distinct lm_head.
+    let has_separate_lm_head = all_tensors.contains_key("lm_head.weight");
+    //
+    // Fix 2: pre-detect OLMo-2/3 post-norm architecture.  If any layer has
+    //   `post_feedforward_layernorm.weight`, all layers use post-norm ordering.
+    //   Without this, the norm ↔ field assignment depends on HashMap iteration
+    //   order (post_feedforward must come before post_attention) — a flaky bug.
+    let is_post_norm = all_tensors.keys()
+        .any(|k| k.contains("post_feedforward_layernorm"));
     let mut model = OlmoModel::new(cfg.clone());
+    if is_post_norm {
+        for layer in &mut model.layers {
+            layer.post_norm = true;
+        }
+    }
     for (name, data) in &all_tensors {
         let is_bf16 = bf16_tensors.contains(name);
         if name == "model.embed_tokens.weight" || name == "tok_embeddings.weight" {
             let vocab = data.len() / cfg.d_model;
             model.embed = Embedding::from_data(data.clone(), vocab, cfg.d_model);
-            model.lm_head = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, vocab);
+            // Only use embed weights for lm_head if model ties them (no separate lm_head.weight)
+            if !has_separate_lm_head {
+                model.lm_head = make_linear_bf16_aware(data.clone(), is_bf16, cfg.d_model, vocab);
+            }
         } else if name == "model.norm.weight" || name == "norm.weight" {
             model.norm = data.clone();
         } else if name == "lm_head.weight" {
@@ -1817,10 +1886,15 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
                     "mlp.down_proj.weight"     => layer.ffn.w_down  = make_linear_bf16_aware(data.clone(), is_bf16, cfg.ffn_hidden, cfg.d_model),
                     "input_layernorm.weight"            => layer.attn_norm = data.clone(),
                     "post_attention_layernorm.weight"   => {
+                        // Post-norm (OLMo-2/3): this is the attention post-norm
+                        // Pre-norm (Llama): this is the FFN pre-norm
                         if layer.post_norm { layer.attn_norm = data.clone(); }
                         else               { layer.ffn_norm  = data.clone(); }
                     }
-                    "post_feedforward_layernorm.weight" => { layer.post_norm = true; layer.ffn_norm = data.clone(); }
+                    "post_feedforward_layernorm.weight" => {
+                        // post_norm already set by pre-detection above
+                        layer.ffn_norm = data.clone();
+                    }
                     "self_attn.q_norm.weight"           => layer.attn.q_norm = data.clone(),
                     "self_attn.k_norm.weight"           => layer.attn.k_norm = data.clone(),
                     _ => {}

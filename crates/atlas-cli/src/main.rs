@@ -784,7 +784,7 @@ fn cmd_bench(_args: &[String]) -> i32 {
 // ────────────────────────────────────────────────────────────────────────────
 
 fn cmd_infer(args: &[String]) -> i32 {
-    use atlas_model::{ModelConfig, load_model_from_safetensors};
+    use atlas_model::{ModelConfig, load_model_from_safetensors, load_model_from_dir};
     use atlas_tokenize::Tokenizer;
 
     // ── Args ──────────────────────────────────────────────────────────────
@@ -850,14 +850,21 @@ fn cmd_infer(args: &[String]) -> i32 {
     };
 
     // ── Load weights ───────────────────────────────────────────────────────
-    let weights_file = format!("{}/model.safetensors", weights_dir.trim_end_matches('/'));
-    println!("\n  Loading weights from {weights_file} …");
+    let dir = weights_dir.trim_end_matches('/');
+    let index_path = format!("{dir}/model.safetensors.index.json");
+    let is_sharded = std::path::Path::new(&index_path).exists();
+    println!("\n  Loading weights from {dir} (sharded={is_sharded}) …");
     let load_start = std::time::Instant::now();
-    let mut model = match load_model_from_safetensors(&weights_file, cfg.clone()) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("  ✗ Failed to load weights: {e}");
-            return 1;
+    let mut model = if is_sharded {
+        match load_model_from_dir(dir, cfg.clone()) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("  ✗ Failed to load sharded weights: {e}"); return 1; }
+        }
+    } else {
+        let weights_file = format!("{dir}/model.safetensors");
+        match load_model_from_safetensors(&weights_file, cfg.clone()) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("  ✗ Failed to load weights: {e}"); return 1; }
         }
     };
     let load_ms = load_start.elapsed().as_millis();
@@ -897,6 +904,43 @@ fn cmd_infer(args: &[String]) -> i32 {
     } else {
         println!("\n  ✓  Logit spread = {spread:.2} (healthy)");
     }
+
+    // ── GPU vs CPU logits comparison ──────────────────────────────────────
+    model.reset();
+    for &t in &prompt_tokens[..prompt_tokens.len().saturating_sub(1)] {
+        model.forward_one(t);
+    }
+    let cpu_logits = model.forward_one(last_tok);
+
+    model.reset();
+    for &t in &prompt_tokens[..prompt_tokens.len().saturating_sub(1)] {
+        if let Some(_) = model.forward_one_gpu(t) {} else { model.forward_one(t); }
+    }
+    let gpu_logits = if let Some(gl) = model.forward_one_gpu(last_tok) {
+        println!("\n  GPU path: ✓ available");
+        gl
+    } else {
+        println!("\n  GPU path: ✗ not available — skipping comparison");
+        cpu_logits.clone()
+    };
+
+    // Compare top-1 CPU vs GPU
+    let cpu_top = cpu_logits.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+    let gpu_top = gpu_logits.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+    println!("  CPU top-1: token {} (logit {:.4})", cpu_top.0, cpu_top.1);
+    println!("  GPU top-1: token {} (logit {:.4})", gpu_top.0, gpu_top.1);
+    if cpu_top.0 != gpu_top.0 {
+        println!("  ⚠  CPU/GPU DISAGREE on top token!");
+    } else {
+        println!("  ✓  CPU/GPU agree on top token");
+    }
+    // Max absolute difference across all logits
+    let max_diff: f32 = cpu_logits.iter().zip(gpu_logits.iter())
+        .map(|(c, g)| (c - g).abs())
+        .fold(0.0f32, f32::max);
+    println!("  Max logit abs diff: {max_diff:.6}");
 
     // ── Generate ──────────────────────────────────────────────────────────
     println!("\n  Generating {max_new} tokens (temperature={temperature}) …");

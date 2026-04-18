@@ -1,6 +1,6 @@
 //! ATLAS API server — TCP listener, connection dispatch, model loading.
 //!
-//! One OS thread per connection. The inference state (model + tokenizer)
+//! Connections handled sequentially on the main thread. The inference state (model + tokenizer)
 //! is shared via `Arc<Mutex<InferState>>`. Connections block during inference
 //! (serialised through the mutex), which is safe and correct for a single-GPU
 //! scenario where the GPU is also the bottleneck.
@@ -16,7 +16,7 @@
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::thread;
+// thread import removed — connections handled on main thread (GPU inference is single-threaded)
 use std::time::Duration;
 
 use atlas_model::{ModelConfig, load_model_from_safetensors, load_model_from_dir};
@@ -77,8 +77,10 @@ impl ApiServer {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let state_clone = Arc::clone(&state);
-                    thread::spawn(move || handle_connection(stream, state_clone));
+                    // Handle on main thread — GPU inference is single-threaded
+                    // anyway (Mutex serialises), and spawning threads caused
+                    // garbage output from CUDA context issues.
+                    handle_connection(stream, Arc::clone(&state));
                 }
                 Err(e) => {
                     eprintln!("atlas-api: accept error: {e}");
