@@ -290,6 +290,10 @@ fn handle_chat_nonstream(
     };
     let (content, prompt_tokens, completion_tokens) =
         run_inference(state, prompt, req.max_tokens, &config);
+
+    // Think budget: if <think> found but never closed, truncate and close it.
+    let content = enforce_think_budget(&content, 200);
+
     let model_id = state.lock().unwrap().model_id.clone();
     let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
     let resp = ChatCompletionResponse {
@@ -298,6 +302,24 @@ fn handle_chat_nonstream(
         prompt_tokens, completion_tokens, finish_reason: finish,
     };
     stream.write_all(&http_json_response(200, "OK", &resp.to_json())).ok();
+}
+
+/// Enforce a think budget: if the text contains `<think>` but no `</think>`,
+/// truncate the think block to approximately `budget` words and close it.
+/// This prevents small models from endlessly rambling in think blocks.
+fn enforce_think_budget(text: &str, budget_words: usize) -> String {
+    if let Some(think_start) = text.find("<think>") {
+        let after_tag = think_start + 7; // len("<think>")
+        if !text[after_tag..].contains("</think>") {
+            // Think block never closed — truncate at budget
+            let think_content = &text[after_tag..];
+            let words: Vec<&str> = think_content.split_whitespace().collect();
+            let truncated: String = words[..budget_words.min(words.len())].join(" ");
+            let before = &text[..think_start];
+            return format!("{before}<think>\n{truncated}\n</think>\n\n");
+        }
+    }
+    text.to_string()
 }
 
 fn handle_chat_stream(
@@ -365,6 +387,14 @@ fn handle_chat_stream(
     let mut token_count: usize = 0;
     let mut write_ok = true;
 
+    // Think budget: track <think> blocks and force-close after a limit.
+    // This prevents small models from endlessly rambling in think blocks.
+    let think_budget: usize = 200; // max tokens inside <think> before force-close
+    let mut accumulated_text = String::new();
+    let mut in_think_block = false;
+    let mut think_tokens: usize = 0;
+    let mut think_closed = false;
+
     model.generate_streaming(
         &prompt_tokens,
         max_tokens,
@@ -379,6 +409,41 @@ fn handle_chat_stream(
                 let bytes = vec![(tok_id % 256) as u8];
                 String::from_utf8_lossy(&bytes).into_owned()
             };
+
+            accumulated_text.push_str(&text);
+
+            // Track think block state
+            if !in_think_block && accumulated_text.contains("<think>") {
+                in_think_block = true;
+                think_tokens = 0;
+            }
+            if in_think_block {
+                if accumulated_text.contains("</think>") {
+                    in_think_block = false;
+                    think_closed = true;
+                } else {
+                    think_tokens += 1;
+                    if think_tokens > think_budget && !think_closed {
+                        // Force-close the think block
+                        let close_chunk = StreamChunk {
+                            id: id_owned.clone(),
+                            model: model_id.clone(),
+                            delta: "\n</think>\n\n".to_string(),
+                            done: false,
+                            finish_reason: None,
+                        };
+                        if write_sse_chunk(stream, &close_chunk.to_sse()).is_err() {
+                            write_ok = false;
+                            return false;
+                        }
+                        think_closed = true;
+                        in_think_block = false;
+                        // Don't emit the current token — it was part of the ramble.
+                        // Continue generating so the model can produce an actual answer.
+                        return true;
+                    }
+                }
+            }
 
             let finish_reason: Option<&'static str> = if token_count >= max_tokens {
                 Some("length")
@@ -579,5 +644,28 @@ mod tests {
         let s    = std::str::from_utf8(&resp).unwrap();
         assert!(s.starts_with("HTTP/1.1 204"));
         assert!(s.contains("Access-Control-Allow-Origin"));
+    }
+
+    #[test]
+    fn think_budget_closes_unclosed_block() {
+        let text = "<think>\nword1 word2 word3 word4 word5 word6 word7 word8 word9 word10";
+        let result = enforce_think_budget(text, 5);
+        assert!(result.contains("</think>"), "should close the think block");
+        assert!(result.contains("word5"), "should include words up to budget");
+        assert!(!result.contains("word6"), "should exclude words beyond budget");
+    }
+
+    #[test]
+    fn think_budget_leaves_closed_blocks_alone() {
+        let text = "<think>\nsome thinking here\n</think>\n\nMadrid is the capital.";
+        let result = enforce_think_budget(text, 3);
+        assert_eq!(result, text, "already-closed think blocks should be untouched");
+    }
+
+    #[test]
+    fn think_budget_no_think_block() {
+        let text = "Madrid is the capital of Spain.";
+        let result = enforce_think_budget(text, 5);
+        assert_eq!(result, text, "text without think blocks should be untouched");
     }
 }
