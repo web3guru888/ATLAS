@@ -11,3 +11,6 @@ repository.workspace = true
 atlas-core     = { path = "../atlas-core" }
 atlas-tensor   = { path = "../atlas-tensor" }
 atlas-json     = { path = "../atlas-json" }
+
+[dev-dependencies]
+atlas-tokenize = { path = "../atlas-tokenize" }

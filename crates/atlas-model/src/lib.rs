@@ -2320,6 +2320,73 @@ mod tests {
         eprintln!("  ✅ OLMo-3-7B-Think: Issue #7 fix verified (SWA + YaRN coherent output)");
     }
 
+    /// End-to-end test: tokenize → generate → decode with OLMo-3-7B-Think.
+    /// This is the definitive Issue #12 fix validation: no more degenerate output.
+    #[test]
+    #[ignore]
+    fn gpu_olmo3_tokenizer_e2e() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".to_string());
+        let dir = format!("{home}/models/olmo3-7b-think");
+        let tok_path = format!("{dir}/tokenizer.json");
+
+        // Load tokenizer
+        let tok = match atlas_tokenize::Tokenizer::from_file(&tok_path) {
+            Ok(t) => t,
+            Err(e) => { eprintln!("  SKIP: tokenizer load failed: {e}"); return; }
+        };
+        eprintln!("  Tokenizer: {} tokens", tok.vocab_size());
+        assert_eq!(tok.vocab_size(), 100278);
+
+        // Load model
+        let mut model = match load_model_from_dir(&dir, ModelConfig::olmo3_actual_7b()) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("  SKIP: model load failed: {e}"); return; }
+        };
+
+        // Encode prompt via tokenizer (the core fix — this used to produce wrong IDs)
+        let prompt_text = "The capital of France is";
+        let prompt_ids = tok.encode(prompt_text);
+        eprintln!("  Prompt: {:?} → {:?}", prompt_text, prompt_ids);
+        assert_eq!(prompt_ids, vec![791, 6864, 315, 9822, 374],
+            "tokenizer encoding must match reference OLMo-3 IDs");
+
+        // Generate 20 tokens (greedy)
+        model.reset();
+        let generated_ids = model.generate(&prompt_ids, 20, 0.0);
+        assert_eq!(generated_ids.len(), 20);
+
+        // Decode output
+        let output_text = tok.decode(&generated_ids);
+        eprintln!("  Generated: {:?}", output_text);
+
+        // Gate: output must NOT contain degenerate patterns
+        let is_degenerate = output_text.contains(".Sign") ||
+            output_text.contains("Comey") ||
+            generated_ids.windows(3).all(|w| w[0] == w[1] && w[1] == w[2]);
+        assert!(!is_degenerate,
+            "DEGENERATE output detected: {:?} — tokenizer mismatch NOT fixed", output_text);
+
+        // Gate: output should contain "Paris" (greedy completion of "capital of France is")
+        let full_text = format!("{}{}", prompt_text, output_text);
+        eprintln!("  Full: {:?}", full_text);
+
+        // Informational: check if Paris appears (not a hard gate — model may say something else)
+        if output_text.to_lowercase().contains("paris") {
+            eprintln!("  ✅ Output contains 'Paris' — model is generating coherent text");
+        } else {
+            eprintln!("  ℹ️  Output doesn't contain 'Paris' but no degenerate pattern — acceptable");
+        }
+
+        // Gate: token diversity (at least 5 unique tokens in 20)
+        let unique: std::collections::HashSet<u32> = generated_ids.iter().copied().collect();
+        eprintln!("  Token diversity: {}/20 unique", unique.len());
+        assert!(unique.len() >= 5,
+            "Only {} unique tokens in 20 — likely still degenerate", unique.len());
+
+        eprintln!("  ✅ Issue #12 RESOLVED: OLMo-3-7B-Think tokenizer + GPU inference end-to-end working");
+    }
+
     // ── Benchmarks (run with: cargo test -p atlas-model -- --ignored --nocapture)
 
     #[test]
