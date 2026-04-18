@@ -80,6 +80,8 @@ pub struct ModelConfig {
     pub sliding_window: Option<usize>,
     /// RoPE scaling (Fix B: YaRN). `RopeScaling::None` = standard RoPE.
     pub rope_scaling: RopeScaling,
+    /// EOS token id from config.json (if present). Generation stops on this token.
+    pub eos_token_id: Option<u32>,
 }
 
 impl ModelConfig {
@@ -98,6 +100,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 
@@ -116,6 +119,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 
@@ -134,6 +138,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 
@@ -153,6 +158,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 
@@ -172,6 +178,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 
@@ -191,6 +198,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 
@@ -212,6 +220,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 
@@ -232,6 +241,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 
@@ -253,6 +263,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 
@@ -311,6 +322,7 @@ impl ModelConfig {
             layer_types:   Vec::new(),
             sliding_window: None,
             rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
         }
     }
 }
@@ -1000,7 +1012,8 @@ impl OlmoModel {
             cfg.d_model,
             cfg.vocab_size,
         );
-        Self { config: cfg, embed, layers, norm, lm_head, rope, pos: 0, eos_token_id: None, rng: Rng::from_entropy() }
+        let eos_token_id = cfg.eos_token_id;
+        Self { config: cfg, embed, layers, norm, lm_head, rope, pos: 0, eos_token_id, rng: Rng::from_entropy() }
     }
 
     /// Reset KV cache and position counter (call between independent sequences).
@@ -1557,6 +1570,12 @@ fn patch_config_from_hf_json(mut cfg: ModelConfig, config_path: &std::path::Path
     if let Some(eps) = json.get("rms_norm_eps").and_then(|v| v.as_f64()) {
         cfg.rms_norm_eps = eps as f32;
         eprintln!("[config.json] rms_norm_eps: {}", cfg.rms_norm_eps);
+    }
+
+    // eos_token_id (e.g. 100257 for OLMo-3, 0 for SmolLM2)
+    if let Some(eos) = json.get("eos_token_id").and_then(|v| v.as_usize()) {
+        cfg.eos_token_id = Some(eos as u32);
+        eprintln!("[config.json] eos_token_id: {eos}");
     }
 
     Ok(cfg)

@@ -120,10 +120,14 @@ impl ApiServer {
                 }
             };
 
-            // Wire EOS token from tokenizer → model so generate() stops naturally.
+            // Wire EOS token → model so generate() stops naturally.
+            // Priority: config.json (parsed during load_model_from_dir) > tokenizer.json
             if let (Some(ref tok), Some(ref mut mdl)) = (&tokenizer, &mut model) {
-                mdl.eos_token_id = tok.eos_token_id;
-                if let Some(eos) = tok.eos_token_id {
+                if mdl.eos_token_id.is_none() {
+                    // config.json didn't have it — try tokenizer
+                    mdl.eos_token_id = tok.eos_token_id;
+                }
+                if let Some(eos) = mdl.eos_token_id {
                     eprintln!("  eos_token_id: {eos} (\"{}\")", tok.id_to_token(eos));
                 }
             }
