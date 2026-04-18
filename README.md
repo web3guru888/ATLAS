@@ -10,7 +10,7 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v4.0.6-success.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v4.0.7-success.svg)](#status)
 [![Tests](https://img.shields.io/badge/tests-562%2F562%20passing-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-21-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
@@ -54,6 +54,12 @@ It fuses four architectural innovations:
 - 🧮 **`CanonicalPheromoneUpdate` λ decay** — replaced linear formula `base_rate × (1 − canonical_term)` (went negative when term > 1, dead gradient at clamp boundary) with `base_rate × exp(−canonical_term)`: always positive, smooth, zero-gradient fidelity, hardware-safe for v6 ASIC spec
 - 🏆 **`InvasionFitnessScorer` competition kernel** — fixed negative Lotka-Volterra coefficients: raw `cosine_sim ∈ [−1, 1]` was giving fitness bonuses to anti-correlated strategies (mutualism, not competition); replaced with `α_ij = ReLU(cos_sim − 0.2)` — threshold at 4σ above noise floor in d=384 embedding space; `competition_threshold` added to `InvasionFitnessConfig`
 - ✅ **532/532 tests** (+4 new regression tests); GPU validated: 47/47 A100 model tests, OLMo-3-7B-Think still **19.9 tok/s**
+
+**v4.0.7** — OLMo-2/3 Post-Norm + QK-Norm Architecture Fixes:
+- 🏗️ **Post-norm layer ordering** — OLMo-2/3 uses `x = residual + rmsnorm(output)` (normalize output, then add residual). ATLAS was incorrectly doing `x = rmsnorm(x + output)` (GPU) or pre-norm (CPU). Fixed both paths to match [HuggingFace Olmo2DecoderLayer](https://github.com/huggingface/transformers/blob/main/src/transformers/models/olmo2/modeling_olmo2.py) reference implementation.
+- 🔧 **QK-norm per-head weight slicing** — `q_norm.weight` has shape `[n_heads × head_dim]` — each head has unique norm weights. `rmsnorm_inplace` was always using `weights[0..128]` for every head instead of `weights[h*128..(h+1)*128]`. Fixed GPU path.
+- ➕ **QK-norm added to CPU attention path** — the CPU `Attention::forward_token()` had no QK-norm at all. Added per-head QK-norm before RoPE to match GPU path.
+- ✅ **Before → After**: CPU/GPU logit agreement went from max diff **20.0 → 0.000015**. Top-1 token for "capital of France" went from `yp`/`décor` → **`Paris`**. OLMo-3-7B-Think now produces coherent `<think>` reasoning traces at **15.4 tok/s** on A100.
 
 **v4.0.6** — Sampling Controls (Issue #16):
 - 🎛️ **Full sampling pipeline**: repetition penalty, temperature, top-p, top-k, min-p, frequency/presence penalty — 7-stage pipeline eliminates model text degeneration
@@ -164,7 +170,7 @@ Every billion-parameter transformer starts here.
 
 ATLAS v4.0.0 delivers a **fully GPU-resident forward pass** — hidden states stay in VRAM between tokens, with pre-pinned weight upload at model load time.
 
-### A100-SXM4-40GB Benchmark (sm_80, CUDA 12.9)
+### A100-SXM4-40GB Benchmark (sm_80, CUDA 13.0)
 
 | Model | Params | GPU tok/s | VRAM | Notes |
 |-------|--------|-----------|------|-------|
@@ -172,7 +178,7 @@ ATLAS v4.0.0 delivers a **fully GPU-resident forward pass** — hidden states st
 | SmolLM2-360M | 360M | **25.4** | ~1.4 GB | f32 |
 | SmolLM2-1.7B | 1.7B | **12.6** | ~6.5 GB | f32, 2.4× over CPU |
 | TinyLlama-1.1B | 1.1B | **20.9** | ~8.4 GB | f32 |
-| OLMo-3-7B-Think | 7B | **19.9** | ~14 GB | **BF16 W16A32** (v4.0.2+); was 4.1 tok/s CPU |
+| OLMo-3-7B-Think | 7B | **19.9** | ~14 GB | **BF16 W16A32** (v4.0.2+); post-norm + QK-norm fixed (v4.0.7) |
 
 ### CUDA Kernel Suite
 
@@ -381,18 +387,18 @@ cargo build --release -p atlas-cli
 
 ---
 
-## Status — v4.0.6
+## Status — v4.0.7
 
 **562/562 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **19.9 tok/s OLMo-3-7B-Think (BF16)**
 
-> 🏔 **v4.0.6 is the current release.** Full sampling pipeline: repetition penalty, temperature, top-p, top-k, min-p, frequency/presence penalty. `SamplingConfig` with `::olmo3()` preset. `generate_with_sampling()` for full control; `generate()` backward-compatible. OpenAI-compatible API params. Issue #16 closed.
+> 🏔 **v4.0.7 is the current release.** Three critical OLMo-2/3 architecture bugs fixed: post-norm layer ordering (CPU + GPU), QK-norm per-head weight slicing, and missing CPU QK-norm. OLMo-3-7B-Think now produces correct, coherent output with CPU/GPU logit agreement at 0.000015 max diff. Full sampling pipeline (v4.0.6): repetition penalty, temperature, top-p, top-k, min-p, frequency/presence penalty.
 
 ### What Works
 
 - ✅ **Discovery is real** — `atlas discover --cycles 3` hits NASA POWER, WHO GHO, World Bank, ArXiv live APIs; causal inference via PC algorithm; Bayesian quality gates
 - ✅ **Memory is real** — 5-type pheromone system (exploitation/exploration/success/traversal/recency), MMAS ceiling, A\* semantic pathfinding (α·C_sem + β·C_phe + γ·C_str), Active Inference agents; `atlas palace --hot` shows pheromone trails
 - ✅ **Training is real** — SFT with GradTape + AdamW + LoRA (rank=8) + gradient accumulation + safetensors checkpoint; DeepSupervisionTrainer (N_sup=4..16, loss trace, latent carry)
-- ✅ **GPU inference is real** — SmolLM2-135M at 37.7 tok/s on A100-SXM4-40GB; OLMo-3-7B-Think at **19.9 tok/s** (BF16 GPU, W16A32, 14 GB VRAM — Issue #9 fixed); SWA + YaRN RoPE (Issue #7 fixed)
+- ✅ **GPU inference is real** — SmolLM2-135M at 37.7 tok/s on A100-SXM4-40GB; OLMo-3-7B-Think at **19.9 tok/s** (BF16 GPU, W16A32, 14 GB VRAM); SWA + YaRN RoPE; post-norm + QK-norm architecture (v4.0.7 fixed — CPU/GPU logit diff 0.000015)
 - ✅ **API is real** — `atlas api serve` exposes `/v1/chat/completions` + `/v1/completions` + `/v1/models`; SSE streaming; CORS; 40 tests
 - ✅ **Provenance is real** — Schnorr proofs + Groth16 stub (HMAC-SHA256, BLS12-381-compatible interface) + ProvenanceChain; `atlas prove` generates verifiable proofs
 - ✅ **Safety is real** — Horn-clause constitution (8 principles, 4 domains, Young 2026 NP-hardness validated); 5-state FSM (`BOOT→NOMINAL→DEGRADED→SAFE_MODE→EMERGENCY_STOP`); CircuitBreaker; append-only audit log
@@ -419,6 +425,7 @@ cargo build --release -p atlas-cli
 | **v4.0.4** | **GPT-4 regex tokenizer (Issue #12): full HuggingFace tokenizer.json support. OLMo-3 + SmolLM2 verified. E2E GPU test.** | **539** |
 | **v4.0.5** | **Inference pipeline fixes (Issues #13–15): EOS stopping, XorShift64 PRNG, ChatML auto-detection.** | **549** |
 | **v4.0.6** | **Sampling controls (Issue #16): repetition penalty, top-p, top-k, min-p, freq/pres penalty. 7-stage pipeline.** | **562** |
+| **v4.0.7** | **OLMo-2/3 post-norm + QK-norm fixes: 3 architecture bugs. CPU/GPU logit diff 20.0 → 0.000015. Correct OLMo-3 output.** | **562** |
 
 ### Crate Status
 
@@ -432,7 +439,7 @@ cargo build --release -p atlas-cli
 | CUDA kernels | 1 | — | ✅ tiled GEMM, rmsnorm, rope, silu_mul, AdamW, INT8/INT4 — compiled on A100-SXM4-40GB (sm_80) |
 | atlas-json | 2 | 12 | ✅ Recursive descent parser, surrogate pairs |
 | atlas-tokenize | 2 | **14** | ✅ GPT-4 regex pre-tokenization (7 alts w/ backtracking), byte-level BPE, HF tokenizer.json; OLMo-3 + SmolLM2 verified |
-| atlas-model | 2 | **27** | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, SWA, YaRN RoPE, config.json auto-patch; GPU-resident forward pass |
+| atlas-model | 2 | **27** | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, SWA, YaRN RoPE, config.json auto-patch; GPU-resident forward pass; **v4.0.7: post-norm architecture + QK-norm per-head slicing** |
 | atlas-palace | 3 | **79** | ✅ A\* search, 5-type pheromones, Active Inference, MMAS, PalaceBackend trait, session_id, PalaceConfig; v4.0.3: `CanonicalPheromoneUpdate` uses `exp(−x)` decay (always positive, smooth, hardware-safe) |
 | atlas-mcp | 3 | **32** | ✅ 28 MCP tools, JSON-RPC 2.0, live palace dispatch; McpConnectionPool (max 5, 5-min idle eviction) |
 | atlas-api | 3 | **40** | ✅ OpenAI-compatible HTTP: /v1/chat/completions, /v1/completions, /v1/models; SSE streaming; CORS |
@@ -446,7 +453,7 @@ cargo build --release -p atlas-cli
 | atlas-safety | 6 | **30** | ✅ Horn-clause constitution (8 principles, 4 domains); 5-state FSM; CircuitBreaker; append-only audit log |
 | atlas-bridge | 6 | **8** | ✅ ZK-attested Rings↔ETH interface, Sepolia chain_id=11155111 |
 | atlas-cli | 7 | **30** | ✅ discover / corpus / train / eval / prove / palace / mcp / api / bench / status |
-| **TOTAL** | | **562** | **✅ All passing — v4.0.6** |
+| **TOTAL** | | **562** | **✅ All passing — v4.0.7** |
 
 ### Quick Start
 
@@ -510,7 +517,7 @@ ATLAS includes a zero-dependency benchmark suite using `atlas_core::bench::Bench
 cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
 ```
 
-**Representative results** (Ubuntu, Rust 1.95, A100-SXM4-40GB, CUDA 12.9):
+**Representative results** (Ubuntu, Rust 1.95, A100-SXM4-40GB, CUDA 13.0):
 
 | Benchmark | Metric | Description |
 |-----------|--------|-------------|
@@ -567,7 +574,7 @@ ATLAS v4.0 implements the **Champagnat n-Morphic Framework** (Issue #6), grounde
 
 ATLAS models are published to Hugging Face under the [`openhubresearch`](https://huggingface.co/openhubresearch) organization.
 
-**First release**: `openhubresearch/ATLAS-OLMo-3-7B-Think-v4` — OLMo-3-7B-Think run through the ATLAS v4.0.6 n-morphic framework with BF16 inference (19.9 tok/s A100-SXM4-40GB, W16A32, 562/562 tests, 47/47 GPU model tests).
+**First release**: `openhubresearch/ATLAS-OLMo-3-7B-Think-v4` — OLMo-3-7B-Think run through the ATLAS v4.0.7 n-morphic framework with BF16 inference (19.9 tok/s A100-SXM4-40GB, W16A32, 562/562 tests, correct post-norm + QK-norm architecture).
 
 ```yaml
 ---
@@ -612,8 +619,9 @@ See [NOTICE](NOTICE) for attribution to incorporated components.
   institution = {OpenHub Research, Thailand},
   url         = {https://github.com/web3guru888/ATLAS},
   note        = {Pure Rust LLM training framework. Zero external dependencies.
-                 v4.0.6: 21 crates, 562 tests, Champagnat n-morphic framework,
+                 v4.0.7: 21 crates, 562 tests, Champagnat n-morphic framework,
                  BF16 GPU inference — OLMo-3-7B-Think 19.9 tok/s on A100-SXM4-40GB (W16A32).
+                 Post-norm + QK-norm architecture for OLMo-2/3 family.
                  Full sampling pipeline: repetition penalty, top-p, top-k, min-p, freq/pres penalty.}
 }
 ```
