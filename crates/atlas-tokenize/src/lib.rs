@@ -22,6 +22,15 @@ use atlas_core::AtlasError;
 use atlas_json::Json;
 use std::collections::HashMap;
 
+/// Pre-tokenizer type detected from tokenizer.json configuration.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PreTokenizerType {
+    /// GPT-4/OLMo-3/LLaMA-3 regex pattern (handles contractions, numbers, punctuation)
+    Gpt4Regex,
+    /// Simple byte-level (naive space splitting — legacy fallback)
+    Simple,
+}
+
 /// A byte-level BPE tokenizer compatible with GPT-2/OLMo/LLaMA-3.
 pub struct Tokenizer {
     /// token id → token string (byte repr)
@@ -44,6 +53,8 @@ pub struct Tokenizer {
     pub eos_token_id: Option<u32>,
     /// PAD token id
     pub pad_token_id: Option<u32>,
+    /// Pre-tokenizer type detected from tokenizer.json
+    pre_tokenizer_type: PreTokenizerType,
 }
 
 impl Tokenizer {
@@ -184,6 +195,9 @@ impl Tokenizer {
             pad_token_id = Some(id as u32);
         }
 
+        // ── pre-tokenizer detection ────────────────────────────────────────
+        let pre_tokenizer_type = Self::detect_pre_tokenizer(&root);
+
         Ok(Self {
             vocab,
             vocab_map,
@@ -195,13 +209,53 @@ impl Tokenizer {
             bos_token_id,
             eos_token_id,
             pad_token_id,
+            pre_tokenizer_type,
         })
+    }
+
+    /// Detect pre-tokenizer type from tokenizer.json structure.
+    fn detect_pre_tokenizer(root: &Json) -> PreTokenizerType {
+        if let Some(pt) = root.get("pre_tokenizer") {
+            // Check for Sequence → Split → Regex pattern (OLMo-3, LLaMA-3)
+            if let Some(pretoks) = pt.get("pretokenizers").and_then(|v| v.as_array()) {
+                for p in pretoks {
+                    if let Some(typ) = p.get("type").and_then(|v| v.as_str()) {
+                        if typ == "Split" {
+                            if let Some(pattern) = p.get("pattern") {
+                                if pattern.get("Regex").is_some() {
+                                    return PreTokenizerType::Gpt4Regex;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Check for ByteLevel (GPT-2 style — use GPT-4 regex, compatible superset)
+            if let Some(typ) = pt.get("type").and_then(|v| v.as_str()) {
+                if typ == "ByteLevel" {
+                    return PreTokenizerType::Gpt4Regex;
+                }
+                // Also check top-level Sequence type
+                if typ == "Sequence" {
+                    if let Some(pretoks) = pt.get("pretokenizers").and_then(|v| v.as_array()) {
+                        for p in pretoks {
+                            if let Some(inner_typ) = p.get("type").and_then(|v| v.as_str()) {
+                                if inner_typ == "ByteLevel" {
+                                    return PreTokenizerType::Gpt4Regex;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        PreTokenizerType::Simple
     }
 
     /// Number of tokens in the vocabulary.
     pub fn vocab_size(&self) -> usize { self.vocab.len() }
 
-    // ── Encoding ────────────────────────────────────────────────────────────
+    // ── Encoding ───────────────────────────────────────────────────────────
 
     /// Encode a text string into token ids.
     pub fn encode(&self, text: &str) -> Vec<u32> {
@@ -282,13 +336,7 @@ impl Tokenizer {
     fn bpe_encode(&self, text: &str) -> Vec<u32> {
         if text.is_empty() { return Vec::new(); }
 
-        // Convert each byte to its GPT-2 unicode representation
-        let byte_chars: Vec<String> = text.bytes()
-            .map(|b| self.byte_encoder[b as usize].to_string())
-            .collect();
-
-        // Pre-tokenize: split on spaces to create word boundaries
-        // GPT-2 style: prepend 'Ġ' (unicode 0x0120) to tokens following a space
+        // Pre-tokenize: split into word-level pieces with byte encoding
         let words = self.pretokenize(text);
         let mut all_ids = Vec::new();
         for word_bytes in words {
@@ -297,10 +345,25 @@ impl Tokenizer {
         all_ids
     }
 
-    /// GPT-2 pre-tokenization: split on whitespace, prepend Ġ to non-first words.
+    /// Pre-tokenization: split text into word-level pieces and byte-encode.
+    ///
+    /// Dispatches to GPT-4 regex pattern or legacy space splitting based on
+    /// the pre-tokenizer type detected from tokenizer.json.
     fn pretokenize(&self, text: &str) -> Vec<Vec<String>> {
-        // Simplified: split on spaces, prepend byte-encoded space (Ġ) to each word
-        // that follows whitespace. This matches HuggingFace ByteLevelBPETokenizer.
+        match self.pre_tokenizer_type {
+            PreTokenizerType::Gpt4Regex => {
+                gpt4_pretokenize_str(text).into_iter().map(|piece| {
+                    piece.bytes()
+                        .map(|b| self.byte_encoder[b as usize].to_string())
+                        .collect()
+                }).collect()
+            }
+            PreTokenizerType::Simple => self.simple_pretokenize(text),
+        }
+    }
+
+    /// Legacy pre-tokenization: split on whitespace, prepend Ġ to non-first words.
+    fn simple_pretokenize(&self, text: &str) -> Vec<Vec<String>> {
         let mut words = Vec::new();
         let mut current_word = Vec::new();
         let mut after_space = true; // start-of-text is treated as "after space"
@@ -367,6 +430,266 @@ impl Tokenizer {
     }
 }
 
+// ── GPT-4 regex pre-tokenizer (zero-dependency) ─────────────────────────────
+
+/// GPT-4/OLMo-3/LLaMA-3 regex pre-tokenization (zero-dependency implementation).
+///
+/// Implements the pattern:
+/// ```text
+/// (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}
+/// | ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// ```
+///
+/// All 7 alternatives are tried left-to-right at each position, matching
+/// the standard NFA regex semantics. Handles UTF-8 correctly via `char_indices`.
+pub fn gpt4_pretokenize_str(text: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut pos = 0;
+
+    while pos < text.len() {
+        let rest = &text[pos..];
+
+        // Alt 1: (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if let Some(len) = try_contraction(rest) {
+            result.push(&text[pos..pos + len]);
+            pos += len;
+            continue;
+        }
+
+        // Alt 2: [^\r\n\p{L}\p{N}]?\p{L}+
+        if let Some(len) = try_letters_with_prefix(rest) {
+            result.push(&text[pos..pos + len]);
+            pos += len;
+            continue;
+        }
+
+        // Alt 3: \p{N}{1,3}
+        if let Some(len) = try_digits(rest) {
+            result.push(&text[pos..pos + len]);
+            pos += len;
+            continue;
+        }
+
+        // Alt 4:  ?[^\s\p{L}\p{N}]+[\r\n]*
+        if let Some(len) = try_punctuation(rest) {
+            result.push(&text[pos..pos + len]);
+            pos += len;
+            continue;
+        }
+
+        // Alt 5: \s*[\r\n]+
+        if let Some(len) = try_newlines(rest) {
+            result.push(&text[pos..pos + len]);
+            pos += len;
+            continue;
+        }
+
+        // Alt 6: \s+(?!\S)
+        if let Some(len) = try_trailing_whitespace(rest) {
+            result.push(&text[pos..pos + len]);
+            pos += len;
+            continue;
+        }
+
+        // Alt 7: \s+
+        if let Some(len) = try_whitespace(rest) {
+            result.push(&text[pos..pos + len]);
+            pos += len;
+            continue;
+        }
+
+        // Safety fallback: advance by one char (should never reach here —
+        // the 7 alternatives cover all possible characters)
+        let c = rest.chars().next().unwrap();
+        let clen = c.len_utf8();
+        result.push(&text[pos..pos + clen]);
+        pos += clen;
+    }
+
+    result
+}
+
+/// Alt 1: `(?i:'s|'t|'re|'ve|'m|'ll|'d)` — contractions (case-insensitive).
+fn try_contraction(s: &str) -> Option<usize> {
+    let mut chars = s.chars();
+    let first = chars.next()?;
+    if first != '\'' { return None; }
+    let flen = first.len_utf8();
+
+    let second = chars.next()?;
+    let slen = second.len_utf8();
+    match second.to_ascii_lowercase() {
+        's' | 't' | 'm' | 'd' => Some(flen + slen),
+        'r' | 'v' | 'l' => {
+            let third = chars.next()?;
+            let tlen = third.len_utf8();
+            match (second.to_ascii_lowercase(), third.to_ascii_lowercase()) {
+                ('r', 'e') | ('v', 'e') | ('l', 'l') => Some(flen + slen + tlen),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Alt 2: `[^\r\n\p{L}\p{N}]?\p{L}+` — optional non-letter/digit/newline prefix + letters.
+fn try_letters_with_prefix(s: &str) -> Option<usize> {
+    let mut chars = s.chars();
+    let first = chars.next()?;
+    let mut byte_len = 0;
+
+    let is_prefix_char = first != '\r' && first != '\n'
+        && !first.is_alphabetic() && !first.is_numeric();
+
+    if is_prefix_char {
+        byte_len += first.len_utf8();
+    } else if first.is_alphabetic() {
+        byte_len += first.len_utf8();
+    } else {
+        return None;
+    }
+
+    // Count consecutive letters
+    let mut letter_count: usize = if first.is_alphabetic() { 1 } else { 0 };
+    for c in chars {
+        if c.is_alphabetic() {
+            byte_len += c.len_utf8();
+            letter_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if letter_count == 0 {
+        return None; // Had prefix but no following letters
+    }
+
+    Some(byte_len)
+}
+
+/// Alt 3: `\p{N}{1,3}` — 1 to 3 digits.
+fn try_digits(s: &str) -> Option<usize> {
+    let mut byte_len = 0;
+    let mut count = 0;
+    for c in s.chars() {
+        if c.is_numeric() && count < 3 {
+            byte_len += c.len_utf8();
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    if count > 0 { Some(byte_len) } else { None }
+}
+
+/// Alt 4: ` ?[^\s\p{L}\p{N}]+[\r\n]*` — optional space + punctuation + optional newlines.
+fn try_punctuation(s: &str) -> Option<usize> {
+    let mut byte_len = 0;
+    let mut it = s.chars().peekable();
+
+    // Optional leading space (literal 0x20)
+    if it.peek() == Some(&' ') {
+        byte_len += 1;
+        it.next();
+    }
+
+    // Required: 1+ chars that are NOT whitespace, NOT letter, NOT digit
+    let mut punct_count = 0;
+    while let Some(&c) = it.peek() {
+        if !c.is_whitespace() && !c.is_alphabetic() && !c.is_numeric() {
+            byte_len += c.len_utf8();
+            punct_count += 1;
+            it.next();
+        } else {
+            break;
+        }
+    }
+
+    if punct_count == 0 {
+        return None;
+    }
+
+    // Optional trailing \r or \n
+    while let Some(&c) = it.peek() {
+        if c == '\r' || c == '\n' {
+            byte_len += c.len_utf8();
+            it.next();
+        } else {
+            break;
+        }
+    }
+
+    Some(byte_len)
+}
+
+/// Alt 5: `\s*[\r\n]+` — whitespace ending in newlines (with backtracking).
+///
+/// Finds the full whitespace run, then matches through the last `\r` or `\n`.
+fn try_newlines(s: &str) -> Option<usize> {
+    let mut ws_byte_len = 0;
+    let mut last_newline_end: Option<usize> = None;
+
+    for c in s.chars() {
+        if c.is_whitespace() {
+            ws_byte_len += c.len_utf8();
+            if c == '\r' || c == '\n' {
+                last_newline_end = Some(ws_byte_len);
+            }
+        } else {
+            break;
+        }
+    }
+
+    last_newline_end
+}
+
+/// Alt 6: `\s+(?!\S)` — trailing whitespace with negative lookahead (with backtracking).
+///
+/// - If run extends to end of string → match entire run.
+/// - If run is 2+ chars → match (run_length − 1) chars.
+/// - If run is exactly 1 char → no match (fall through to Alt 7).
+fn try_trailing_whitespace(s: &str) -> Option<usize> {
+    let mut ws_byte_len = 0;
+    let mut ws_count: usize = 0;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            ws_byte_len += c.len_utf8();
+            ws_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if ws_count == 0 { return None; }
+
+    // If run extends to end of string → match entire run
+    if ws_byte_len == s.len() {
+        return Some(ws_byte_len);
+    }
+
+    // If run is 2+ chars → match all but the last whitespace char
+    if ws_count >= 2 {
+        let last_char = s[..ws_byte_len].chars().next_back().unwrap();
+        return Some(ws_byte_len - last_char.len_utf8());
+    }
+
+    // Run is exactly 1 char followed by non-whitespace → no match
+    None
+}
+
+/// Alt 7: `\s+` — any whitespace run (greedy).
+fn try_whitespace(s: &str) -> Option<usize> {
+    let mut byte_len = 0;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            byte_len += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if byte_len > 0 { Some(byte_len) } else { None }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -420,6 +743,7 @@ mod tests {
             bos_token_id: None,
             eos_token_id: None,
             pad_token_id: None,
+            pre_tokenizer_type: PreTokenizerType::Simple,
         }
     }
 
@@ -470,5 +794,123 @@ mod tests {
         let pieces = tok.split_on_special("hello world");
         assert_eq!(pieces.len(), 1);
         assert!(!pieces[0].1);
+    }
+
+    // ── GPT-4 pre-tokenizer tests ────────────────────────────────────────────
+
+    #[test]
+    fn gpt4_pretokenize_basic() {
+        let pieces = gpt4_pretokenize_str("The capital of France is");
+        assert_eq!(pieces, vec!["The", " capital", " of", " France", " is"]);
+    }
+
+    #[test]
+    fn gpt4_pretokenize_contractions() {
+        let pieces = gpt4_pretokenize_str("What's the weather like?");
+        assert_eq!(pieces, vec!["What", "'s", " the", " weather", " like", "?"]);
+    }
+
+    #[test]
+    fn gpt4_pretokenize_numbers() {
+        let pieces = gpt4_pretokenize_str("1234 tokens");
+        assert_eq!(pieces, vec!["123", "4", " tokens"]);
+    }
+
+    #[test]
+    fn gpt4_pretokenize_punctuation() {
+        let pieces = gpt4_pretokenize_str("Hello, world!");
+        assert_eq!(pieces, vec!["Hello", ",", " world", "!"]);
+    }
+
+    #[test]
+    fn gpt4_pretokenize_leading_spaces() {
+        let pieces = gpt4_pretokenize_str("  leading spaces");
+        assert_eq!(pieces, vec![" ", " leading", " spaces"]);
+    }
+
+    #[test]
+    fn gpt4_pretokenize_newline() {
+        let pieces = gpt4_pretokenize_str("newline\nhere");
+        assert_eq!(pieces, vec!["newline", "\n", "here"]);
+    }
+
+    #[test]
+    fn gpt4_pretokenize_math() {
+        let pieces = gpt4_pretokenize_str("x=42+3");
+        assert_eq!(pieces, vec!["x", "=", "42", "+", "3"]);
+    }
+
+    // ── OLMo-3 integration test (requires tokenizer.json on disk) ────────
+
+    #[test]
+    #[ignore] // Run with: cargo test -p atlas-tokenize -- --ignored --nocapture
+    fn olmo3_encode_reference() {
+        // Try standard model location, or /tmp for CI
+        let paths = [
+            format!("{}/models/olmo3-7b-think/tokenizer.json",
+                    std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".into())),
+            "/tmp/olmo3_tokenizer.json".to_string(),
+        ];
+        let tok = paths.iter()
+            .find_map(|p| Tokenizer::from_file(p).ok())
+            .expect("OLMo-3 tokenizer.json not found — copy to /tmp/olmo3_tokenizer.json");
+
+        eprintln!("  OLMo-3 vocab size: {}", tok.vocab_size());
+        assert_eq!(tok.vocab_size(), 100278, "unexpected vocab size");
+        assert_eq!(tok.pre_tokenizer_type, PreTokenizerType::Gpt4Regex,
+            "should detect GPT-4 regex pre-tokenizer");
+
+        // Reference encodings from HuggingFace `tokenizers` library
+        let cases: &[(&str, &[u32])] = &[
+            ("The capital of France is", &[791, 6864, 315, 9822, 374]),
+            ("Hello, world!", &[9906, 11, 1917, 0]),
+            ("1234 tokens", &[4513, 19, 11460]),
+        ];
+
+        for (text, expected) in cases {
+            let ids = tok.encode(text);
+            eprintln!("  encode({:30}) → {:?}", format!("{text:?}"), ids);
+            assert_eq!(&ids, expected,
+                "encoding mismatch for {:?}: got {:?}, expected {:?}",
+                text, ids, expected);
+        }
+
+        // Round-trip decode
+        for (text, ids) in cases {
+            let decoded = tok.decode(ids);
+            assert_eq!(decoded, *text,
+                "decode mismatch for {:?}: got {:?}", ids, decoded);
+        }
+
+        eprintln!("  ✅ OLMo-3 encode/decode: all reference cases pass");
+    }
+
+    #[test]
+    #[ignore]
+    fn smollm2_encode_reference() {
+        let paths = [
+            format!("{}/models/smollm2-1b7/tokenizer.json",
+                    std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".into())),
+        ];
+        let tok = match paths.iter().find_map(|p| Tokenizer::from_file(p).ok()) {
+            Some(t) => t,
+            None => { eprintln!("  SKIP: SmolLM2 tokenizer.json not found"); return; }
+        };
+
+        eprintln!("  SmolLM2 vocab size: {}", tok.vocab_size());
+
+        let cases: &[(&str, &[u32])] = &[
+            ("The capital of France is", &[504, 3575, 282, 4649, 314]),
+            ("Hello, world!", &[19556, 28, 905, 17]),
+        ];
+
+        for (text, expected) in cases {
+            let ids = tok.encode(text);
+            eprintln!("  encode({:30}) → {:?}", format!("{text:?}"), ids);
+            assert_eq!(&ids, expected,
+                "encoding mismatch for {:?}: got {:?}, expected {:?}",
+                text, ids, expected);
+        }
+        eprintln!("  ✅ SmolLM2 encode/decode: all reference cases pass");
     }
 }
