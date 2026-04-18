@@ -283,6 +283,7 @@ fn handle_chat_nonstream(
     id: &str,
     state: &Arc<Mutex<InferState>>,
 ) {
+    let olmo3 = SamplingConfig::olmo3();
     let config = SamplingConfig {
         temperature: req.temperature,
         top_p: req.top_p,
@@ -292,6 +293,7 @@ fn handle_chat_nonstream(
         repetition_window: req.repetition_window,
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
+        suppress_initial_tokens: olmo3.suppress_initial_tokens,
     };
     let (content, prompt_tokens, completion_tokens) =
         run_inference(state, prompt, req.max_tokens, &config);
@@ -332,8 +334,10 @@ fn enforce_think_budget(text: &str, budget_words: usize) -> String {
 
 /// Strip all `<think>...</think>` blocks from the output text.
 ///
-/// Small models often generate `<think>` blocks despite system prompt
-/// instructions not to. This post-processing ensures clean output.
+/// Handles:
+/// - Properly closed `<think>...</think>` blocks
+/// - Malformed `</think` (missing `>`) — common with small models
+/// - Filler words ("Okay", "Hmm") that often leak after think blocks
 ///
 /// If stripping removes everything (model only thought, never answered),
 /// we extract whatever useful content we can from the think block itself.
@@ -344,34 +348,110 @@ fn strip_think_blocks(text: &str) -> String {
     while let Some(start) = remaining.find("<think>") {
         // Add everything before the think block
         result.push_str(&remaining[..start]);
-        // Find the end of the think block
-        if let Some(end) = remaining[start..].find("</think>") {
+        // Find the end — try proper close first, then malformed
+        let after = &remaining[start..];
+        if let Some(end) = after.find("</think>") {
             last_think_content = remaining[start + 7..start + end].trim().to_string();
             remaining = &remaining[start + end + 8..]; // len("</think>") = 8
+        } else if let Some(end) = after.find("</think") {
+            // Malformed close (no >) — common with small models hitting token limit
+            last_think_content = remaining[start + 7..start + end].trim().to_string();
+            // Skip past </think and any trailing >
+            let skip = start + end + 7; // len("</think") = 7
+            remaining = if remaining.len() > skip && remaining.as_bytes().get(skip) == Some(&b'>') {
+                &remaining[skip + 1..]
+            } else {
+                &remaining[skip..]
+            };
         } else {
-            // No closing tag — discard everything from <think> onwards
+            // No closing tag at all — discard everything from <think> onwards
             last_think_content = remaining[start + 7..].trim().to_string();
             remaining = "";
             break;
         }
     }
     result.push_str(remaining);
-    let trimmed = result.trim();
+
+    // Clean up stray </think> or </think fragments (can appear without matching <think>)
+    let result = result.replace("</think>", "").replace("</think", "");
+
+    // Clean up filler words that often leak after think blocks
+    let trimmed = clean_filler(result.trim());
     if !trimmed.is_empty() {
-        return trimmed.to_string();
+        return trimmed;
     }
-    // Model only thought but never answered — try to extract a useful sentence
-    // from the think block itself (often the first coherent sentence is good).
+
+    // Model only thought but never answered — extract useful content from think block.
     if !last_think_content.is_empty() {
-        // Find the first sentence-like content after "Let me" / "I recall" / etc.
-        for line in last_think_content.lines() {
-            let l = line.trim();
-            if l.len() > 10 && !l.starts_with("Okay") && !l.starts_with("Hmm")
-                && !l.starts_with("Wait") && !l.starts_with("Let me")
-                && !l.starts_with("User") && !l.starts_with("Need")
-                && !l.starts_with("First") {
-                return l.to_string();
-            }
+        return extract_answer_from_think(&last_think_content);
+    }
+
+    "I'd be happy to help with that! Could you rephrase your question?".to_string()
+}
+
+/// Remove common filler words/phrases that leak from think blocks.
+fn clean_filler(text: &str) -> String {
+    let mut s = text.to_string();
+    // Remove leading filler
+    let filler_prefixes = ["Okay\n", "Okay\r\n", "Okay?", "Okay!", "Okay ",
+                           "Hmm\n", "Hmm.", "Hmm,", "Hmm ",
+                           "Wait,", "Wait.", "Wait\n"];
+    for prefix in &filler_prefixes {
+        if s.starts_with(prefix) {
+            s = s[prefix.len()..].trim_start().to_string();
+        }
+    }
+    // Remove trailing filler (common: model ends with "Okay" after think)
+    let filler_suffixes = ["\nOkay", "\nOkay?", "\r\nOkay", "\nHmm"];
+    for suffix in &filler_suffixes {
+        if s.ends_with(suffix) {
+            s = s[..s.len() - suffix.len()].trim_end().to_string();
+        }
+    }
+    s
+}
+
+/// Extract the most useful answer from think-block content.
+///
+/// When the model only produces `<think>` content with no visible answer,
+/// we mine the think text for declarative statements that are likely
+/// the actual answer (e.g., "The capital of Spain is Madrid.").
+fn extract_answer_from_think(think: &str) -> String {
+    // Collect all candidate sentences — prefer declarative statements
+    let mut candidates: Vec<(usize, &str)> = Vec::new();
+    for line in think.lines() {
+        let l = line.trim();
+        if l.len() < 8 { continue; }
+
+        // Skip meta-thinking / filler lines
+        let skip_starts = [
+            "Okay", "Hmm", "Wait", "Let me", "User", "Need", "First",
+            "I think", "I need", "I recall", "I should", "So,", "So ",
+            "The user", "Now,", "Now ", "Alright", "Right",
+            "I'm ", "Let's", "...", "---",
+        ];
+        let is_filler = skip_starts.iter().any(|p| l.starts_with(p));
+        if is_filler { continue; }
+
+        // Declarative statements get highest score
+        let score = if l.ends_with('.') || l.ends_with('!') {
+            100 + l.len().min(200)  // longer declarative = better
+        } else if l.contains(" is ") || l.contains(" are ") || l.contains(" was ") {
+            80 + l.len().min(200)
+        } else {
+            l.len().min(200)
+        };
+        candidates.push((score, l));
+    }
+    // Return the highest-scoring candidate
+    if let Some((_, best)) = candidates.iter().max_by_key(|(s, _)| *s) {
+        return best.to_string();
+    }
+    // Absolute fallback: take the first non-trivial line
+    for line in think.lines() {
+        let l = line.trim();
+        if l.len() > 15 {
+            return l.to_string();
         }
     }
     "I'd be happy to help with that! Could you rephrase your question?".to_string()
@@ -384,6 +464,7 @@ fn handle_chat_stream(
     id: &str,
     state: &Arc<Mutex<InferState>>,
 ) {
+    let olmo3 = SamplingConfig::olmo3();
     let config = SamplingConfig {
         temperature: req.temperature,
         top_p: req.top_p,
@@ -393,6 +474,7 @@ fn handle_chat_stream(
         repetition_window: req.repetition_window,
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
+        suppress_initial_tokens: olmo3.suppress_initial_tokens,
     };
 
     let mut st = state.lock().unwrap();
@@ -545,6 +627,7 @@ fn handle_completion(
     id: &str,
     state: &Arc<Mutex<InferState>>,
 ) {
+    let olmo3 = SamplingConfig::olmo3();
     let config = SamplingConfig {
         temperature: req.temperature,
         top_p: req.top_p,
@@ -554,6 +637,7 @@ fn handle_completion(
         repetition_window: req.repetition_window,
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
+        suppress_initial_tokens: olmo3.suppress_initial_tokens,
     };
     let (text, prompt_tokens, completion_tokens) =
         run_inference(state, &req.prompt, req.max_tokens, &config);
@@ -800,5 +884,47 @@ mod tests {
         // Should extract the useful content from the think block
         assert!(!result.contains("<think>"));
         assert!(result.contains("Paris") || result.contains("help"));
+    }
+
+    #[test]
+    fn strip_think_blocks_malformed_close_no_gt() {
+        // Model sometimes outputs </think without closing >
+        let text = "Some content\n</think\nMore content after";
+        let result = strip_think_blocks(text);
+        assert!(!result.contains("</think"), "malformed close tag should not leak");
+    }
+
+    #[test]
+    fn strip_think_blocks_with_malformed_close() {
+        let text = "<think>thinking stuff</think\nActual answer here.";
+        let result = strip_think_blocks(text);
+        assert!(result.contains("Actual answer"), "content after malformed close should appear");
+        assert!(!result.contains("<think>"));
+    }
+
+    #[test]
+    fn clean_filler_removes_okay() {
+        assert_eq!(clean_filler("Okay\nThe answer is 42."), "The answer is 42.");
+        assert_eq!(clean_filler("Hello world\nOkay"), "Hello world");
+    }
+
+    #[test]
+    fn clean_filler_preserves_normal() {
+        assert_eq!(clean_filler("Madrid is the capital."), "Madrid is the capital.");
+    }
+
+    #[test]
+    fn extract_answer_declarative_preferred() {
+        let think = "Okay, let me think.\nI need to figure this out.\nMadrid is the capital of Spain.\nWait, actually let me reconsider.";
+        let result = extract_answer_from_think(think);
+        assert!(result.contains("Madrid"), "should extract the declarative statement, got: {}", result);
+    }
+
+    #[test]
+    fn extract_answer_fallback_on_all_filler() {
+        let think = "Okay so I need to think about this.\nLet me consider.\nFirst, I should note.\nHmm, interesting.";
+        let result = extract_answer_from_think(think);
+        // Should return something rather than panic
+        assert!(!result.is_empty());
     }
 }

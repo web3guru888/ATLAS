@@ -1024,6 +1024,14 @@ pub struct SamplingConfig {
     pub top_k: usize,
     /// Min-P sampling threshold. 0.0 = off. Recommended: 0.05 (future).
     pub min_p: f32,
+    /// Tokens to suppress (logit → −∞) on the **first generated token only**.
+    ///
+    /// Used to prevent models like OLMo-3-7B-Think from entering `<think>`
+    /// mode. Suppressing token 14023 (`<th`) at step 0 forces the model to
+    /// start with visible content instead of a chain-of-thought block.
+    ///
+    /// Empty by default (no suppression).
+    pub suppress_initial_tokens: Vec<u32>,
 }
 
 impl Default for SamplingConfig {
@@ -1037,6 +1045,7 @@ impl Default for SamplingConfig {
             top_p: 1.0,
             top_k: 0,
             min_p: 0.0,
+            suppress_initial_tokens: Vec::new(),
         }
     }
 }
@@ -1063,6 +1072,11 @@ impl SamplingConfig {
             top_p: 0.95,
             top_k: 50,
             min_p: 0.05,
+            // Suppress `<th` (token 14023) as the first generated token.
+            // This prevents OLMo-3-7B-Think from entering `<think>` mode
+            // which causes degenerate infinite reasoning loops that waste
+            // the entire token budget on internal monologue.
+            suppress_initial_tokens: vec![14023],
         }
     }
 }
@@ -1246,6 +1260,17 @@ impl OlmoModel {
                 // Greedy — still apply repetition penalty for greedy decoding
                 let mut logits = last_logits.clone();
 
+                // Step 0: Suppress banned tokens on the first generated token.
+                // This prevents models trained with <think> from entering
+                // chain-of-thought mode that wastes the entire token budget.
+                if _step == 0 {
+                    for &tid in &config.suppress_initial_tokens {
+                        if (tid as usize) < logits.len() {
+                            logits[tid as usize] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+
                 if config.repetition_penalty != 1.0 && !token_history.is_empty() {
                     let start = token_history.len().saturating_sub(config.repetition_window);
                     apply_repetition_penalty(
@@ -1256,6 +1281,15 @@ impl OlmoModel {
                 argmax(&logits)
             } else {
                 let mut logits = last_logits.clone();
+
+                // Step 0: Initial token suppression (same as greedy path)
+                if _step == 0 {
+                    for &tid in &config.suppress_initial_tokens {
+                        if (tid as usize) < logits.len() {
+                            logits[tid as usize] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
 
                 // Step 1: Repetition penalty (on raw logits)
                 if config.repetition_penalty != 1.0 && !token_history.is_empty() {
@@ -1366,6 +1400,14 @@ impl OlmoModel {
         for _step in 0..max_new {
             let next = if config.temperature <= 0.0 || config.temperature < 1e-6 {
                 let mut logits = last_logits.clone();
+                // Initial token suppression (prevent <think> on first token)
+                if _step == 0 {
+                    for &tid in &config.suppress_initial_tokens {
+                        if (tid as usize) < logits.len() {
+                            logits[tid as usize] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
                 if config.repetition_penalty != 1.0 && !token_history.is_empty() {
                     let start = token_history.len().saturating_sub(config.repetition_window);
                     apply_repetition_penalty(
@@ -1375,6 +1417,14 @@ impl OlmoModel {
                 argmax(&logits)
             } else {
                 let mut logits = last_logits.clone();
+                // Initial token suppression (prevent <think> on first token)
+                if _step == 0 {
+                    for &tid in &config.suppress_initial_tokens {
+                        if (tid as usize) < logits.len() {
+                            logits[tid as usize] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
                 if config.repetition_penalty != 1.0 && !token_history.is_empty() {
                     let start = token_history.len().saturating_sub(config.repetition_window);
                     apply_repetition_penalty(
@@ -2451,6 +2501,33 @@ mod tests {
         assert!((config.min_p - 0.05).abs() < 0.01);
         assert_eq!(config.repetition_window, 256);
         assert!((config.frequency_penalty - 0.0).abs() < 0.01);
+        assert_eq!(config.suppress_initial_tokens, vec![14023],
+            "olmo3 should suppress <th> (14023) to prevent <think> loops");
+    }
+
+    #[test]
+    fn suppress_initial_tokens_changes_first_token() {
+        let cfg = ModelConfig::tiny();
+        let mut model1 = OlmoModel::new(cfg.clone());
+        model1.set_rng_seed(42);
+        let tokens1 = model1.generate_with_sampling(
+            &[0, 1], 5,
+            &SamplingConfig { temperature: 0.0, ..SamplingConfig::default() },
+        );
+        // Now generate with the first token suppressed
+        let mut model2 = OlmoModel::new(cfg);
+        model2.set_rng_seed(42);
+        let suppress_id = tokens1[0]; // suppress whatever the first token was
+        let tokens2 = model2.generate_with_sampling(
+            &[0, 1], 5,
+            &SamplingConfig {
+                temperature: 0.0,
+                suppress_initial_tokens: vec![suppress_id],
+                ..SamplingConfig::default()
+            },
+        );
+        assert_ne!(tokens1[0], tokens2[0],
+            "suppressing the first token should produce a different token");
     }
 
     #[test]

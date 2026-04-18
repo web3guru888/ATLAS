@@ -126,7 +126,7 @@ impl ChatCompletionRequest {
             .unwrap_or_default();
         let max_tokens = v.get("max_tokens")
             .and_then(|x| x.as_usize())
-            .unwrap_or(256);
+            .unwrap_or(512);
         let temperature = v.get("temperature")
             .and_then(|x| x.as_f64())
             .unwrap_or(0.0) as f32;
@@ -252,7 +252,7 @@ impl CompletionRequest {
             .to_string();
         let max_tokens = v.get("max_tokens")
             .and_then(|x| x.as_usize())
-            .unwrap_or(256);
+            .unwrap_or(512);
         let temperature = v.get("temperature")
             .and_then(|x| x.as_f64())
             .unwrap_or(0.0) as f32;
@@ -539,7 +539,7 @@ mod tests {
         // Defaults now come from SamplingConfig::olmo3() to prevent repetition loops
         let req = ChatCompletionRequest::parse(r#"{"messages":[]}"#).unwrap();
         let olmo3 = atlas_model::SamplingConfig::olmo3();
-        assert_eq!(req.max_tokens, 256);
+        assert_eq!(req.max_tokens, 512);
         assert_eq!(req.temperature, 0.0);
         assert!(!req.stream);
         assert!((req.top_p - olmo3.top_p).abs() < 0.01);
