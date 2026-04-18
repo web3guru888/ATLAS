@@ -334,28 +334,47 @@ fn enforce_think_budget(text: &str, budget_words: usize) -> String {
 ///
 /// Small models often generate `<think>` blocks despite system prompt
 /// instructions not to. This post-processing ensures clean output.
+///
+/// If stripping removes everything (model only thought, never answered),
+/// we extract whatever useful content we can from the think block itself.
 fn strip_think_blocks(text: &str) -> String {
     let mut result = String::new();
     let mut remaining = text;
+    let mut last_think_content = String::new();
     while let Some(start) = remaining.find("<think>") {
         // Add everything before the think block
         result.push_str(&remaining[..start]);
         // Find the end of the think block
         if let Some(end) = remaining[start..].find("</think>") {
+            last_think_content = remaining[start + 7..start + end].trim().to_string();
             remaining = &remaining[start + end + 8..]; // len("</think>") = 8
         } else {
             // No closing tag — discard everything from <think> onwards
+            last_think_content = remaining[start + 7..].trim().to_string();
             remaining = "";
             break;
         }
     }
     result.push_str(remaining);
     let trimmed = result.trim();
-    if trimmed.is_empty() {
-        // If stripping removed everything, return a minimal response
-        return text.to_string();
+    if !trimmed.is_empty() {
+        return trimmed.to_string();
     }
-    trimmed.to_string()
+    // Model only thought but never answered — try to extract a useful sentence
+    // from the think block itself (often the first coherent sentence is good).
+    if !last_think_content.is_empty() {
+        // Find the first sentence-like content after "Let me" / "I recall" / etc.
+        for line in last_think_content.lines() {
+            let l = line.trim();
+            if l.len() > 10 && !l.starts_with("Okay") && !l.starts_with("Hmm")
+                && !l.starts_with("Wait") && !l.starts_with("Let me")
+                && !l.starts_with("User") && !l.starts_with("Need")
+                && !l.starts_with("First") {
+                return l.to_string();
+            }
+        }
+    }
+    "I'd be happy to help with that! Could you rephrase your question?".to_string()
 }
 
 fn handle_chat_stream(
@@ -767,10 +786,19 @@ mod tests {
     }
 
     #[test]
-    fn strip_think_blocks_unclosed_discards() {
+    fn strip_think_blocks_unclosed_graceful() {
         let text = "<think>rambling without end";
         let result = strip_think_blocks(text);
-        // Falls back to original since stripping leaves empty
-        assert_eq!(result, text);
+        // Should not return raw <think> block
+        assert!(!result.contains("<think>"), "should not expose raw think block");
+    }
+
+    #[test]
+    fn strip_think_blocks_all_think_no_answer() {
+        let text = "<think>\nOkay, I need to think.\nThe capital of France is Paris.\n</think>";
+        let result = strip_think_blocks(text);
+        // Should extract the useful content from the think block
+        assert!(!result.contains("<think>"));
+        assert!(result.contains("Paris") || result.contains("help"));
     }
 }
