@@ -10,8 +10,8 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v4.0.4-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-539%2F539%20passing-brightgreen.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v4.0.5-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-549%2F549%20passing-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-21-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__80%20A100-76b900.svg)](#gpu-inference)
@@ -54,6 +54,12 @@ It fuses four architectural innovations:
 - 🧮 **`CanonicalPheromoneUpdate` λ decay** — replaced linear formula `base_rate × (1 − canonical_term)` (went negative when term > 1, dead gradient at clamp boundary) with `base_rate × exp(−canonical_term)`: always positive, smooth, zero-gradient fidelity, hardware-safe for v6 ASIC spec
 - 🏆 **`InvasionFitnessScorer` competition kernel** — fixed negative Lotka-Volterra coefficients: raw `cosine_sim ∈ [−1, 1]` was giving fitness bonuses to anti-correlated strategies (mutualism, not competition); replaced with `α_ij = ReLU(cos_sim − 0.2)` — threshold at 4σ above noise floor in d=384 embedding space; `competition_threshold` added to `InvasionFitnessConfig`
 - ✅ **532/532 tests** (+4 new regression tests); GPU validated: 47/47 A100 model tests, OLMo-3-7B-Think still **19.9 tok/s**
+
+**v4.0.5** — Inference Pipeline Fixes (Issues #13, #14, #15):
+- 🛑 **EOS stopping** — `generate()` now stops on EOS token (was dead code: `if let Some(eos) = None::<u32>`); parsed from `config.json` (OLMo-3: 100257), wired through model → API `finish_reason: "stop"` works correctly
+- 🎲 **Stateful PRNG** — XorShift64 replaces deterministic step-based LCG hash; re-seeded from system time each `generate()` call; repeated requests now produce different completions
+- 💬 **ChatML template** — `<|im_start|>/<|im_end|>` format (OLMo-3, SmolLM2, Qwen); auto-detected from tokenizer special tokens; also supports Llama-3 format; fixes garbage output from wrong `<|system|>/<|user|>` tokens
+- ✅ **549/549 tests** (+10 new: EOS stopping, PRNG variability, ChatML/Llama3/Generic templates)
 
 **v4.0.4** — GPT-4 Regex Tokenizer (Issue #12):
 - 🔤 **Full HuggingFace tokenizer.json support** — hand-coded GPT-4/OLMo-3/LLaMA-3 pre-tokenization regex (zero external deps): contractions, word boundaries, 3-digit number grouping, punctuation, newlines, whitespace with backtracking
@@ -370,7 +376,7 @@ cargo build --release -p atlas-cli
 
 ## Status — v4.0.4
 
-**539/539 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **19.9 tok/s OLMo-3-7B-Think (BF16)**
+**549/549 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **19.9 tok/s OLMo-3-7B-Think (BF16)**
 
 > 🏔 **v4.0.4 is the current release.** GPT-4 regex tokenizer: full HuggingFace `tokenizer.json` support. Hand-coded pre-tokenization scanner (7 regex alternatives including backtracking) — OLMo-3, LLaMA-3, Mistral, SmolLM2 all encode correctly. End-to-end GPU test: tokenize→generate→decode on A100. Issue #12 closed.
 
