@@ -1045,17 +1045,20 @@ impl SamplingConfig {
     /// OLMo-3-7B-Think recommended defaults.
     ///
     /// Key settings to prevent degenerate repetition loops:
-    /// - `repetition_penalty: 1.1` — Keskar penalty on recent tokens
+    /// - `repetition_penalty: 1.15` — Keskar penalty on recent tokens
     /// - `repetition_window: 256` — look back far enough to catch paragraph-level loops
-    /// - `frequency_penalty: 0.1` — proportional penalty discourages high-count tokens
     /// - `top_k: 50` + `min_p: 0.05` — filter low-probability tail tokens
     /// - `top_p: 0.95` — nucleus sampling
+    ///
+    /// Note: `frequency_penalty` kept at 0.0 — even small values (0.1) degrade
+    /// coherence in 7B models by pushing them away from common function words.
+    /// The repetition_penalty + large window is sufficient for loop prevention.
     pub fn olmo3() -> Self {
         Self {
             temperature: 0.6,
-            repetition_penalty: 1.1,
+            repetition_penalty: 1.15,
             repetition_window: 256,
-            frequency_penalty: 0.1,
+            frequency_penalty: 0.0,
             presence_penalty: 0.0,
             top_p: 0.95,
             top_k: 50,
@@ -2442,8 +2445,12 @@ mod tests {
     fn sampling_config_olmo3() {
         let config = SamplingConfig::olmo3();
         assert!((config.temperature - 0.6).abs() < 0.01);
-        assert!((config.repetition_penalty - 1.1).abs() < 0.01);
+        assert!((config.repetition_penalty - 1.15).abs() < 0.01);
         assert!((config.top_p - 0.95).abs() < 0.01);
+        assert_eq!(config.top_k, 50);
+        assert!((config.min_p - 0.05).abs() < 0.01);
+        assert_eq!(config.repetition_window, 256);
+        assert!((config.frequency_penalty - 0.0).abs() < 0.01);
     }
 
     #[test]
