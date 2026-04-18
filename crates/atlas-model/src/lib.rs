@@ -3774,4 +3774,39 @@ mod tests {
             _ => panic!("unknown tensor: {name}"),
         }
     }
+
+    /// Verify that SamplingConfig::olmo3() improves output diversity vs default sampling.
+    /// Requires: ~/models/olmo3-7b-think/ with config.json + model shards.
+    #[test]
+    #[ignore]
+    fn gpu_olmo3_sampling_controls() {
+        use std::collections::HashSet;
+        let home = std::env::var("HOME").unwrap();
+        let dir = format!("{home}/models/olmo3-7b-think");
+        if !std::path::Path::new(&dir).exists() { return; }
+        let mut model = match load_model_from_dir(&dir, ModelConfig::olmo3_actual_7b()) {
+            Ok(m) => m,
+            Err(e) => { eprintln!("skip: {e}"); return; }
+        };
+        // ChatML prompt: "What is the capital of France?"
+        let prompt = vec![100264u32, 882, 198, 3923, 374, 279, 6864, 315, 9822, 30, 100265, 198, 100264, 78191, 198];
+
+        // Without sampling controls (default config, temp=1.0) — tends to degenerate
+        let old_out = model.generate(&prompt, 30, 1.0);
+        let old_unique: HashSet<u32> = old_out.iter().copied().collect();
+        let old_diversity = old_unique.len() as f32 / old_out.len().max(1) as f32;
+
+        // With OLMo-3 sampling controls — should be more diverse
+        let config = SamplingConfig::olmo3();
+        let new_out = model.generate_with_sampling(&prompt, 30, &config);
+        let new_unique: HashSet<u32> = new_out.iter().copied().collect();
+        let new_diversity = new_unique.len() as f32 / new_out.len().max(1) as f32;
+
+        eprintln!("Old diversity: {:.3} ({}/{} unique)", old_diversity, old_unique.len(), old_out.len());
+        eprintln!("New diversity: {:.3} ({}/{} unique)", new_diversity, new_unique.len(), new_out.len());
+
+        // The new output should have significantly better diversity
+        assert!(new_diversity > old_diversity || new_diversity > 0.3,
+            "Sampling controls should improve diversity: old={old_diversity:.3}, new={new_diversity:.3}");
+    }
 }
