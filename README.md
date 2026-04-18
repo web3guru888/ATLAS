@@ -10,8 +10,8 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v4.0.5-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-549%2F549%20passing-brightgreen.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v4.0.6-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-562%2F562%20passing-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-21-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__80%20A100-76b900.svg)](#gpu-inference)
@@ -54,6 +54,13 @@ It fuses four architectural innovations:
 - 🧮 **`CanonicalPheromoneUpdate` λ decay** — replaced linear formula `base_rate × (1 − canonical_term)` (went negative when term > 1, dead gradient at clamp boundary) with `base_rate × exp(−canonical_term)`: always positive, smooth, zero-gradient fidelity, hardware-safe for v6 ASIC spec
 - 🏆 **`InvasionFitnessScorer` competition kernel** — fixed negative Lotka-Volterra coefficients: raw `cosine_sim ∈ [−1, 1]` was giving fitness bonuses to anti-correlated strategies (mutualism, not competition); replaced with `α_ij = ReLU(cos_sim − 0.2)` — threshold at 4σ above noise floor in d=384 embedding space; `competition_threshold` added to `InvasionFitnessConfig`
 - ✅ **532/532 tests** (+4 new regression tests); GPU validated: 47/47 A100 model tests, OLMo-3-7B-Think still **19.9 tok/s**
+
+**v4.0.6** — Sampling Controls (Issue #16):
+- 🎛️ **Full sampling pipeline**: repetition penalty, temperature, top-p, top-k, min-p, frequency/presence penalty — 7-stage pipeline eliminates model text degeneration
+- 🔧 **`SamplingConfig` struct** with `::olmo3()` preset (temp=0.6, rep_penalty=1.1, top_p=0.95, top_k=50, min_p=0.05)
+- 🆕 **`generate_with_sampling()`** — full control; `generate()` remains backward-compatible
+- 📡 **OpenAI-compatible API** — `top_p`, `repetition_penalty`, `frequency_penalty`, `presence_penalty` in request body
+- ✅ **562/562 tests** (+13 new: repetition penalty, top-p/top-k/min-p filtering, frequency/presence penalties, greedy+sampling)
 
 **v4.0.5** — Inference Pipeline Fixes (Issues #13, #14, #15):
 - 🛑 **EOS stopping** — `generate()` now stops on EOS token (was dead code: `if let Some(eos) = None::<u32>`); parsed from `config.json` (OLMo-3: 100257), wired through model → API `finish_reason: "stop"` works correctly
@@ -374,11 +381,11 @@ cargo build --release -p atlas-cli
 
 ---
 
-## Status — v4.0.4
+## Status — v4.0.6
 
-**549/549 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **19.9 tok/s OLMo-3-7B-Think (BF16)**
+**562/562 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **19.9 tok/s OLMo-3-7B-Think (BF16)**
 
-> 🏔 **v4.0.4 is the current release.** GPT-4 regex tokenizer: full HuggingFace `tokenizer.json` support. Hand-coded pre-tokenization scanner (7 regex alternatives including backtracking) — OLMo-3, LLaMA-3, Mistral, SmolLM2 all encode correctly. End-to-end GPU test: tokenize→generate→decode on A100. Issue #12 closed.
+> 🏔 **v4.0.6 is the current release.** Full sampling pipeline: repetition penalty, temperature, top-p, top-k, min-p, frequency/presence penalty. `SamplingConfig` with `::olmo3()` preset. `generate_with_sampling()` for full control; `generate()` backward-compatible. OpenAI-compatible API params. Issue #16 closed.
 
 ### What Works
 
@@ -410,6 +417,8 @@ cargo build --release -p atlas-cli
 | **v4.0.2** | **BF16 GPU inference path (Issue #9): OLMo-3-7B-Think 4.1 → 19.9 tok/s (4.8×), W16A32, GEMV kernels** | **528** |
 | **v4.0.3** | **Math integrity (Issue #11): λ exp decay + ReLU competition threshold. 47/47 GPU model tests.** | **532** |
 | **v4.0.4** | **GPT-4 regex tokenizer (Issue #12): full HuggingFace tokenizer.json support. OLMo-3 + SmolLM2 verified. E2E GPU test.** | **539** |
+| **v4.0.5** | **Inference pipeline fixes (Issues #13–15): EOS stopping, XorShift64 PRNG, ChatML auto-detection.** | **549** |
+| **v4.0.6** | **Sampling controls (Issue #16): repetition penalty, top-p, top-k, min-p, freq/pres penalty. 7-stage pipeline.** | **562** |
 
 ### Crate Status
 
@@ -437,7 +446,7 @@ cargo build --release -p atlas-cli
 | atlas-safety | 6 | **30** | ✅ Horn-clause constitution (8 principles, 4 domains); 5-state FSM; CircuitBreaker; append-only audit log |
 | atlas-bridge | 6 | **8** | ✅ ZK-attested Rings↔ETH interface, Sepolia chain_id=11155111 |
 | atlas-cli | 7 | **30** | ✅ discover / corpus / train / eval / prove / palace / mcp / api / bench / status |
-| **TOTAL** | | **532** | **✅ All passing — v4.0.3** |
+| **TOTAL** | | **562** | **✅ All passing — v4.0.6** |
 
 ### Quick Start
 
@@ -558,7 +567,7 @@ ATLAS v4.0 implements the **Champagnat n-Morphic Framework** (Issue #6), grounde
 
 ATLAS models are published to Hugging Face under the [`openhubresearch`](https://huggingface.co/openhubresearch) organization.
 
-**First release**: `openhubresearch/ATLAS-OLMo-3-7B-Think-v4` — OLMo-3-7B-Think run through the ATLAS v4.0.3 n-morphic framework with BF16 inference (19.9 tok/s A100-SXM4-40GB, W16A32, 532/532 tests, 47/47 GPU model tests).
+**First release**: `openhubresearch/ATLAS-OLMo-3-7B-Think-v4` — OLMo-3-7B-Think run through the ATLAS v4.0.6 n-morphic framework with BF16 inference (19.9 tok/s A100-SXM4-40GB, W16A32, 562/562 tests, 47/47 GPU model tests).
 
 ```yaml
 ---
@@ -603,8 +612,8 @@ See [NOTICE](NOTICE) for attribution to incorporated components.
   institution = {OpenHub Research, Thailand},
   url         = {https://github.com/web3guru888/ATLAS},
   note        = {Pure Rust LLM training framework. Zero external dependencies.
-                 v4.0.3: 21 crates, 532 tests, Champagnat n-morphic framework,
+                 v4.0.6: 21 crates, 562 tests, Champagnat n-morphic framework,
                  BF16 GPU inference — OLMo-3-7B-Think 19.9 tok/s on A100-SXM4-40GB (W16A32).
-                 Math-validated: exp decay (Issue #11) + Lotka-Volterra competition fix.}
+                 Full sampling pipeline: repetition penalty, top-p, top-k, min-p, freq/pres penalty.}
 }
 ```
