@@ -313,31 +313,116 @@ fn handle_chat_stream(
         presence_penalty: req.presence_penalty,
         ..SamplingConfig::default()
     };
-    let (content, _prompt_tokens, completion_tokens) =
-        run_inference(state, prompt, req.max_tokens, &config);
-    let model_id = state.lock().unwrap().model_id.clone();
-    let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
 
-    if stream.write_all(&http_sse_header()).is_err() { return; }
+    let mut st = state.lock().unwrap();
+    let model_id = st.model_id.clone();
+    let max_tokens = req.max_tokens;
+    let id_owned = id.to_string();
 
-    // Stream in small text chunks for a smooth client UX
-    let parts = split_chunks(&content, 4);
-    let n     = parts.len();
-    for (i, text) in parts.iter().enumerate() {
-        let finish_reason = if i == n.saturating_sub(1) && n > 0 { Some(finish) } else { None };
-        let chunk = StreamChunk {
-            id: id.to_string(), model: model_id.clone(),
-            delta: text.to_string(), done: false, finish_reason,
-        };
-        if write_sse_chunk(stream, &chunk.to_sse()).is_err() { return; }
-    }
-    // [DONE] sentinel
-    let done = StreamChunk {
-        id: id.to_string(), model: model_id,
-        delta: String::new(), done: true, finish_reason: None,
+    // Encode prompt while we have the lock
+    let prompt_tokens: Vec<u32> = if let Some(ref tok) = st.tokenizer {
+        tok.encode(prompt)
+    } else {
+        prompt.bytes().map(|b| b as u32).collect()
     };
-    write_sse_chunk(stream, &done.to_sse()).ok();
-    write_chunk_end(stream).ok();
+
+    // Take model and tokenizer out of InferState so we can use them
+    // independently (model needs &mut, tokenizer needs &, TCP stream needs &mut).
+    let mut model = match st.model.take() {
+        Some(m) => m,
+        None => {
+            // No model (echo mode) — send empty [DONE]
+            if stream.write_all(&http_sse_header()).is_err() { return; }
+            let done = StreamChunk {
+                id: id_owned, model: model_id,
+                delta: String::new(), done: true, finish_reason: None,
+            };
+            write_sse_chunk(stream, &done.to_sse()).ok();
+            write_chunk_end(stream).ok();
+            return;
+        }
+    };
+    let tokenizer = st.tokenizer.take();
+
+    // Release the Mutex so other endpoints (health, models) aren't blocked
+    // during the (potentially multi-second) inference.
+    drop(st);
+
+    // Send SSE headers immediately so the client knows streaming has started
+    if stream.write_all(&http_sse_header()).is_err() {
+        let mut st = state.lock().unwrap();
+        st.model = Some(model);
+        st.tokenizer = tokenizer;
+        return;
+    }
+
+    // True token-by-token streaming: generate_streaming calls our closure
+    // after each token, and we immediately decode + flush an SSE chunk.
+    let mut token_count: usize = 0;
+    let mut write_ok = true;
+
+    model.generate_streaming(
+        &prompt_tokens,
+        max_tokens,
+        &config,
+        |tok_id: u32| {
+            token_count += 1;
+
+            // Decode this single token
+            let text = if let Some(ref tok) = tokenizer {
+                tok.decode(&[tok_id])
+            } else {
+                let bytes = vec![(tok_id % 256) as u8];
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+
+            let finish_reason: Option<&'static str> = if token_count >= max_tokens {
+                Some("length")
+            } else {
+                None
+            };
+
+            let chunk = StreamChunk {
+                id: id_owned.clone(),
+                model: model_id.clone(),
+                delta: text,
+                done: false,
+                finish_reason,
+            };
+            match write_sse_chunk(stream, &chunk.to_sse()) {
+                Ok(()) => true,   // keep generating
+                Err(_) => {
+                    write_ok = false;
+                    false // client disconnected — stop generation
+                }
+            }
+        },
+    );
+
+    // Write final finish-reason chunk + [DONE] sentinel
+    if write_ok {
+        let finish: &'static str = if token_count >= max_tokens { "length" } else { "stop" };
+        let final_chunk = StreamChunk {
+            id: id_owned.clone(),
+            model: model_id.clone(),
+            delta: String::new(),
+            done: false,
+            finish_reason: Some(finish),
+        };
+        write_sse_chunk(stream, &final_chunk.to_sse()).ok();
+
+        let done = StreamChunk {
+            id: id_owned, model: model_id,
+            delta: String::new(), done: true, finish_reason: None,
+        };
+        write_sse_chunk(stream, &done.to_sse()).ok();
+        write_chunk_end(stream).ok();
+    }
+
+    // Put model and tokenizer back into InferState
+    let mut st = state.lock().unwrap();
+    st.model = Some(model);
+    st.tokenizer = tokenizer;
 }
 
 fn handle_completion(

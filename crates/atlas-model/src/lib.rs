@@ -1319,6 +1319,110 @@ impl OlmoModel {
         new_tokens
     }
 
+    /// Generate tokens one-by-one, calling `on_token(token_id)` after each.
+    ///
+    /// Returns `false` from the callback to stop early (e.g. client disconnected).
+    /// Same sampling pipeline as `generate_with_sampling`.
+    pub fn generate_streaming<F>(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        config: &SamplingConfig,
+        mut on_token: F,
+    ) -> Vec<u32>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        self.reset();
+        self.rng = Rng::from_entropy();
+
+        let mut new_tokens: Vec<u32> = Vec::new();
+        let mut last_logits = vec![0.0f32; self.config.vocab_size];
+
+        // Process prompt
+        for &tok in prompt {
+            last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
+                gl
+            } else {
+                self.forward_one(tok)
+            };
+        }
+
+        let mut token_history: Vec<u32> = Vec::new();
+
+        for _step in 0..max_new {
+            let next = if config.temperature <= 0.0 || config.temperature < 1e-6 {
+                let mut logits = last_logits.clone();
+                if config.repetition_penalty != 1.0 && !token_history.is_empty() {
+                    let start = token_history.len().saturating_sub(config.repetition_window);
+                    apply_repetition_penalty(
+                        &mut logits, &token_history[start..], config.repetition_penalty,
+                    );
+                }
+                argmax(&logits)
+            } else {
+                let mut logits = last_logits.clone();
+                if config.repetition_penalty != 1.0 && !token_history.is_empty() {
+                    let start = token_history.len().saturating_sub(config.repetition_window);
+                    apply_repetition_penalty(
+                        &mut logits, &token_history[start..], config.repetition_penalty,
+                    );
+                }
+                if config.frequency_penalty != 0.0 && !token_history.is_empty() {
+                    let mut counts: Vec<(u32, usize)> = Vec::new();
+                    for &t in &token_history {
+                        if let Some(entry) = counts.iter_mut().find(|(tok, _)| *tok == t) {
+                            entry.1 += 1;
+                        } else {
+                            counts.push((t, 1));
+                        }
+                    }
+                    apply_frequency_penalty(&mut logits, &counts, config.frequency_penalty);
+                }
+                if config.presence_penalty != 0.0 && !token_history.is_empty() {
+                    let mut seen: Vec<u32> = token_history.clone();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    apply_presence_penalty(&mut logits, &seen, config.presence_penalty);
+                }
+                for l in logits.iter_mut() {
+                    *l /= config.temperature;
+                }
+                if config.top_k > 0 {
+                    apply_top_k(&mut logits, config.top_k);
+                }
+                if config.top_p < 1.0 {
+                    apply_top_p(&mut logits, config.top_p);
+                }
+                if config.min_p > 0.0 {
+                    apply_min_p(&mut logits, config.min_p);
+                }
+                softmax_inplace(&mut logits);
+                sample_from_probs(&logits, self.rng.next_f32())
+            };
+
+            let tok_id = next as u32;
+            if let Some(eos) = self.eos_token_id {
+                if tok_id == eos { break; }
+            }
+            if self.extra_stop_tokens.contains(&tok_id) { break; }
+
+            let tok = next as u32;
+            new_tokens.push(tok);
+            token_history.push(tok);
+
+            // Notify caller — stop if they return false
+            if !on_token(tok) { break; }
+
+            last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
+                gl
+            } else {
+                self.forward_one(tok)
+            };
+        }
+        new_tokens
+    }
+
     /// Set PRNG seed for reproducible sampling (useful for tests).
     ///
     /// In production, `generate()` re-seeds from system entropy automatically.
