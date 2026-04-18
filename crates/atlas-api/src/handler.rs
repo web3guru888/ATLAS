@@ -21,7 +21,7 @@ use atlas_tokenize::Tokenizer;
 
 use crate::types::{
     json_string, gen_id, unix_ts,
-    ChatCompletionRequest, ChatCompletionResponse, ChatTemplate,
+    ChatMessage, ChatCompletionRequest, ChatCompletionResponse, ChatTemplate,
     CompletionRequest, CompletionResponse,
     ErrorResponse, StreamChunk,
 };
@@ -179,7 +179,7 @@ pub fn handle(
                     return;
                 }
             };
-            let req = match ChatCompletionRequest::parse(body_str) {
+            let mut req = match ChatCompletionRequest::parse(body_str) {
                 Ok(r)  => r,
                 Err(e) => {
                     let err = ErrorResponse { message: format!("{e}"), error_type: "invalid_request_error", status: 400 };
@@ -187,6 +187,11 @@ pub fn handle(
                     return;
                 }
             };
+            // Auto-inject a system prompt if none provided.
+            // This dramatically improves output quality for small models
+            // by preventing degenerate <think> loops and providing clear
+            // behavioral framing.
+            inject_default_system_prompt(&mut req.messages);
             let template = state.lock().unwrap().chat_template;
             let prompt = req.to_prompt_with(&template);
             let id     = gen_id("chatcmpl");
@@ -292,7 +297,7 @@ fn handle_chat_nonstream(
         run_inference(state, prompt, req.max_tokens, &config);
 
     // Think budget: if <think> found but never closed, truncate and close it.
-    let content = enforce_think_budget(&content, 200);
+    let content = enforce_think_budget(&content, 100);
 
     let model_id = state.lock().unwrap().model_id.clone();
     let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
@@ -389,7 +394,7 @@ fn handle_chat_stream(
 
     // Think budget: track <think> blocks and force-close after a limit.
     // This prevents small models from endlessly rambling in think blocks.
-    let think_budget: usize = 200; // max tokens inside <think> before force-close
+    let think_budget: usize = 100; // max tokens inside <think> before force-close
     let mut accumulated_text = String::new();
     let mut in_think_block = false;
     let mut think_tokens: usize = 0;
@@ -520,6 +525,33 @@ fn handle_completion(
         prompt_tokens, completion_tokens, finish_reason: finish,
     };
     stream.write_all(&http_json_response(200, "OK", &resp.to_json())).ok();
+}
+
+// ── System prompt ────────────────────────────────────────────────────────────
+
+/// Default system prompt injected when no system message is present.
+/// This dramatically improves output quality for small models (7B) by:
+/// - Preventing degenerate `<think>` loops
+/// - Providing clear behavioral framing
+/// - Encouraging concise, direct responses
+const DEFAULT_SYSTEM_PROMPT: &str =
+    "You are ATLAS, a helpful and knowledgeable AI assistant. \
+     Respond directly to questions. Keep answers clear, informative, \
+     and concise. Do not use thinking tags or internal monologue.";
+
+/// Inject a default system prompt if the message list has no system message.
+///
+/// This is the single biggest improvement for small model output quality.
+/// Without a system prompt, OLMo-3-7B-Think enters degenerate `<think>`
+/// loops on nearly every query.
+fn inject_default_system_prompt(messages: &mut Vec<ChatMessage>) {
+    let has_system = messages.iter().any(|m| m.role == "system");
+    if !has_system {
+        messages.insert(0, ChatMessage {
+            role: "system".to_string(),
+            content: DEFAULT_SYSTEM_PROMPT.to_string(),
+        });
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -667,5 +699,28 @@ mod tests {
         let text = "Madrid is the capital of Spain.";
         let result = enforce_think_budget(text, 5);
         assert_eq!(result, text, "text without think blocks should be untouched");
+    }
+
+    #[test]
+    fn default_system_prompt_injected_when_absent() {
+        let mut messages = vec![
+            ChatMessage { role: "user".to_string(), content: "Hello".to_string() },
+        ];
+        inject_default_system_prompt(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0].content.contains("ATLAS"));
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn default_system_prompt_not_injected_when_present() {
+        let mut messages = vec![
+            ChatMessage { role: "system".to_string(), content: "Custom system".to_string() },
+            ChatMessage { role: "user".to_string(), content: "Hello".to_string() },
+        ];
+        inject_default_system_prompt(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "Custom system");
     }
 }
