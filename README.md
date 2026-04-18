@@ -10,8 +10,8 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v4.0.3-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-532%2F532%20passing-brightgreen.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v4.0.4-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-539%2F539%20passing-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-21-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__80%20A100-76b900.svg)](#gpu-inference)
@@ -54,6 +54,12 @@ It fuses four architectural innovations:
 - 🧮 **`CanonicalPheromoneUpdate` λ decay** — replaced linear formula `base_rate × (1 − canonical_term)` (went negative when term > 1, dead gradient at clamp boundary) with `base_rate × exp(−canonical_term)`: always positive, smooth, zero-gradient fidelity, hardware-safe for v6 ASIC spec
 - 🏆 **`InvasionFitnessScorer` competition kernel** — fixed negative Lotka-Volterra coefficients: raw `cosine_sim ∈ [−1, 1]` was giving fitness bonuses to anti-correlated strategies (mutualism, not competition); replaced with `α_ij = ReLU(cos_sim − 0.2)` — threshold at 4σ above noise floor in d=384 embedding space; `competition_threshold` added to `InvasionFitnessConfig`
 - ✅ **532/532 tests** (+4 new regression tests); GPU validated: 47/47 A100 model tests, OLMo-3-7B-Think still **19.9 tok/s**
+
+**v4.0.4** — GPT-4 Regex Tokenizer (Issue #12):
+- 🔤 **Full HuggingFace tokenizer.json support** — hand-coded GPT-4/OLMo-3/LLaMA-3 pre-tokenization regex (zero external deps): contractions, word boundaries, 3-digit number grouping, punctuation, newlines, whitespace with backtracking
+- ✅ **Verified against HuggingFace `tokenizers`** — OLMo-3 `encode("The capital of France is") → [791, 6864, 315, 9822, 374]`, SmolLM2 verified, round-trip decode perfect
+- 🧪 **End-to-end GPU test** — tokenize→generate→decode on A100, chat template with `<|im_start|>/<|im_end|>` special tokens
+- ✅ **539/539 tests** (+7 pre-tokenizer unit + 2 integration + 1 e2e GPU)
 
 The result: a self-improving scientific intelligence that trains on what it **actually discovers** about the world — real causal relationships from live data, validated by recursive architecture, guided by stigmergic memory.
 
@@ -362,11 +368,11 @@ cargo build --release -p atlas-cli
 
 ---
 
-## Status — v4.0.3
+## Status — v4.0.4
 
-**532/532 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **19.9 tok/s OLMo-3-7B-Think (BF16)**
+**539/539 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **19.9 tok/s OLMo-3-7B-Think (BF16)**
 
-> 🏔 **v4.0.3 is the current release.** Math integrity fixes: `CanonicalPheromoneUpdate` exp decay (λ never negative) + `InvasionFitnessScorer` ReLU competition threshold (no mutualism). GPU-validated: 532/532 workspace + 47/47 A100 model tests. OLMo-3-7B-Think 19.9 tok/s confirmed.
+> 🏔 **v4.0.4 is the current release.** GPT-4 regex tokenizer: full HuggingFace `tokenizer.json` support. Hand-coded pre-tokenization scanner (7 regex alternatives including backtracking) — OLMo-3, LLaMA-3, Mistral, SmolLM2 all encode correctly. End-to-end GPU test: tokenize→generate→decode on A100. Issue #12 closed.
 
 ### What Works
 
@@ -397,6 +403,7 @@ cargo build --release -p atlas-cli
 | **v4.0.1** | **Docs + test cleanup for v4.0.0 / Issue #7** | **528** |
 | **v4.0.2** | **BF16 GPU inference path (Issue #9): OLMo-3-7B-Think 4.1 → 19.9 tok/s (4.8×), W16A32, GEMV kernels** | **528** |
 | **v4.0.3** | **Math integrity (Issue #11): λ exp decay + ReLU competition threshold. 47/47 GPU model tests.** | **532** |
+| **v4.0.4** | **GPT-4 regex tokenizer (Issue #12): full HuggingFace tokenizer.json support. OLMo-3 + SmolLM2 verified. E2E GPU test.** | **539** |
 
 ### Crate Status
 
@@ -409,7 +416,7 @@ cargo build --release -p atlas-cli
 | atlas-quant | 1 | 7 | ✅ INT8, INT4, symmetric scaling |
 | CUDA kernels | 1 | — | ✅ tiled GEMM, rmsnorm, rope, silu_mul, AdamW, INT8/INT4 — compiled on A100-SXM4-40GB (sm_80) |
 | atlas-json | 2 | 12 | ✅ Recursive descent parser, surrogate pairs |
-| atlas-tokenize | 2 | 6 | ✅ GPT-2 byte-level BPE, tokenizer.json |
+| atlas-tokenize | 2 | **14** | ✅ GPT-4 regex pre-tokenization (7 alts w/ backtracking), byte-level BPE, HF tokenizer.json; OLMo-3 + SmolLM2 verified |
 | atlas-model | 2 | **27** | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, SWA, YaRN RoPE, config.json auto-patch; GPU-resident forward pass |
 | atlas-palace | 3 | **79** | ✅ A\* search, 5-type pheromones, Active Inference, MMAS, PalaceBackend trait, session_id, PalaceConfig; v4.0.3: `CanonicalPheromoneUpdate` uses `exp(−x)` decay (always positive, smooth, hardware-safe) |
 | atlas-mcp | 3 | **32** | ✅ 28 MCP tools, JSON-RPC 2.0, live palace dispatch; McpConnectionPool (max 5, 5-min idle eviction) |
