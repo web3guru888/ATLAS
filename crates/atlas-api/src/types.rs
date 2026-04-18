@@ -95,6 +95,14 @@ pub struct ChatCompletionRequest {
     pub temperature: f32,
     /// Whether to stream tokens back via SSE.
     pub stream: bool,
+    /// Top-P (nucleus) sampling threshold. 1.0 = off.
+    pub top_p: f32,
+    /// Repetition penalty θ (Keskar 2019). 1.0 = off.
+    pub repetition_penalty: f32,
+    /// Frequency penalty — proportional to token count. 0.0 = off.
+    pub frequency_penalty: f32,
+    /// Presence penalty — flat penalty for any seen token. 0.0 = off.
+    pub presence_penalty: f32,
 }
 
 impl ChatCompletionRequest {
@@ -119,7 +127,20 @@ impl ChatCompletionRequest {
         let stream = v.get("stream")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
-        Ok(Self { model, messages, max_tokens, temperature, stream })
+        let top_p = v.get("top_p")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(1.0) as f32;
+        let repetition_penalty = v.get("repetition_penalty")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(1.0) as f32;
+        let frequency_penalty = v.get("frequency_penalty")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0) as f32;
+        let presence_penalty = v.get("presence_penalty")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0) as f32;
+        Ok(Self { model, messages, max_tokens, temperature, stream,
+                  top_p, repetition_penalty, frequency_penalty, presence_penalty })
     }
 
     /// Build a prompt string using the default ChatML template.
@@ -183,6 +204,14 @@ pub struct CompletionRequest {
     pub temperature: f32,
     /// Whether to stream.
     pub stream: bool,
+    /// Top-P (nucleus) sampling threshold. 1.0 = off.
+    pub top_p: f32,
+    /// Repetition penalty θ (Keskar 2019). 1.0 = off.
+    pub repetition_penalty: f32,
+    /// Frequency penalty — proportional to token count. 0.0 = off.
+    pub frequency_penalty: f32,
+    /// Presence penalty — flat penalty for any seen token. 0.0 = off.
+    pub presence_penalty: f32,
 }
 
 impl CompletionRequest {
@@ -207,7 +236,20 @@ impl CompletionRequest {
         let stream = v.get("stream")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
-        Ok(Self { model, prompt, max_tokens, temperature, stream })
+        let top_p = v.get("top_p")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(1.0) as f32;
+        let repetition_penalty = v.get("repetition_penalty")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(1.0) as f32;
+        let frequency_penalty = v.get("frequency_penalty")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0) as f32;
+        let presence_penalty = v.get("presence_penalty")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(0.0) as f32;
+        Ok(Self { model, prompt, max_tokens, temperature, stream,
+                  top_p, repetition_penalty, frequency_penalty, presence_penalty })
     }
 }
 
@@ -464,6 +506,10 @@ mod tests {
         assert_eq!(req.max_tokens, 256);
         assert_eq!(req.temperature, 0.0);
         assert!(!req.stream);
+        assert_eq!(req.top_p, 1.0);
+        assert_eq!(req.repetition_penalty, 1.0);
+        assert_eq!(req.frequency_penalty, 0.0);
+        assert_eq!(req.presence_penalty, 0.0);
     }
 
     #[test]
@@ -488,6 +534,7 @@ mod tests {
                 ChatMessage { role: "user".to_string(),      content: "What is 2+2?".to_string() },
             ],
             max_tokens: 50, temperature: 0.0, stream: false,
+            top_p: 1.0, repetition_penalty: 1.0, frequency_penalty: 0.0, presence_penalty: 0.0,
         };
         // Default is ChatML
         let p = req.to_prompt();
@@ -504,6 +551,7 @@ mod tests {
                 ChatMessage { role: "user".to_string(), content: "Hi".to_string() },
             ],
             max_tokens: 50, temperature: 0.0, stream: false,
+            top_p: 1.0, repetition_penalty: 1.0, frequency_penalty: 0.0, presence_penalty: 0.0,
         };
         let p = req.to_prompt_with(&ChatTemplate::Llama3);
         assert!(p.contains("<|start_header_id|>user<|end_header_id|>"));
@@ -520,6 +568,7 @@ mod tests {
                 ChatMessage { role: "user".to_string(),   content: "Hello".to_string() },
             ],
             max_tokens: 50, temperature: 0.0, stream: false,
+            top_p: 1.0, repetition_penalty: 1.0, frequency_penalty: 0.0, presence_penalty: 0.0,
         };
         let p = req.to_prompt_with(&ChatTemplate::Generic);
         assert!(p.contains("<|system|>"));

@@ -16,7 +16,7 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
-use atlas_model::OlmoModel;
+use atlas_model::{OlmoModel, SamplingConfig};
 use atlas_tokenize::Tokenizer;
 
 use crate::types::{
@@ -233,13 +233,13 @@ pub fn handle(
 
 // ── Inference ─────────────────────────────────────────────────────────────────
 
-/// Run model inference for `prompt`.
+/// Run model inference for `prompt` with full sampling controls.
 /// Returns `(generated_text, prompt_token_count, completion_token_count)`.
 fn run_inference(
     state: &Arc<Mutex<InferState>>,
     prompt: &str,
     max_tokens: usize,
-    temperature: f32,
+    config: &SamplingConfig,
 ) -> (String, usize, usize) {
     let mut st = state.lock().unwrap();
 
@@ -254,7 +254,7 @@ fn run_inference(
     // Generate
     let new_tokens: Vec<u32> = if let Some(ref mut model) = st.model {
         model.reset();
-        model.generate(&prompt_tokens, max_tokens, temperature)
+        model.generate_with_sampling(&prompt_tokens, max_tokens, config)
     } else {
         vec![] // echo / test mode
     };
@@ -278,8 +278,16 @@ fn handle_chat_nonstream(
     id: &str,
     state: &Arc<Mutex<InferState>>,
 ) {
+    let config = SamplingConfig {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        repetition_penalty: req.repetition_penalty,
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+        ..SamplingConfig::default()
+    };
     let (content, prompt_tokens, completion_tokens) =
-        run_inference(state, prompt, req.max_tokens, req.temperature);
+        run_inference(state, prompt, req.max_tokens, &config);
     let model_id = state.lock().unwrap().model_id.clone();
     let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
     let resp = ChatCompletionResponse {
@@ -297,8 +305,16 @@ fn handle_chat_stream(
     id: &str,
     state: &Arc<Mutex<InferState>>,
 ) {
+    let config = SamplingConfig {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        repetition_penalty: req.repetition_penalty,
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+        ..SamplingConfig::default()
+    };
     let (content, _prompt_tokens, completion_tokens) =
-        run_inference(state, prompt, req.max_tokens, req.temperature);
+        run_inference(state, prompt, req.max_tokens, &config);
     let model_id = state.lock().unwrap().model_id.clone();
     let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
 
@@ -330,8 +346,16 @@ fn handle_completion(
     id: &str,
     state: &Arc<Mutex<InferState>>,
 ) {
+    let config = SamplingConfig {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        repetition_penalty: req.repetition_penalty,
+        frequency_penalty: req.frequency_penalty,
+        presence_penalty: req.presence_penalty,
+        ..SamplingConfig::default()
+    };
     let (text, prompt_tokens, completion_tokens) =
-        run_inference(state, &req.prompt, req.max_tokens, req.temperature);
+        run_inference(state, &req.prompt, req.max_tokens, &config);
     let model_id = state.lock().unwrap().model_id.clone();
     let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
     let resp = CompletionResponse {
@@ -450,8 +474,9 @@ mod tests {
             model_id: "test".to_string(),
             chat_template: ChatTemplate::ChatML,
         }));
+        let config = SamplingConfig { temperature: 0.0, ..SamplingConfig::default() };
         let (text, prompt_count, completion_count) =
-            run_inference(&state, "hello world", 10, 0.0);
+            run_inference(&state, "hello world", 10, &config);
         assert_eq!(text, "");              // no model → empty
         assert_eq!(completion_count, 0);
         assert_eq!(prompt_count, 11);      // byte-encode: "hello world" = 11 bytes

@@ -4,7 +4,8 @@
 //! - RMSNorm, RoPE, SwiGLU, Grouped Query Attention (GQA)
 //! - Safetensors weight loading (zero-dependency binary parser)
 //! - f32 + optional CUDA execution via atlas-tensor
-//! - Greedy/temperature generation loop
+//! - Greedy/temperature generation loop with sampling controls
+//!   (repetition penalty, top-p, top-k, min-p, frequency/presence penalty)
 //!
 //! # Quickstart (small test model)
 //! ```
@@ -965,6 +966,58 @@ impl Rng {
     }
 }
 
+/// Configuration for text generation sampling controls.
+///
+/// Pipeline order: repetition_penalty → frequency_penalty → presence_penalty
+/// → temperature → top_k → top_p → min_p → sample.
+#[derive(Debug, Clone)]
+pub struct SamplingConfig {
+    /// Temperature for softmax scaling. 0.0 = greedy.
+    pub temperature: f32,
+    /// Repetition penalty θ (Keskar 2019). 1.0 = off. Recommended: 1.1.
+    pub repetition_penalty: f32,
+    /// Number of recent tokens to consider for repetition penalty.
+    pub repetition_window: usize,
+    /// Frequency penalty — proportional to token count. 0.0 = off.
+    pub frequency_penalty: f32,
+    /// Presence penalty — flat penalty for any seen token. 0.0 = off.
+    pub presence_penalty: f32,
+    /// Top-P (nucleus) sampling threshold. 1.0 = off. Recommended: 0.95.
+    pub top_p: f32,
+    /// Top-K sampling. 0 = off. Recommended: 50.
+    pub top_k: usize,
+    /// Min-P sampling threshold. 0.0 = off. Recommended: 0.05 (future).
+    pub min_p: f32,
+}
+
+impl Default for SamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            repetition_penalty: 1.0,
+            repetition_window: 64,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+        }
+    }
+}
+
+impl SamplingConfig {
+    /// OLMo-3-7B-Think recommended defaults.
+    pub fn olmo3() -> Self {
+        Self {
+            temperature: 0.6,
+            repetition_penalty: 1.1,
+            repetition_window: 64,
+            top_p: 0.95,
+            ..Default::default()
+        }
+    }
+}
+
 /// Transformer language model (OLMo/LLaMA architecture).
 pub struct OlmoModel {
     config: ModelConfig,
@@ -1094,15 +1147,38 @@ impl OlmoModel {
     ///
     /// Stops early if the model produces the EOS token (set via `eos_token_id`).
     /// The EOS token itself is excluded from the output.
+    ///
+    /// This is a convenience wrapper — delegates to [`generate_with_sampling`]
+    /// with default sampling config (no repetition penalty, top-p, etc.).
     pub fn generate(&mut self, prompt: &[u32], max_new: usize, temperature: f32) -> Vec<u32> {
+        let config = SamplingConfig {
+            temperature,
+            ..SamplingConfig::default()
+        };
+        self.generate_with_sampling(prompt, max_new, &config)
+    }
+
+    /// Autoregressive generation with full sampling controls.
+    ///
+    /// Pipeline order: repetition_penalty → frequency_penalty → presence_penalty
+    /// → temperature → top_k → top_p → min_p → softmax → sample.
+    ///
+    /// Stops early if the model produces the EOS token (set via `eos_token_id`).
+    /// The EOS token itself is excluded from the output.
+    pub fn generate_with_sampling(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        config: &SamplingConfig,
+    ) -> Vec<u32> {
         self.reset();
         // Re-seed PRNG from system entropy so each call produces different output.
         self.rng = Rng::from_entropy();
 
-        // Process prompt
-        let mut new_tokens = Vec::new();
+        let mut new_tokens: Vec<u32> = Vec::new();
         let mut last_logits = vec![0.0f32; self.config.vocab_size];
 
+        // Process prompt
         for &tok in prompt {
             last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
                 gl
@@ -1111,16 +1187,77 @@ impl OlmoModel {
             };
         }
 
+        // Token history for repetition / frequency / presence penalties
+        let mut token_history: Vec<u32> = Vec::new();
+
         for _step in 0..max_new {
-            let next = if temperature <= 0.0 || temperature < 1e-6 {
-                // Greedy (deterministic)
-                argmax(&last_logits)
+            let next = if config.temperature <= 0.0 || config.temperature < 1e-6 {
+                // Greedy — still apply repetition penalty for greedy decoding
+                let mut logits = last_logits.clone();
+
+                if config.repetition_penalty != 1.0 && !token_history.is_empty() {
+                    let start = token_history.len().saturating_sub(config.repetition_window);
+                    apply_repetition_penalty(
+                        &mut logits, &token_history[start..], config.repetition_penalty,
+                    );
+                }
+
+                argmax(&logits)
             } else {
-                // Temperature sampling with stateful PRNG
-                let mut scaled: Vec<f32> = last_logits.iter()
-                    .map(|&l| l / temperature).collect();
-                softmax_inplace(&mut scaled);
-                sample_from_probs(&scaled, self.rng.next_f32())
+                let mut logits = last_logits.clone();
+
+                // Step 1: Repetition penalty (on raw logits)
+                if config.repetition_penalty != 1.0 && !token_history.is_empty() {
+                    let start = token_history.len().saturating_sub(config.repetition_window);
+                    apply_repetition_penalty(
+                        &mut logits, &token_history[start..], config.repetition_penalty,
+                    );
+                }
+
+                // Step 2: Frequency penalty
+                if config.frequency_penalty != 0.0 && !token_history.is_empty() {
+                    let mut counts: Vec<(u32, usize)> = Vec::new();
+                    for &t in &token_history {
+                        if let Some(entry) = counts.iter_mut().find(|(tok, _)| *tok == t) {
+                            entry.1 += 1;
+                        } else {
+                            counts.push((t, 1));
+                        }
+                    }
+                    apply_frequency_penalty(&mut logits, &counts, config.frequency_penalty);
+                }
+
+                // Step 3: Presence penalty
+                if config.presence_penalty != 0.0 && !token_history.is_empty() {
+                    let mut seen: Vec<u32> = token_history.clone();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    apply_presence_penalty(&mut logits, &seen, config.presence_penalty);
+                }
+
+                // Step 4: Temperature
+                for l in logits.iter_mut() {
+                    *l /= config.temperature;
+                }
+
+                // Step 5: Top-K
+                if config.top_k > 0 {
+                    apply_top_k(&mut logits, config.top_k);
+                }
+
+                // Step 6: Top-P
+                if config.top_p < 1.0 {
+                    apply_top_p(&mut logits, config.top_p);
+                }
+
+                // Step 7: Min-P
+                if config.min_p > 0.0 {
+                    apply_min_p(&mut logits, config.min_p);
+                }
+
+                // Step 8: Softmax + sample
+                softmax_inplace(&mut logits);
+                sample_from_probs(&logits, self.rng.next_f32())
             };
 
             // Stop on EOS before adding to output (EOS itself is not emitted).
@@ -1128,13 +1265,15 @@ impl OlmoModel {
                 if next as u32 == eos { break; }
             }
 
-            new_tokens.push(next as u32);
+            let tok = next as u32;
+            new_tokens.push(tok);
+            token_history.push(tok);
 
             // Prefer GPU-resident forward
-            last_logits = if let Some(gl) = self.forward_one_gpu(next as u32) {
+            last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
                 gl
             } else {
-                self.forward_one(next as u32)
+                self.forward_one(tok)
             };
         }
         new_tokens
@@ -1695,6 +1834,133 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
 
 // ── Utility ────────────────────────────────────────────────────────────────
 
+// ── Sampling primitives ──────────────────────────────────────────────────
+
+/// Apply Keskar-style repetition penalty to logits.
+///
+/// For each token in `penalized_tokens`: if logit > 0, divide by θ;
+/// if logit < 0, multiply by θ. This uniformly reduces the probability
+/// of recently generated tokens regardless of sign.
+fn apply_repetition_penalty(logits: &mut [f32], penalized_tokens: &[u32], theta: f32) {
+    for &tok in penalized_tokens {
+        let idx = tok as usize;
+        if idx < logits.len() {
+            if logits[idx] > 0.0 {
+                logits[idx] /= theta;
+            } else {
+                logits[idx] *= theta;
+            }
+        }
+    }
+}
+
+/// Apply frequency penalty: subtract `penalty * count` for each token.
+///
+/// Tokens that appear more often in the history receive a proportionally
+/// larger penalty, encouraging vocabulary diversity.
+fn apply_frequency_penalty(logits: &mut [f32], token_counts: &[(u32, usize)], penalty: f32) {
+    for &(tok, count) in token_counts {
+        let idx = tok as usize;
+        if idx < logits.len() {
+            logits[idx] -= penalty * count as f32;
+        }
+    }
+}
+
+/// Apply presence penalty: subtract `penalty` for any token that appeared.
+///
+/// Unlike frequency penalty, this is a flat penalty regardless of count.
+fn apply_presence_penalty(logits: &mut [f32], seen_tokens: &[u32], penalty: f32) {
+    for &tok in seen_tokens {
+        let idx = tok as usize;
+        if idx < logits.len() {
+            logits[idx] -= penalty;
+        }
+    }
+}
+
+/// Apply top-p (nucleus) sampling: set logits below cumulative probability
+/// threshold `p` to -∞.
+///
+/// Sorts tokens by probability descending, accumulates until ≥ p, then
+/// masks out all remaining tokens. This focuses sampling on the most
+/// likely nucleus while preserving the relative probabilities within it.
+fn apply_top_p(logits: &mut [f32], p: f32) {
+    let n = logits.len();
+    if n == 0 { return; }
+    // Compute probabilities via softmax
+    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<(usize, f32)> = logits.iter().enumerate()
+        .map(|(i, &l)| (i, (l - max_l).exp()))
+        .collect();
+    let sum: f32 = probs.iter().map(|&(_, prob)| prob).sum();
+    if sum <= 0.0 { return; }
+    for item in probs.iter_mut() { item.1 /= sum; }
+
+    // Sort by probability descending
+    probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Find cutoff
+    let mut cumsum = 0.0f32;
+    let mut cutoff_idx = n;
+    for (i, &(_, prob)) in probs.iter().enumerate() {
+        cumsum += prob;
+        if cumsum >= p {
+            cutoff_idx = i + 1; // keep this token too
+            break;
+        }
+    }
+
+    // Mask out logits below the cutoff
+    for &(idx, _) in &probs[cutoff_idx..] {
+        logits[idx] = f32::NEG_INFINITY;
+    }
+}
+
+/// Apply top-k sampling: keep only top `k` logits, set the rest to -∞.
+fn apply_top_k(logits: &mut [f32], k: usize) {
+    if k == 0 || k >= logits.len() { return; }
+    // Find the k-th largest value
+    let mut sorted: Vec<f32> = logits.to_vec();
+    sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let threshold = sorted[k - 1];
+    // Count how many are >= threshold to handle ties
+    let count_at_threshold: usize = logits.iter().filter(|&&l| l >= threshold).count();
+    if count_at_threshold <= k {
+        for l in logits.iter_mut() {
+            if *l < threshold { *l = f32::NEG_INFINITY; }
+        }
+    } else {
+        // Tie-breaking: keep exactly k tokens
+        let mut above = 0usize;
+        let mut at_threshold_kept = 0usize;
+        let need_at_threshold = k - logits.iter().filter(|&&l| l > threshold).count();
+        for l in logits.iter_mut() {
+            if *l > threshold {
+                above += 1;
+            } else if *l == threshold && at_threshold_kept < need_at_threshold {
+                at_threshold_kept += 1;
+            } else {
+                *l = f32::NEG_INFINITY;
+            }
+        }
+        let _ = above; // suppress unused warning
+    }
+}
+
+/// Apply min-p sampling: keep tokens with probability ≥ `min_p × max_prob`.
+///
+/// Works in logit space: keep if `exp(l_i - max_l) ≥ min_p`, i.e.
+/// `l_i ≥ max_l + ln(min_p)`.
+fn apply_min_p(logits: &mut [f32], min_p: f32) {
+    if min_p <= 0.0 { return; }
+    let max_l = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let threshold = max_l + min_p.ln();
+    for l in logits.iter_mut() {
+        if *l < threshold { *l = f32::NEG_INFINITY; }
+    }
+}
+
 fn argmax(x: &[f32]) -> usize {
     x.iter().enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
@@ -1870,6 +2136,163 @@ mod tests {
         assert_eq!(sample_from_probs(&probs, 0.15), 1); // cumsum: 0.3 → picks 1
         assert_eq!(sample_from_probs(&probs, 0.35), 2); // cumsum: 0.6 → picks 2
         assert_eq!(sample_from_probs(&probs, 0.95), 3); // cumsum: 1.0 → picks 3
+    }
+
+    // ── Sampling control tests ─────────────────────────────────────────────
+
+    #[test]
+    fn repetition_penalty_reduces_repeated() {
+        let mut logits = vec![1.0, 2.0, 3.0, -1.0];
+        apply_repetition_penalty(&mut logits, &[1, 3], 1.5);
+        // Token 1: logit 2.0 > 0 → 2.0 / 1.5 = 1.333
+        assert!((logits[1] - 1.333).abs() < 0.01);
+        // Token 3: logit -1.0 < 0 → -1.0 * 1.5 = -1.5
+        assert!((logits[3] - (-1.5)).abs() < 0.01);
+        // Token 0, 2: unchanged
+        assert_eq!(logits[0], 1.0);
+        assert_eq!(logits[2], 3.0);
+    }
+
+    #[test]
+    fn repetition_penalty_one_is_noop() {
+        let orig = vec![1.0, 2.0, 3.0, -1.0];
+        let mut logits = orig.clone();
+        apply_repetition_penalty(&mut logits, &[0, 1, 2, 3], 1.0);
+        assert_eq!(logits, orig);
+    }
+
+    #[test]
+    fn top_p_filters_low_prob() {
+        // Create logits where softmax gives approximately [0.06, 0.11, 0.22, 0.60]
+        let mut logits = vec![-1.0, 0.0, 0.7, 1.7];
+        apply_top_p(&mut logits, 0.5);
+        // Token 3 has prob ~0.60 ≥ 0.5, so it should be kept.
+        // Remaining tokens may be filtered.
+        assert!(logits[3] > f32::NEG_INFINITY, "top token should survive");
+        // At least one low-prob token should be filtered
+        let filtered = logits.iter().filter(|&&l| l == f32::NEG_INFINITY).count();
+        assert!(filtered >= 1, "top_p=0.5 should filter at least one token");
+    }
+
+    #[test]
+    fn top_p_one_keeps_all() {
+        let orig = vec![1.0, 2.0, 3.0, 4.0];
+        let mut logits = orig.clone();
+        apply_top_p(&mut logits, 1.0);
+        // p=1.0 → keep all tokens (cumsum will reach 1.0 at last token)
+        assert!(logits.iter().all(|&l| l > f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn top_k_keeps_only_k() {
+        let mut logits = vec![1.0, 5.0, 3.0, 2.0, 4.0];
+        apply_top_k(&mut logits, 3);
+        // Top 3: indices 1(5.0), 4(4.0), 2(3.0)
+        assert!(logits[1] > f32::NEG_INFINITY);
+        assert!(logits[4] > f32::NEG_INFINITY);
+        assert!(logits[2] > f32::NEG_INFINITY);
+        assert_eq!(logits[0], f32::NEG_INFINITY);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn top_k_zero_is_noop() {
+        let orig = vec![1.0, 5.0, 3.0, 2.0, 4.0];
+        let mut logits = orig.clone();
+        apply_top_k(&mut logits, 0);
+        assert_eq!(logits, orig);
+    }
+
+    #[test]
+    fn min_p_filters_low_relative() {
+        let mut logits = vec![10.0, 0.0, -5.0, 9.0];
+        apply_min_p(&mut logits, 0.1);
+        // max logit = 10.0, threshold = 10.0 + ln(0.1) ≈ 10.0 - 2.3 = 7.7
+        // Keep: logits[0]=10.0, logits[3]=9.0 (both ≥ 7.7)
+        // Filter: logits[1]=0.0, logits[2]=-5.0
+        assert!(logits[0] > f32::NEG_INFINITY);
+        assert!(logits[3] > f32::NEG_INFINITY);
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn frequency_penalty_proportional() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        apply_frequency_penalty(&mut logits, &[(1, 3), (2, 1)], 0.5);
+        // Token 1: 2.0 - 0.5*3 = 0.5
+        // Token 2: 3.0 - 0.5*1 = 2.5
+        assert!((logits[1] - 0.5).abs() < 0.01);
+        assert!((logits[2] - 2.5).abs() < 0.01);
+        assert_eq!(logits[0], 1.0);
+    }
+
+    #[test]
+    fn presence_penalty_flat() {
+        let mut logits = vec![1.0, 2.0, 3.0];
+        apply_presence_penalty(&mut logits, &[0, 2], 0.5);
+        assert!((logits[0] - 0.5).abs() < 0.01);
+        assert_eq!(logits[1], 2.0);
+        assert!((logits[2] - 2.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn sampling_config_default_is_passthrough() {
+        let config = SamplingConfig::default();
+        assert_eq!(config.repetition_penalty, 1.0);
+        assert_eq!(config.top_p, 1.0);
+        assert_eq!(config.top_k, 0);
+        assert_eq!(config.min_p, 0.0);
+        assert_eq!(config.temperature, 1.0);
+    }
+
+    #[test]
+    fn sampling_config_olmo3() {
+        let config = SamplingConfig::olmo3();
+        assert!((config.temperature - 0.6).abs() < 0.01);
+        assert!((config.repetition_penalty - 1.1).abs() < 0.01);
+        assert!((config.top_p - 0.95).abs() < 0.01);
+    }
+
+    #[test]
+    fn generate_backward_compat() {
+        // generate() should produce same results as generate_with_sampling()
+        // when using default sampling config with same temperature.
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg.clone());
+        model.set_rng_seed(42);
+        let a = model.generate(&[0, 1], 5, 0.0);
+        let mut model2 = OlmoModel::new(cfg);
+        model2.set_rng_seed(42);
+        let b = model2.generate_with_sampling(
+            &[0, 1], 5,
+            &SamplingConfig { temperature: 0.0, ..SamplingConfig::default() },
+        );
+        assert_eq!(a, b, "generate() and generate_with_sampling() should match for greedy");
+    }
+
+    #[test]
+    fn generate_with_repetition_penalty() {
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+        // Greedy without penalty
+        let plain = model.generate(&[0, 1], 20, 0.0);
+        // Greedy with high repetition penalty
+        let config = SamplingConfig {
+            temperature: 0.0,
+            repetition_penalty: 2.0,
+            repetition_window: 64,
+            ..SamplingConfig::default()
+        };
+        let penalized = model.generate_with_sampling(&[0, 1], 20, &config);
+        // With penalty, we expect more unique tokens (less repetition)
+        let plain_unique: std::collections::HashSet<_> = plain.iter().collect();
+        let pen_unique: std::collections::HashSet<_> = penalized.iter().collect();
+        // The penalized output should have at least as many unique tokens,
+        // and the outputs should differ.
+        assert!(pen_unique.len() >= plain_unique.len(),
+            "repetition penalty should increase diversity: plain={} penalized={}",
+            plain_unique.len(), pen_unique.len());
     }
 
     #[test]
