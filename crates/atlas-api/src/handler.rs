@@ -395,14 +395,32 @@ fn clean_filler(text: &str) -> String {
     // Remove leading filler
     let filler_prefixes = ["Okay\n", "Okay\r\n", "Okay?", "Okay!", "Okay ",
                            "Hmm\n", "Hmm.", "Hmm,", "Hmm ",
-                           "Wait,", "Wait.", "Wait\n"];
+                           "Wait,", "Wait.", "Wait\n",
+                           "Alright\n", "Alright,", "Alright "];
     for prefix in &filler_prefixes {
         if s.starts_with(prefix) {
             s = s[prefix.len()..].trim_start().to_string();
         }
     }
-    // Remove trailing filler (common: model ends with "Okay" after think)
-    let filler_suffixes = ["\nOkay", "\nOkay?", "\r\nOkay", "\nHmm"];
+    // Remove trailing filler paragraph (model sometimes appends "Okay" or
+    // rambling "I think..." after a good answer). Find last double-newline
+    // and check if the trailing paragraph is filler.
+    if let Some(split) = s.rfind("\n\n") {
+        let tail = s[split + 2..].trim();
+        let tail_lower = tail.to_lowercase();
+        let is_filler = tail_lower.starts_with("okay")
+            || tail_lower.starts_with("hmm")
+            || tail_lower.starts_with("wait")
+            || tail_lower.starts_with("alright")
+            || tail_lower.starts_with("it seems your question")
+            || tail_lower.starts_with("let me know")
+            || (tail.len() < 10 && !tail.contains('.'));
+        if is_filler {
+            s = s[..split].trim_end().to_string();
+        }
+    }
+    // Simple trailing filler lines
+    let filler_suffixes = ["\nOkay", "\nOkay?", "\r\nOkay", "\nHmm", "\nAlright"];
     for suffix in &filler_suffixes {
         if s.ends_with(suffix) {
             s = s[..s.len() - suffix.len()].trim_end().to_string();
@@ -906,6 +924,11 @@ mod tests {
     fn clean_filler_removes_okay() {
         assert_eq!(clean_filler("Okay\nThe answer is 42."), "The answer is 42.");
         assert_eq!(clean_filler("Hello world\nOkay"), "Hello world");
+        // Trailing filler paragraph
+        assert_eq!(
+            clean_filler("Good answer here.\n\nOkay let me know if that helps"),
+            "Good answer here."
+        );
     }
 
     #[test]
