@@ -1014,7 +1014,19 @@ fn cmd_api(args: &[String]) -> i32 {
     match subcmd {
         "serve" => {
             let weights_dir = opt(args, "--weights").map(|s| s.to_string());
-            let model_id    = opt(args, "--model").unwrap_or("smollm2-135m").to_string();
+            // Auto-detect model from weights directory name when --model not given.
+            let model_id = opt(args, "--model").map(|s| s.to_string()).unwrap_or_else(|| {
+                if let Some(ref dir) = weights_dir {
+                    let d = dir.to_lowercase();
+                    if d.contains("olmo") && d.contains("7b") { "olmo3-7b".to_string() }
+                    else if d.contains("olmo") { "olmo3-1b".to_string() }
+                    else if d.contains("1.7b") || d.contains("1b7") { "smollm2-1.7b".to_string() }
+                    else if d.contains("llama") { "llama32-1b".to_string() }
+                    else { "smollm2-135m".to_string() }
+                } else {
+                    "smollm2-135m".to_string()
+                }
+            });
             let port: u16   = opt(args, "--port")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8080);
