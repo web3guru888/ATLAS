@@ -97,8 +97,14 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     /// Top-P (nucleus) sampling threshold. 1.0 = off.
     pub top_p: f32,
+    /// Top-K sampling. 0 = off.
+    pub top_k: usize,
+    /// Min-P sampling threshold. 0.0 = off.
+    pub min_p: f32,
     /// Repetition penalty θ (Keskar 2019). 1.0 = off.
     pub repetition_penalty: f32,
+    /// Number of recent tokens for repetition penalty window.
+    pub repetition_window: usize,
     /// Frequency penalty — proportional to token count. 0.0 = off.
     pub frequency_penalty: f32,
     /// Presence penalty — flat penalty for any seen token. 0.0 = off.
@@ -127,20 +133,31 @@ impl ChatCompletionRequest {
         let stream = v.get("stream")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
+        let olmo3 = atlas_model::SamplingConfig::olmo3();
         let top_p = v.get("top_p")
             .and_then(|x| x.as_f64())
-            .unwrap_or(1.0) as f32;
+            .unwrap_or(olmo3.top_p as f64) as f32;
+        let top_k = v.get("top_k")
+            .and_then(|x| x.as_usize())
+            .unwrap_or(olmo3.top_k);
+        let min_p = v.get("min_p")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(olmo3.min_p as f64) as f32;
         let repetition_penalty = v.get("repetition_penalty")
             .and_then(|x| x.as_f64())
-            .unwrap_or(1.0) as f32;
+            .unwrap_or(olmo3.repetition_penalty as f64) as f32;
+        let repetition_window = v.get("repetition_window")
+            .and_then(|x| x.as_usize())
+            .unwrap_or(olmo3.repetition_window);
         let frequency_penalty = v.get("frequency_penalty")
             .and_then(|x| x.as_f64())
-            .unwrap_or(0.0) as f32;
+            .unwrap_or(olmo3.frequency_penalty as f64) as f32;
         let presence_penalty = v.get("presence_penalty")
             .and_then(|x| x.as_f64())
-            .unwrap_or(0.0) as f32;
+            .unwrap_or(olmo3.presence_penalty as f64) as f32;
         Ok(Self { model, messages, max_tokens, temperature, stream,
-                  top_p, repetition_penalty, frequency_penalty, presence_penalty })
+                  top_p, top_k, min_p, repetition_penalty, repetition_window,
+                  frequency_penalty, presence_penalty })
     }
 
     /// Build a prompt string using the default ChatML template.
@@ -206,8 +223,14 @@ pub struct CompletionRequest {
     pub stream: bool,
     /// Top-P (nucleus) sampling threshold. 1.0 = off.
     pub top_p: f32,
+    /// Top-K sampling. 0 = off.
+    pub top_k: usize,
+    /// Min-P sampling threshold. 0.0 = off.
+    pub min_p: f32,
     /// Repetition penalty θ (Keskar 2019). 1.0 = off.
     pub repetition_penalty: f32,
+    /// Number of recent tokens for repetition penalty window.
+    pub repetition_window: usize,
     /// Frequency penalty — proportional to token count. 0.0 = off.
     pub frequency_penalty: f32,
     /// Presence penalty — flat penalty for any seen token. 0.0 = off.
@@ -236,20 +259,31 @@ impl CompletionRequest {
         let stream = v.get("stream")
             .and_then(|x| x.as_bool())
             .unwrap_or(false);
+        let olmo3 = atlas_model::SamplingConfig::olmo3();
         let top_p = v.get("top_p")
             .and_then(|x| x.as_f64())
-            .unwrap_or(1.0) as f32;
+            .unwrap_or(olmo3.top_p as f64) as f32;
+        let top_k = v.get("top_k")
+            .and_then(|x| x.as_usize())
+            .unwrap_or(olmo3.top_k);
+        let min_p = v.get("min_p")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(olmo3.min_p as f64) as f32;
         let repetition_penalty = v.get("repetition_penalty")
             .and_then(|x| x.as_f64())
-            .unwrap_or(1.0) as f32;
+            .unwrap_or(olmo3.repetition_penalty as f64) as f32;
+        let repetition_window = v.get("repetition_window")
+            .and_then(|x| x.as_usize())
+            .unwrap_or(olmo3.repetition_window);
         let frequency_penalty = v.get("frequency_penalty")
             .and_then(|x| x.as_f64())
-            .unwrap_or(0.0) as f32;
+            .unwrap_or(olmo3.frequency_penalty as f64) as f32;
         let presence_penalty = v.get("presence_penalty")
             .and_then(|x| x.as_f64())
-            .unwrap_or(0.0) as f32;
+            .unwrap_or(olmo3.presence_penalty as f64) as f32;
         Ok(Self { model, prompt, max_tokens, temperature, stream,
-                  top_p, repetition_penalty, frequency_penalty, presence_penalty })
+                  top_p, top_k, min_p, repetition_penalty, repetition_window,
+                  frequency_penalty, presence_penalty })
     }
 }
 
@@ -502,14 +536,19 @@ mod tests {
 
     #[test]
     fn chat_request_defaults() {
+        // Defaults now come from SamplingConfig::olmo3() to prevent repetition loops
         let req = ChatCompletionRequest::parse(r#"{"messages":[]}"#).unwrap();
+        let olmo3 = atlas_model::SamplingConfig::olmo3();
         assert_eq!(req.max_tokens, 256);
         assert_eq!(req.temperature, 0.0);
         assert!(!req.stream);
-        assert_eq!(req.top_p, 1.0);
-        assert_eq!(req.repetition_penalty, 1.0);
-        assert_eq!(req.frequency_penalty, 0.0);
-        assert_eq!(req.presence_penalty, 0.0);
+        assert!((req.top_p - olmo3.top_p).abs() < 0.01);
+        assert_eq!(req.top_k, olmo3.top_k);
+        assert!((req.min_p - olmo3.min_p).abs() < 0.01);
+        assert!((req.repetition_penalty - olmo3.repetition_penalty).abs() < 0.01);
+        assert_eq!(req.repetition_window, olmo3.repetition_window);
+        assert!((req.frequency_penalty - olmo3.frequency_penalty).abs() < 0.01);
+        assert!((req.presence_penalty - olmo3.presence_penalty).abs() < 0.01);
     }
 
     #[test]
@@ -534,7 +573,9 @@ mod tests {
                 ChatMessage { role: "user".to_string(),      content: "What is 2+2?".to_string() },
             ],
             max_tokens: 50, temperature: 0.0, stream: false,
-            top_p: 1.0, repetition_penalty: 1.0, frequency_penalty: 0.0, presence_penalty: 0.0,
+            top_p: 1.0, top_k: 0, min_p: 0.0,
+            repetition_penalty: 1.0, repetition_window: 64,
+            frequency_penalty: 0.0, presence_penalty: 0.0,
         };
         // Default is ChatML
         let p = req.to_prompt();
@@ -551,7 +592,9 @@ mod tests {
                 ChatMessage { role: "user".to_string(), content: "Hi".to_string() },
             ],
             max_tokens: 50, temperature: 0.0, stream: false,
-            top_p: 1.0, repetition_penalty: 1.0, frequency_penalty: 0.0, presence_penalty: 0.0,
+            top_p: 1.0, top_k: 0, min_p: 0.0,
+            repetition_penalty: 1.0, repetition_window: 64,
+            frequency_penalty: 0.0, presence_penalty: 0.0,
         };
         let p = req.to_prompt_with(&ChatTemplate::Llama3);
         assert!(p.contains("<|start_header_id|>user<|end_header_id|>"));
@@ -568,7 +611,9 @@ mod tests {
                 ChatMessage { role: "user".to_string(),   content: "Hello".to_string() },
             ],
             max_tokens: 50, temperature: 0.0, stream: false,
-            top_p: 1.0, repetition_penalty: 1.0, frequency_penalty: 0.0, presence_penalty: 0.0,
+            top_p: 1.0, top_k: 0, min_p: 0.0,
+            repetition_penalty: 1.0, repetition_window: 64,
+            frequency_penalty: 0.0, presence_penalty: 0.0,
         };
         let p = req.to_prompt_with(&ChatTemplate::Generic);
         assert!(p.contains("<|system|>"));

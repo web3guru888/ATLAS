@@ -1043,13 +1043,23 @@ impl Default for SamplingConfig {
 
 impl SamplingConfig {
     /// OLMo-3-7B-Think recommended defaults.
+    ///
+    /// Key settings to prevent degenerate repetition loops:
+    /// - `repetition_penalty: 1.1` — Keskar penalty on recent tokens
+    /// - `repetition_window: 256` — look back far enough to catch paragraph-level loops
+    /// - `frequency_penalty: 0.1` — proportional penalty discourages high-count tokens
+    /// - `top_k: 50` + `min_p: 0.05` — filter low-probability tail tokens
+    /// - `top_p: 0.95` — nucleus sampling
     pub fn olmo3() -> Self {
         Self {
             temperature: 0.6,
             repetition_penalty: 1.1,
-            repetition_window: 64,
+            repetition_window: 256,
+            frequency_penalty: 0.1,
+            presence_penalty: 0.0,
             top_p: 0.95,
-            ..Default::default()
+            top_k: 50,
+            min_p: 0.05,
         }
     }
 }

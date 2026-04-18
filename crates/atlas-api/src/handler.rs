@@ -281,10 +281,12 @@ fn handle_chat_nonstream(
     let config = SamplingConfig {
         temperature: req.temperature,
         top_p: req.top_p,
+        top_k: req.top_k,
+        min_p: req.min_p,
         repetition_penalty: req.repetition_penalty,
+        repetition_window: req.repetition_window,
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
-        ..SamplingConfig::default()
     };
     let (content, prompt_tokens, completion_tokens) =
         run_inference(state, prompt, req.max_tokens, &config);
@@ -308,10 +310,12 @@ fn handle_chat_stream(
     let config = SamplingConfig {
         temperature: req.temperature,
         top_p: req.top_p,
+        top_k: req.top_k,
+        min_p: req.min_p,
         repetition_penalty: req.repetition_penalty,
+        repetition_window: req.repetition_window,
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
-        ..SamplingConfig::default()
     };
 
     let mut st = state.lock().unwrap();
@@ -434,10 +438,12 @@ fn handle_completion(
     let config = SamplingConfig {
         temperature: req.temperature,
         top_p: req.top_p,
+        top_k: req.top_k,
+        min_p: req.min_p,
         repetition_penalty: req.repetition_penalty,
+        repetition_window: req.repetition_window,
         frequency_penalty: req.frequency_penalty,
         presence_penalty: req.presence_penalty,
-        ..SamplingConfig::default()
     };
     let (text, prompt_tokens, completion_tokens) =
         run_inference(state, &req.prompt, req.max_tokens, &config);

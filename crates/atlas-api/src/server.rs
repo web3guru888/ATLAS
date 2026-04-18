@@ -63,6 +63,10 @@ impl ApiServer {
         eprintln!("│  model    : {}", self.cfg.model_id);
         eprintln!("│  weights  : {}", self.cfg.weights_dir.as_deref().unwrap_or("(none — echo mode)"));
         eprintln!("│  max_tok  : {}", self.cfg.max_tokens);
+        let olmo3 = atlas_model::SamplingConfig::olmo3();
+        eprintln!("│  defaults : rep_pen={:.1} window={} freq_pen={:.1} top_p={:.2} top_k={} min_p={:.2}",
+            olmo3.repetition_penalty, olmo3.repetition_window,
+            olmo3.frequency_penalty, olmo3.top_p, olmo3.top_k, olmo3.min_p);
         eprintln!("│");
         eprintln!("│  OpenAI base URL  : http://{addr}/v1");
         eprintln!("│  Endpoints:");
