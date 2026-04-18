@@ -1066,6 +1066,8 @@ pub struct OlmoModel {
     pos:     usize,
     /// EOS token id — generation stops when the model emits this token.
     pub eos_token_id: Option<u32>,
+    /// Additional stop token ids (e.g. `<|im_end|>` for ChatML models).
+    pub extra_stop_tokens: Vec<u32>,
     /// Stateful PRNG for temperature sampling (re-seeded each `generate()` call).
     rng:     Rng,
 }
@@ -1102,7 +1104,7 @@ impl OlmoModel {
             cfg.vocab_size,
         );
         let eos_token_id = cfg.eos_token_id;
-        Self { config: cfg, embed, layers, norm, lm_head, rope, pos: 0, eos_token_id, rng: Rng::from_entropy() }
+        Self { config: cfg, embed, layers, norm, lm_head, rope, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy() }
     }
 
     /// Reset KV cache and position counter (call between independent sequences).
@@ -1297,9 +1299,11 @@ impl OlmoModel {
             };
 
             // Stop on EOS before adding to output (EOS itself is not emitted).
+            let tok_id = next as u32;
             if let Some(eos) = self.eos_token_id {
-                if next as u32 == eos { break; }
+                if tok_id == eos { break; }
             }
+            if self.extra_stop_tokens.contains(&tok_id) { break; }
 
             let tok = next as u32;
             new_tokens.push(tok);

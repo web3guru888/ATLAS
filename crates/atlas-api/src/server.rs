@@ -132,6 +132,15 @@ impl ApiServer {
                 if let Some(eos) = mdl.eos_token_id {
                     eprintln!("  eos_token_id: {eos} (\"{}\")", tok.id_to_token(eos));
                 }
+                // ChatML models (OLMo-3, Qwen, etc.) use <|im_end|> to end assistant turns.
+                // Add it as an extra stop token so generation stops at end of turn.
+                if let Some(im_end_id) = tok.token_to_id("<|im_end|>") {
+                    let eos_id = mdl.eos_token_id.unwrap_or(u32::MAX);
+                    if im_end_id != eos_id {
+                        mdl.extra_stop_tokens.push(im_end_id);
+                        eprintln!("  extra_stop: {im_end_id} (\"<|im_end|>\")");
+                    }
+                }
             }
 
             // Auto-detect chat template from tokenizer special tokens.
