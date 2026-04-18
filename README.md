@@ -10,8 +10,8 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v4.0.8-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-565%2F565%20passing-brightgreen.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v4.0.9-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-579%2F579%20passing-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-21-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__80%20A100-76b900.svg)](#gpu-inference)
@@ -60,6 +60,14 @@ It fuses four architectural innovations:
 - 🔧 **QK-norm per-head weight slicing** — `q_norm.weight` has shape `[n_heads × head_dim]` — each head has unique norm weights. `rmsnorm_inplace` was always using `weights[0..128]` for every head instead of `weights[h*128..(h+1)*128]`. Fixed GPU path.
 - ➕ **QK-norm added to CPU attention path** — the CPU `Attention::forward_token()` had no QK-norm at all. Added per-head QK-norm before RoPE to match GPU path.
 - ✅ **Before → After**: CPU/GPU logit agreement went from max diff **20.0 → 0.000015**. Top-1 token for "capital of France" went from `yp`/`décor` → **`Paris`**. OLMo-3-7B-Think now produces coherent `<think>` reasoning traces at **15.4 tok/s** on A100.
+
+**v4.0.9** — Think Suppression + Output Quality:
+- 🚫 **Think suppression** — ban `<think>` token at step 0 via logit masking, preventing the model from entering internal reasoning mode entirely. Produces clean, direct answers instead of visible `<think>...</think>` blocks
+- 📏 **`max_tokens` raised to 512** (was 256) — gives the model room for complete answers without truncation
+- 🧹 **Improved filler cleanup** — post-processing removes trailing "Okay" paragraphs and other filler patterns that small models produce
+- 🔍 **Model auto-detection** — `atlas-model` now infers model config from the weights directory name (e.g., `OLMo-3-0125-7B` → OLMo-3 config), eliminating manual config specification
+- 📊 **API test results**: 4/6 prompts produce clean, correct answers (Hello=perfect, Spain=perfect, Exercise=good, Einstein=good); before: 2/8 clean with 50% think-block fallback
+- ✅ **579/579 tests** (+14 new)
 
 **v4.0.8** — Anti-Repetition Defaults + Think Budget:
 - 🔁 **Fixed degenerate think loops** — API defaulted all penalties to OFF; model entered "Wait, no, yes, Madrid" ×100 spirals. Root cause: no `repetition_penalty` from frontend + tiny 64-token window + no `top_k`/`min_p` filtering
@@ -411,11 +419,11 @@ cargo build --release -p atlas-cli
 
 ---
 
-## Status — v4.0.8
+## Status — v4.0.9
 
-**565/565 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **15.4 tok/s OLMo-3-7B-Think (BF16)**
+**579/579 tests passing** · **21 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **15.4 tok/s OLMo-3-7B-Think (BF16)**
 
-> 🏔 **v4.0.8 is the current release.** Fixed degenerate think-loop repetition (API defaulted all sampling penalties to OFF — model entered "Wait, no, yes" ×100 spirals). Defaults now sourced from `SamplingConfig::olmo3()`: `rep_penalty=1.15`, `window=256`, `top_k=50`, `min_p=0.05`, `top_p=0.95`. Added think budget: `<think>` blocks force-closed after 200 tokens. Extended API with `top_k`, `min_p`, `repetition_window` params.
+> 🏔 **v4.0.9 is the current release.** Think suppression: bans `<think>` token at step 0 via logit masking — model produces clean, direct answers with no visible reasoning blocks. `max_tokens` raised to 512. Improved filler cleanup removes trailing "Okay" paragraphs. Model auto-detection from weights directory name. 4/6 API prompts now produce clean correct answers (was 2/8 with 50% think-block fallback).
 
 ### What Works
 
@@ -451,6 +459,7 @@ cargo build --release -p atlas-cli
 | **v4.0.6** | **Sampling controls (Issue #16): repetition penalty, top-p, top-k, min-p, freq/pres penalty. 7-stage pipeline.** | **562** |
 | **v4.0.7** | **OLMo-2/3 post-norm + QK-norm fixes: 3 architecture bugs. CPU/GPU logit diff 20.0 → 0.000015. Correct OLMo-3 output.** | **562** |
 | **v4.0.8** | **Anti-repetition defaults + think budget. Fixed degenerate think loops. API defaults from olmo3() preset. `<think>` force-close after 200 tokens.** | **565** |
+| **v4.0.9** | **Think suppression (logit masking at step 0) + max_tokens 512 + filler cleanup + model auto-detect. Clean direct answers.** | **579** |
 
 ### Crate Status
 
@@ -464,10 +473,10 @@ cargo build --release -p atlas-cli
 | CUDA kernels | 1 | — | ✅ tiled GEMM, rmsnorm, rope, silu_mul, AdamW, INT8/INT4 — compiled on A100-SXM4-40GB (sm_80) |
 | atlas-json | 2 | 12 | ✅ Recursive descent parser, surrogate pairs |
 | atlas-tokenize | 2 | **14** | ✅ GPT-4 regex pre-tokenization (7 alts w/ backtracking), byte-level BPE, HF tokenizer.json; OLMo-3 + SmolLM2 verified |
-| atlas-model | 2 | **27** | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, SWA, YaRN RoPE, config.json auto-patch; GPU-resident forward pass; **v4.0.7: post-norm + QK-norm**; **v4.0.8: `olmo3()` preset (rep_penalty=1.15, window=256, top_k=50, min_p=0.05)** |
+| atlas-model | 2 | **27** | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, SWA, YaRN RoPE, config.json auto-patch; GPU-resident forward pass; **v4.0.7: post-norm + QK-norm**; **v4.0.8: `olmo3()` preset**; **v4.0.9: model auto-detect from weights dir** |
 | atlas-palace | 3 | **79** | ✅ A\* search, 5-type pheromones, Active Inference, MMAS, PalaceBackend trait, session_id, PalaceConfig; v4.0.3: `CanonicalPheromoneUpdate` uses `exp(−x)` decay (always positive, smooth, hardware-safe) |
 | atlas-mcp | 3 | **32** | ✅ 28 MCP tools, JSON-RPC 2.0, live palace dispatch; McpConnectionPool (max 5, 5-min idle eviction) |
-| atlas-api | 3 | **47** | ✅ OpenAI-compatible HTTP: /v1/chat/completions, /v1/completions, /v1/models; SSE streaming; CORS; OLMo-3 sampling defaults; think budget (200-token cap) |
+| atlas-api | 3 | **47** | ✅ OpenAI-compatible HTTP: /v1/chat/completions, /v1/completions, /v1/models; SSE streaming; CORS; OLMo-3 sampling defaults; think budget; **v4.0.9: think suppression (logit masking), max_tokens 512, filler cleanup** |
 | atlas-trm | 4 | 12 | ✅ TRM-CausalValidator depth-6 RNN, Bayesian combining |
 | atlas-http | 5 | 11 | ✅ HTTP/1.1 TcpStream, chunked decoding, curl HTTPS |
 | atlas-bayes | 5 | 13 | ✅ BetaPrior, BayesNetwork, QualityGate, Jaccard novelty |
@@ -478,7 +487,7 @@ cargo build --release -p atlas-cli
 | atlas-safety | 6 | **30** | ✅ Horn-clause constitution (8 principles, 4 domains); 5-state FSM; CircuitBreaker; append-only audit log |
 | atlas-bridge | 6 | **8** | ✅ ZK-attested Rings↔ETH interface, Sepolia chain_id=11155111 |
 | atlas-cli | 7 | **30** | ✅ discover / corpus / train / eval / prove / palace / mcp / api / bench / status |
-| **TOTAL** | | **565** | **✅ All passing — v4.0.8** |
+| **TOTAL** | | **579** | **✅ All passing — v4.0.9** |
 
 ### Quick Start
 
@@ -599,7 +608,7 @@ ATLAS v4.0 implements the **Champagnat n-Morphic Framework** (Issue #6), grounde
 
 ATLAS models are published to Hugging Face under the [`openhubresearch`](https://huggingface.co/openhubresearch) organization.
 
-**First release**: `openhubresearch/ATLAS-OLMo-3-7B-Think-v4` — OLMo-3-7B-Think run through the ATLAS v4.0.8 n-morphic framework with BF16 inference (15.4 tok/s A100-SXM4-40GB, W16A32, 565/565 tests, correct post-norm + QK-norm architecture, anti-repetition defaults + think budget).
+**First release**: `openhubresearch/ATLAS-OLMo-3-7B-Think-v4` — OLMo-3-7B-Think run through the ATLAS v4.0.9 n-morphic framework with BF16 inference (15.4 tok/s A100-SXM4-40GB, W16A32, 579/579 tests, correct post-norm + QK-norm architecture, think suppression + anti-repetition defaults).
 
 ```yaml
 ---
@@ -662,9 +671,9 @@ See [NOTICE](NOTICE) for attribution to incorporated components.
   institution = {OpenHub Research, Thailand},
   url         = {https://github.com/web3guru888/ATLAS},
   note        = {Pure Rust LLM training framework. Zero external dependencies.
-                 v4.0.8: 21 crates, 565 tests, Champagnat n-morphic framework,
+                 v4.0.9: 21 crates, 579 tests, Champagnat n-morphic framework,
                  BF16 GPU inference — OLMo-3-7B-Think 15.4 tok/s on A100-SXM4-40GB (W16A32).
                  Post-norm + QK-norm architecture for OLMo-2/3 family.
-                 Full sampling pipeline with OLMo-3 defaults, think budget.}
+                 Think suppression, full sampling pipeline, model auto-detection.}
 }
 ```
