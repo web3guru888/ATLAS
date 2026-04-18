@@ -300,6 +300,12 @@ impl Tokenizer {
         self.vocab_map.get(token).copied()
     }
 
+    /// Look up a special token by name (e.g. `"<|im_start|>"`).
+    /// Returns the token id if found in the added_tokens / special_tokens map.
+    pub fn special_token_id(&self, name: &str) -> Option<u32> {
+        self.special_tokens.get(name).copied()
+    }
+
     // ── BPE internals ────────────────────────────────────────────────────────
 
     fn split_on_special<'a>(&self, text: &'a str) -> Vec<(&'a str, bool)> {

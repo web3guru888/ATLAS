@@ -39,6 +39,27 @@ impl Default for ServerConfig {
     }
 }
 
+// ── Chat template ────────────────────────────────────────────────────────────
+
+/// Chat template format for converting messages → prompt text.
+///
+/// Different model families expect different framing tokens around chat turns.
+/// Using the wrong template produces garbage output even with a perfect model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatTemplate {
+    /// ChatML: `<|im_start|>role\ncontent<|im_end|>\n`
+    /// Used by: OLMo-3, SmolLM2-Instruct, Qwen, many HF models.
+    ChatML,
+    /// Llama-3 style: `<|start_header_id|>role<|end_header_id|>\n\ncontent<|eot_id|>`
+    Llama3,
+    /// Generic fallback: `<|role|>\ncontent\n`
+    Generic,
+}
+
+impl Default for ChatTemplate {
+    fn default() -> Self { Self::ChatML }
+}
+
 // ── Chat message ─────────────────────────────────────────────────────────────
 
 /// A single message in a chat conversation.
@@ -101,15 +122,48 @@ impl ChatCompletionRequest {
         Ok(Self { model, messages, max_tokens, temperature, stream })
     }
 
-    /// Build a single prompt string from the messages (ChatML format).
+    /// Build a prompt string using the default ChatML template.
     pub fn to_prompt(&self) -> String {
+        self.to_prompt_with(&ChatTemplate::default())
+    }
+
+    /// Build a prompt string using the specified chat template.
+    ///
+    /// The template must match the model's training format — using the wrong
+    /// one produces incoherent output even with a perfect model.
+    pub fn to_prompt_with(&self, template: &ChatTemplate) -> String {
         let mut prompt = String::new();
-        for msg in &self.messages {
-            match msg.role.as_str() {
-                "system"    => { prompt.push_str(&format!("<|system|>\n{}\n", msg.content)); }
-                "user"      => { prompt.push_str(&format!("<|user|>\n{}\n<|assistant|>\n", msg.content)); }
-                "assistant" => { prompt.push_str(&format!("{}\n", msg.content)); }
-                _           => { prompt.push_str(&format!("{}\n", msg.content)); }
+        match template {
+            ChatTemplate::ChatML => {
+                // <|im_start|>role\ncontent<|im_end|>\n
+                for msg in &self.messages {
+                    prompt.push_str(&format!(
+                        "<|im_start|>{}\n{}<|im_end|>\n",
+                        msg.role, msg.content
+                    ));
+                }
+                // Prompt for assistant response
+                prompt.push_str("<|im_start|>assistant\n");
+            }
+            ChatTemplate::Llama3 => {
+                // <|begin_of_text|> is typically prepended by the tokenizer.
+                for msg in &self.messages {
+                    prompt.push_str(&format!(
+                        "<|start_header_id|>{}<|end_header_id|>\n\n{}<|eot_id|>",
+                        msg.role, msg.content
+                    ));
+                }
+                prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            }
+            ChatTemplate::Generic => {
+                for msg in &self.messages {
+                    match msg.role.as_str() {
+                        "system"    => prompt.push_str(&format!("<|system|>\n{}\n", msg.content)),
+                        "user"      => prompt.push_str(&format!("<|user|>\n{}\n<|assistant|>\n", msg.content)),
+                        "assistant" => prompt.push_str(&format!("{}\n", msg.content)),
+                        _           => prompt.push_str(&format!("{}\n", msg.content)),
+                    }
+                }
             }
         }
         prompt
@@ -426,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn to_prompt_system_user() {
+    fn to_prompt_chatml() {
         let req = ChatCompletionRequest {
             model: "atlas".to_string(),
             messages: vec![
@@ -435,11 +489,41 @@ mod tests {
             ],
             max_tokens: 50, temperature: 0.0, stream: false,
         };
+        // Default is ChatML
         let p = req.to_prompt();
+        assert!(p.contains("<|im_start|>system\nYou are helpful.<|im_end|>"));
+        assert!(p.contains("<|im_start|>user\nWhat is 2+2?<|im_end|>"));
+        assert!(p.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn to_prompt_llama3() {
+        let req = ChatCompletionRequest {
+            model: "atlas".to_string(),
+            messages: vec![
+                ChatMessage { role: "user".to_string(), content: "Hi".to_string() },
+            ],
+            max_tokens: 50, temperature: 0.0, stream: false,
+        };
+        let p = req.to_prompt_with(&ChatTemplate::Llama3);
+        assert!(p.contains("<|start_header_id|>user<|end_header_id|>"));
+        assert!(p.contains("Hi<|eot_id|>"));
+        assert!(p.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    }
+
+    #[test]
+    fn to_prompt_generic() {
+        let req = ChatCompletionRequest {
+            model: "atlas".to_string(),
+            messages: vec![
+                ChatMessage { role: "system".to_string(), content: "You are helpful.".to_string() },
+                ChatMessage { role: "user".to_string(),   content: "Hello".to_string() },
+            ],
+            max_tokens: 50, temperature: 0.0, stream: false,
+        };
+        let p = req.to_prompt_with(&ChatTemplate::Generic);
         assert!(p.contains("<|system|>"));
-        assert!(p.contains("You are helpful."));
         assert!(p.contains("<|user|>"));
-        assert!(p.contains("What is 2+2?"));
         assert!(p.contains("<|assistant|>"));
     }
 

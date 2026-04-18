@@ -21,7 +21,7 @@ use atlas_tokenize::Tokenizer;
 
 use crate::types::{
     json_string, gen_id, unix_ts,
-    ChatCompletionRequest, ChatCompletionResponse,
+    ChatCompletionRequest, ChatCompletionResponse, ChatTemplate,
     CompletionRequest, CompletionResponse,
     ErrorResponse, StreamChunk,
 };
@@ -36,6 +36,8 @@ pub struct InferState {
     pub tokenizer: Option<Tokenizer>,
     /// The model ID string served to clients.
     pub model_id: String,
+    /// Chat template format for converting messages → prompt text.
+    pub chat_template: ChatTemplate,
 }
 
 // ── HTTP primitives ───────────────────────────────────────────────────────────
@@ -185,7 +187,8 @@ pub fn handle(
                     return;
                 }
             };
-            let prompt = req.to_prompt();
+            let template = state.lock().unwrap().chat_template;
+            let prompt = req.to_prompt_with(&template);
             let id     = gen_id("chatcmpl");
             if req.stream {
                 handle_chat_stream(stream, &req, &prompt, &id, state);
@@ -445,6 +448,7 @@ mod tests {
         let state = Arc::new(Mutex::new(InferState {
             model: None, tokenizer: None,
             model_id: "test".to_string(),
+            chat_template: ChatTemplate::ChatML,
         }));
         let (text, prompt_count, completion_count) =
             run_inference(&state, "hello world", 10, 0.0);

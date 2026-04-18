@@ -23,7 +23,7 @@ use atlas_model::{ModelConfig, load_model_from_safetensors, load_model_from_dir}
 use atlas_tokenize::Tokenizer;
 
 use crate::handler::{handle, parse_http_request, InferState};
-use crate::types::ServerConfig;
+use crate::types::{ChatTemplate, ServerConfig};
 
 /// The ATLAS OpenAI-compatible HTTP API server.
 pub struct ApiServer {
@@ -104,7 +104,7 @@ impl ApiServer {
             let dir = weights_dir.trim_end_matches('/');
             let index_path = format!("{dir}/model.safetensors.index.json");
             let cfg   = model_config_from_id(&self.cfg.model_id);
-            let model = if std::path::Path::new(&index_path).exists() {
+            let mut model = if std::path::Path::new(&index_path).exists() {
                 // Sharded model (OLMo-2/3 7B etc.) — use index-based dir loader
                 eprintln!("  model: sharded index detected — using load_model_from_dir");
                 match load_model_from_dir(dir, cfg) {
@@ -120,10 +120,22 @@ impl ApiServer {
                 }
             };
 
-            InferState { model, tokenizer, model_id: self.cfg.model_id.clone() }
+            // Wire EOS token from tokenizer → model so generate() stops naturally.
+            if let (Some(ref tok), Some(ref mut mdl)) = (&tokenizer, &mut model) {
+                mdl.eos_token_id = tok.eos_token_id;
+                if let Some(eos) = tok.eos_token_id {
+                    eprintln!("  eos_token_id: {eos} (\"{}\")", tok.id_to_token(eos));
+                }
+            }
+
+            // Auto-detect chat template from tokenizer special tokens.
+            let chat_template = detect_chat_template(&tokenizer, &self.cfg.model_id);
+            eprintln!("  chat_template: {:?}", chat_template);
+
+            InferState { model, tokenizer, model_id: self.cfg.model_id.clone(), chat_template }
         } else {
             eprintln!("atlas-api: no --weights — running in echo mode");
-            InferState { model: None, tokenizer: None, model_id: self.cfg.model_id.clone() }
+            InferState { model: None, tokenizer: None, model_id: self.cfg.model_id.clone(), chat_template: ChatTemplate::default() }
         }
     }
 }
@@ -144,6 +156,29 @@ pub fn model_config_from_id(id: &str) -> ModelConfig {
     } else {
         ModelConfig::smollm2_135m() // safe default
     }
+}
+
+/// Detect the chat template format from tokenizer special tokens.
+///
+/// Priority: tokenizer special tokens > model_id heuristic > default (ChatML).
+fn detect_chat_template(tokenizer: &Option<Tokenizer>, model_id: &str) -> ChatTemplate {
+    if let Some(ref tok) = tokenizer {
+        // ChatML: OLMo-3, SmolLM2-Instruct, Qwen use <|im_start|>/<|im_end|>
+        if tok.special_token_id("<|im_start|>").is_some() {
+            return ChatTemplate::ChatML;
+        }
+        // Llama-3: uses <|start_header_id|>/<|end_header_id|>
+        if tok.special_token_id("<|start_header_id|>").is_some() {
+            return ChatTemplate::Llama3;
+        }
+    }
+    // Fallback: heuristic from model_id string
+    let id_lc = model_id.to_lowercase();
+    if id_lc.contains("llama") && id_lc.contains("3") {
+        return ChatTemplate::Llama3;
+    }
+    // Default to ChatML — most modern HF models use it.
+    ChatTemplate::ChatML
 }
 
 /// Read a full HTTP/1.1 request from the TCP stream, respecting Content-Length.
@@ -275,6 +310,18 @@ mod tests {
         let st = srv.load_infer_state();
         // tokenizer and model will both fail gracefully → None
         assert!(st.model.is_none());
+    }
+
+    #[test]
+    fn detect_template_no_tokenizer_defaults_chatml() {
+        let t = detect_chat_template(&None, "my-model");
+        assert_eq!(t, ChatTemplate::ChatML);
+    }
+
+    #[test]
+    fn detect_template_llama3_from_id() {
+        let t = detect_chat_template(&None, "llama-3-8b");
+        assert_eq!(t, ChatTemplate::Llama3);
     }
 
     #[test]

@@ -921,6 +921,39 @@ impl TransformerBlock {
 // ── Full Model ────────────────────────────────────────────────────────────
 
 /// ATLAS transformer model (OLMo 3 / Llama 3 architecture).
+/// Stateful XorShift64 PRNG for temperature sampling.
+///
+/// Seeded from system time at each `generate()` call so that repeated
+/// requests with the same prompt produce different completions.
+pub struct Rng(u64);
+
+impl Rng {
+    /// Create a new RNG seeded from system time + a salt.
+    fn from_entropy() -> Self {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        // Mix time with a constant to avoid zero-seed degeneracy.
+        Self(t ^ 0x517cc1b727220a95)
+    }
+
+    /// Create a deterministic RNG from a fixed seed (for tests).
+    #[cfg(test)]
+    fn from_seed(seed: u64) -> Self {
+        Self(seed | 1) // ensure non-zero
+    }
+
+    /// Return a uniform f32 in [0, 1) and advance the state.
+    fn next_f32(&mut self) -> f32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 33) as f32 / (1u64 << 31) as f32
+    }
+}
+
+/// Transformer language model (OLMo/LLaMA architecture).
 pub struct OlmoModel {
     config: ModelConfig,
     embed:  Embedding,
@@ -930,6 +963,10 @@ pub struct OlmoModel {
     rope:    RopeCache,
     /// Position counter (for autoregressive generation).
     pos:     usize,
+    /// EOS token id — generation stops when the model emits this token.
+    pub eos_token_id: Option<u32>,
+    /// Stateful PRNG for temperature sampling (re-seeded each `generate()` call).
+    rng:     Rng,
 }
 
 impl OlmoModel {
@@ -963,7 +1000,7 @@ impl OlmoModel {
             cfg.d_model,
             cfg.vocab_size,
         );
-        Self { config: cfg, embed, layers, norm, lm_head, rope, pos: 0 }
+        Self { config: cfg, embed, layers, norm, lm_head, rope, pos: 0, eos_token_id: None, rng: Rng::from_entropy() }
     }
 
     /// Reset KV cache and position counter (call between independent sequences).
@@ -1039,11 +1076,16 @@ impl OlmoModel {
         }
     }
 
-    /// Greedy generation: given prompt tokens, generate up to `max_new` more.
-    /// Greedy generation: given prompt tokens, generate up to `max_new` more.
+    /// Autoregressive generation: given prompt tokens, generate up to `max_new` more.
     /// Uses GPU-resident forward pass if CUDA available (2 PCIe transfers/token).
+    ///
+    /// Stops early if the model produces the EOS token (set via `eos_token_id`).
+    /// The EOS token itself is excluded from the output.
     pub fn generate(&mut self, prompt: &[u32], max_new: usize, temperature: f32) -> Vec<u32> {
         self.reset();
+        // Re-seed PRNG from system entropy so each call produces different output.
+        self.rng = Rng::from_entropy();
+
         // Process prompt
         let mut new_tokens = Vec::new();
         let mut last_logits = vec![0.0f32; self.config.vocab_size];
@@ -1056,21 +1098,25 @@ impl OlmoModel {
             };
         }
 
-        for step in 0..max_new {
+        for _step in 0..max_new {
             let next = if temperature <= 0.0 || temperature < 1e-6 {
-                // Greedy
+                // Greedy (deterministic)
                 argmax(&last_logits)
             } else {
-                // Temperature sampling
+                // Temperature sampling with stateful PRNG
                 let mut scaled: Vec<f32> = last_logits.iter()
                     .map(|&l| l / temperature).collect();
                 softmax_inplace(&mut scaled);
-                sample_from_probs(&scaled, step as u64)
+                sample_from_probs(&scaled, self.rng.next_f32())
             };
-            new_tokens.push(next as u32);
-            if let Some(eos) = None::<u32> {
+
+            // Stop on EOS before adding to output (EOS itself is not emitted).
+            if let Some(eos) = self.eos_token_id {
                 if next as u32 == eos { break; }
             }
+
+            new_tokens.push(next as u32);
+
             // Prefer GPU-resident forward
             last_logits = if let Some(gl) = self.forward_one_gpu(next as u32) {
                 gl
@@ -1630,10 +1676,9 @@ fn argmax(x: &[f32]) -> usize {
         .unwrap_or(0)
 }
 
-/// Deterministic sampling from a probability distribution (no rand crate).
-fn sample_from_probs(probs: &[f32], seed: u64) -> usize {
-    // LCG random in [0, 1)
-    let rand = lcg_uniform(seed);
+/// Sample an index from a probability distribution using a pre-generated
+/// uniform random value in [0, 1).
+fn sample_from_probs(probs: &[f32], rand: f32) -> usize {
     let mut cum = 0.0f32;
     for (i, &p) in probs.iter().enumerate() {
         cum += p;
@@ -1719,6 +1764,86 @@ mod tests {
         assert_eq!(out.len(), 5);
         // All token ids should be valid
         assert!(out.iter().all(|&id| (id as usize) < 256));
+    }
+
+    #[test]
+    fn generate_stops_on_eos() {
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+
+        // First, do a greedy generate to find out what token is produced at step 0.
+        let full = model.generate(&[0u32, 1], 10, 0.0);
+        assert_eq!(full.len(), 10, "without EOS, should generate all 10 tokens");
+
+        // Now set that first token as EOS — generate should stop immediately
+        // and return an empty vec (EOS is not included in output).
+        model.eos_token_id = Some(full[0]);
+        let stopped = model.generate(&[0u32, 1], 10, 0.0);
+        assert!(stopped.is_empty(), "should stop immediately when first token is EOS");
+    }
+
+    #[test]
+    fn generate_eos_mid_sequence() {
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+
+        // Greedy generate 10 tokens
+        let full = model.generate(&[0u32, 1], 10, 0.0);
+        assert_eq!(full.len(), 10);
+
+        // Set the 5th generated token as EOS — should stop at 4 tokens.
+        model.eos_token_id = Some(full[4]);
+        let stopped = model.generate(&[0u32, 1], 10, 0.0);
+        assert_eq!(stopped.len(), 4, "should stop before the EOS token at position 4");
+        assert_eq!(&stopped[..], &full[..4], "tokens before EOS should match");
+    }
+
+    #[test]
+    fn generate_temperature_varies() {
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+
+        // Generate with temperature > 0 twice — outputs should (almost certainly) differ
+        // because the RNG is re-seeded from system time each call.
+        let a = model.generate(&[0u32, 1], 20, 1.0);
+        // Small sleep to ensure different system time nanosecond
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let b = model.generate(&[0u32, 1], 20, 1.0);
+        // With 20 tokens and 256 vocab, the chance of identical output is vanishingly small.
+        assert_ne!(a, b, "temperature sampling should produce different output on repeated calls");
+    }
+
+    #[test]
+    fn rng_xorshift_produces_values_in_range() {
+        let mut rng = Rng::from_seed(42);
+        for _ in 0..1000 {
+            let v = rng.next_f32();
+            assert!(v >= 0.0 && v < 2.0, "RNG value out of range: {v}");
+        }
+    }
+
+    #[test]
+    fn rng_xorshift_not_constant() {
+        let mut rng = Rng::from_seed(42);
+        let first = rng.next_f32();
+        let mut all_same = true;
+        for _ in 0..100 {
+            if (rng.next_f32() - first).abs() > 1e-9 {
+                all_same = false;
+                break;
+            }
+        }
+        assert!(!all_same, "RNG should not produce the same value repeatedly");
+    }
+
+    #[test]
+    fn sample_from_probs_basic() {
+        let probs = vec![0.1, 0.2, 0.3, 0.4];
+        assert_eq!(sample_from_probs(&probs, 0.0), 0);  // cumsum: 0.1 → picks 0
+        assert_eq!(sample_from_probs(&probs, 0.05), 0);
+        assert_eq!(sample_from_probs(&probs, 0.15), 1); // cumsum: 0.3 → picks 1
+        assert_eq!(sample_from_probs(&probs, 0.35), 2); // cumsum: 0.6 → picks 2
+        assert_eq!(sample_from_probs(&probs, 0.95), 3); // cumsum: 1.0 → picks 3
     }
 
     #[test]
