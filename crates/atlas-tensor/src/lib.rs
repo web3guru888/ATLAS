@@ -739,14 +739,18 @@ impl GpuKvCache {
         None
     }
 
-    /// Reset cache for a new sequence (all positions → 0).
+    /// Reset cache for a new sequence.
+    ///
+    /// The GPU buffers do NOT need to be zeroed: the decode attention kernel only
+    /// reads positions `t ∈ [0, pos]`, and `pos` is managed by `OlmoModel::pos`
+    /// which is reset to 0 in `OlmoModel::reset()`.  Stale data at positions
+    /// beyond `pos` is never accessed.
+    ///
+    /// This is a NO-OP by design — any CPU zeroing of the GPU buffer would
+    /// require 1 GB of memory allocation and PCIe traffic for a 32-layer model,
+    /// which is ~100× more expensive than the benefit.
     pub fn reset(&mut self) {
-        // Overwrite with zeros via CPU upload for correctness
-        // (GPU memset would be faster but this is called rarely)
-        let zeros_k = vec![0.0f32; self.max_seq * self.n_kv_heads * self.head_dim];
-        let zeros_v = zeros_k.clone();
-        self.keys   = GpuVec::from_slice(&zeros_k);
-        self.values = GpuVec::from_slice(&zeros_v);
+        /* intentionally empty — see doc comment */
     }
 }
 
