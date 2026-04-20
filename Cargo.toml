@@ -21,6 +21,7 @@ members = [
     "crates/atlas-safety",
     "crates/atlas-bridge",
     "crates/atlas-api",
+    "crates/atlas-infer",
 ]
 resolver = "2"
 

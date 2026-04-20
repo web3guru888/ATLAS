@@ -103,6 +103,7 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=static=atlas_kernels");
     println!("cargo:rustc-link-lib=cudart");  // CUDA runtime (malloc/free/memcpy/sync/kernels)
+    println!("cargo:rustc-link-lib=cublas");  // cuBLAS — tensor core GEMM (system lib, not a Rust crate)
     println!("cargo:rustc-cfg=atlas_cuda");
     eprintln!("[atlas-tensor/build.rs] CUDA kernels compiled OK ({arch})");
 }

@@ -7,6 +7,7 @@ name = "atlas-api"
 version = "0.1.0"
 dependencies = [
  "atlas-core",
+ "atlas-infer",
  "atlas-json",
  "atlas-model",
  "atlas-tokenize",
@@ -98,6 +99,16 @@ name = "atlas-http"
 version = "0.1.0"
 dependencies = [
  "atlas-core",
+]
+
+[[package]]
+name = "atlas-infer"
+version = "0.1.0"
+dependencies = [
+ "atlas-core",
+ "atlas-model",
+ "atlas-tensor",
+ "atlas-tokenize",
 ]
 
 [[package]]

@@ -16,7 +16,8 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
-use atlas_model::{OlmoModel, SamplingConfig};
+use atlas_infer::InferEngine;
+use atlas_model::SamplingConfig;
 use atlas_tokenize::Tokenizer;
 
 use crate::types::{
@@ -30,8 +31,9 @@ use crate::types::{
 
 /// Model + tokenizer shared across HTTP worker threads.
 pub struct InferState {
-    /// Loaded model, or None in echo/test mode.
-    pub model: Option<OlmoModel>,
+    /// Loaded model (wrapped in InferEngine for StigmergicHook support), or
+    /// None in echo/test mode.
+    pub model: Option<InferEngine>,
     /// Loaded tokenizer, or None (falls back to byte encoding).
     pub tokenizer: Option<Tokenizer>,
     /// The model ID string served to clients.
@@ -256,10 +258,11 @@ fn run_inference(
     };
     let prompt_count = prompt_tokens.len();
 
-    // Generate
-    let new_tokens: Vec<u32> = if let Some(ref mut model) = st.model {
-        model.reset();
-        model.generate_with_sampling(&prompt_tokens, max_tokens, config)
+    // Generate — InferEngine::generate handles reset() internally and
+    // returns (tokens, pheromone_deposits); deposits are discarded here
+    // unless a StigmergicHook is configured on the engine.
+    let new_tokens: Vec<u32> = if let Some(ref mut engine) = st.model {
+        engine.generate(&prompt_tokens, max_tokens, config).0
     } else {
         vec![] // echo / test mode
     };
@@ -550,11 +553,13 @@ fn handle_chat_stream(
     let mut in_think_block = false;
     let mut think_tokens: usize = 0;
 
+    // InferEngine::generate_streaming closure takes (tok_id, deposit);
+    // deposit is None when no StigmergicHook is configured (the common case).
     model.generate_streaming(
         &prompt_tokens,
         max_tokens,
         &config,
-        |tok_id: u32| {
+        |tok_id: u32, _deposit| {
             token_count += 1;
 
             // Decode this single token

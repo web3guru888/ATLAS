@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 // thread import removed — connections handled on main thread (GPU inference is single-threaded)
 use std::time::Duration;
 
-use atlas_model::{ModelConfig, load_model_from_safetensors, load_model_from_dir};
+use atlas_infer::InferEngine;
+use atlas_model::{ModelConfig, OlmoModel, load_model_from_safetensors, load_model_from_dir};
 use atlas_tokenize::Tokenizer;
 
 use crate::handler::{handle, parse_http_request, InferState};
@@ -110,7 +111,7 @@ impl ApiServer {
             let dir = weights_dir.trim_end_matches('/');
             let index_path = format!("{dir}/model.safetensors.index.json");
             let cfg   = model_config_from_id(&self.cfg.model_id);
-            let mut model = if std::path::Path::new(&index_path).exists() {
+            let mut raw_model: Option<OlmoModel> = if std::path::Path::new(&index_path).exists() {
                 // Sharded model (OLMo-2/3 7B etc.) — use index-based dir loader
                 eprintln!("  model: sharded index detected — using load_model_from_dir");
                 match load_model_from_dir(dir, cfg) {
@@ -128,7 +129,7 @@ impl ApiServer {
 
             // Wire EOS token → model so generate() stops naturally.
             // Priority: config.json (parsed during load_model_from_dir) > tokenizer.json
-            if let (Some(ref tok), Some(ref mut mdl)) = (&tokenizer, &mut model) {
+            if let (Some(ref tok), Some(ref mut mdl)) = (&tokenizer, &mut raw_model) {
                 if mdl.eos_token_id.is_none() {
                     // config.json didn't have it — try tokenizer
                     mdl.eos_token_id = tok.eos_token_id;
@@ -147,11 +148,15 @@ impl ApiServer {
                 }
             }
 
+            // Wrap OlmoModel in InferEngine (adds StigmergicHook support).
+            // No hook attached by default — zero overhead on the hot path.
+            let engine: Option<InferEngine> = raw_model.map(InferEngine::new);
+
             // Auto-detect chat template from tokenizer special tokens.
             let chat_template = detect_chat_template(&tokenizer, &self.cfg.model_id);
             eprintln!("  chat_template: {:?}", chat_template);
 
-            InferState { model, tokenizer, model_id: self.cfg.model_id.clone(), chat_template }
+            InferState { model: engine, tokenizer, model_id: self.cfg.model_id.clone(), chat_template }
         } else {
             eprintln!("atlas-api: no --weights — running in echo mode");
             InferState { model: None, tokenizer: None, model_id: self.cfg.model_id.clone(), chat_template: ChatTemplate::default() }

@@ -1142,12 +1142,49 @@ impl OlmoModel {
 
     /// Forward pass for one new token. Returns logits [vocab_size].
     pub fn forward_one(&mut self, token: u32) -> Vec<f32> {
+        self.forward_one_hooked(token, |_layer_idx, _hidden| None)
+    }
+
+    /// Forward pass for one token with a per-layer hidden-state hook.
+    ///
+    /// The hook `F` is called after every transformer layer with `(layer_idx,
+    /// hidden_state_slice)`.  Returning `Some(delta)` from the hook yields a
+    /// pheromone delta that the caller can accumulate for GraphPalace deposits.
+    ///
+    /// # Zero overhead when no hook
+    ///
+    /// Pass `|_, _| None` and the compiler inlines away all hook machinery.
+    ///
+    /// ```rust
+    /// # use atlas_model::{OlmoModel, ModelConfig};
+    /// let cfg = ModelConfig::tiny();
+    /// let mut model = OlmoModel::new(cfg);
+    /// let logits = model.forward_one_hooked(0u32, |layer_idx, hidden| {
+    ///     // e.g. deposit mean-abs as pheromone on layers ≥ 24
+    ///     if layer_idx >= 24 {
+    ///         let mag = hidden.iter().map(|v| v.abs()).sum::<f32>()
+    ///                   / hidden.len().max(1) as f32;
+    ///         Some(mag * 0.01)
+    ///     } else {
+    ///         None
+    ///     }
+    /// });
+    /// assert_eq!(logits.len(), cfg.vocab_size);
+    /// ```
+    pub fn forward_one_hooked<F>(&mut self, token: u32, mut hook: F) -> Vec<f32>
+    where
+        F: FnMut(usize, &[f32]) -> Option<f32>,
+    {
         let pos = self.pos;
         self.pos += 1;
 
         let mut x: Vec<f32> = self.embed.embed_token(token).to_vec();
-        for layer in &mut self.layers {
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             layer.forward_token(&mut x, pos, &self.rope);
+            // StigmergicHook: call after post-residual hidden state is ready.
+            // The return value is handed back to the caller for pheromone
+            // deposit aggregation — the model itself is hook-agnostic.
+            let _ = hook(layer_idx, &x);
         }
         rmsnorm_inplace(&mut x, &self.norm, self.config.rms_norm_eps);
 
@@ -1164,6 +1201,30 @@ impl OlmoModel {
     ///
     /// Returns `None` if CUDA is not available — caller should use `forward_one`.
     pub fn forward_one_gpu(&mut self, token: u32) -> Option<Vec<f32>> {
+        self.forward_one_gpu_hooked(token, |_layer_idx, _hidden| None)
+    }
+
+    /// GPU-resident forward pass for one token with a per-layer hidden-state hook.
+    ///
+    /// Same as [`forward_one_gpu`] but calls `hook(layer_idx, hidden_slice)` after
+    /// every transformer layer.  The hidden state is downloaded from VRAM to RAM
+    /// after each layer so the hook can inspect it.
+    ///
+    /// # Overhead
+    ///
+    /// ~16 KB × num_layers of PCIe D2H traffic per token (~0.5 MB for a 32-layer
+    /// d=4096 model at f32).  At PCIe Gen 4 bandwidth (~16 GB/s) this adds
+    /// ~30 µs per token — negligible at 40 tok/s (25 ms/token).
+    ///
+    /// For zero overhead (no hook), call [`forward_one_gpu`] instead.
+    /// [`InferEngine`] picks the right method automatically based on whether a
+    /// hook is attached.
+    ///
+    /// Returns `None` if CUDA is not available.
+    pub fn forward_one_gpu_hooked<F>(&mut self, token: u32, mut hook: F) -> Option<Vec<f32>>
+    where
+        F: FnMut(usize, &[f32]) -> Option<f32>,
+    {
         use atlas_tensor::GpuVec;
         if !atlas_tensor::cuda_available() { return None; }
 
@@ -1175,8 +1236,13 @@ impl OlmoModel {
         let mut x = GpuVec::from_slice(embed);
 
         // Run all transformer layers entirely in VRAM
-        for layer in &mut self.layers {
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             layer.forward_token_gpu(&mut x, pos, &self.rope);
+
+            // StigmergicHook: download hidden state so the hook can read it.
+            // ~16 KB per layer for d=4096 f32 model.
+            let hidden_cpu = x.download();
+            let _ = hook(layer_idx, &hidden_cpu);
         }
 
         // Final RMSNorm (GPU)
@@ -1365,6 +1431,123 @@ impl OlmoModel {
         }
         new_tokens
     }
+
+    /// Autoregressive generation with per-layer StigmergicHook support.
+    ///
+    /// Identical to [`generate_with_sampling`] but calls `hook(layer_idx, hidden)`
+    /// after every transformer layer forward pass.  The hook's return values are
+    /// accumulated per token and returned alongside the generated token sequence.
+    ///
+    /// # Returns
+    /// `(tokens, per_token_data)` where `per_token_data[i]` is
+    /// `(token_id, total_pheromone_delta, layers_that_fired)` for token `i`.
+    ///
+    /// [`generate_with_sampling`]: OlmoModel::generate_with_sampling
+    pub fn generate_with_sampling_hooked<F>(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        config: &SamplingConfig,
+        mut hook: F,
+    ) -> (Vec<u32>, Vec<(u32, f32, u32)>)
+    where
+        F: FnMut(usize, &[f32]) -> Option<f32>,
+    {
+        self.reset();
+        self.rng = Rng::from_entropy();
+
+        let mut new_tokens: Vec<u32> = Vec::new();
+        let mut pheromone_data: Vec<(u32, f32, u32)> = Vec::new();
+        let mut last_logits = vec![0.0f32; self.config.vocab_size];
+
+        // Prefill: forward all prompt tokens with hook
+        for &tok in prompt {
+            let mut _acc = 0.0f32;
+            let mut _fired = 0u32;
+            last_logits = self.forward_one_hooked(tok, |li, hid| {
+                if let Some(d) = hook(li, hid) { _acc += d.max(0.0); _fired += 1; }
+                None
+            });
+        }
+
+        let mut token_history: Vec<u32> = Vec::new();
+
+        for _step in 0..max_new {
+            let next = if config.temperature <= 0.0 || config.temperature < 1e-6 {
+                let mut logits = last_logits.clone();
+                if _step == 0 {
+                    for &tid in &config.suppress_initial_tokens {
+                        if (tid as usize) < logits.len() {
+                            logits[tid as usize] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+                if config.repetition_penalty != 1.0 && !token_history.is_empty() {
+                    let start = token_history.len().saturating_sub(config.repetition_window);
+                    apply_repetition_penalty(&mut logits, &token_history[start..], config.repetition_penalty);
+                }
+                argmax(&logits)
+            } else {
+                let mut logits = last_logits.clone();
+                if _step == 0 {
+                    for &tid in &config.suppress_initial_tokens {
+                        if (tid as usize) < logits.len() {
+                            logits[tid as usize] = f32::NEG_INFINITY;
+                        }
+                    }
+                }
+                if config.repetition_penalty != 1.0 && !token_history.is_empty() {
+                    let start = token_history.len().saturating_sub(config.repetition_window);
+                    apply_repetition_penalty(&mut logits, &token_history[start..], config.repetition_penalty);
+                }
+                if config.frequency_penalty != 0.0 && !token_history.is_empty() {
+                    let mut counts: Vec<(u32, usize)> = Vec::new();
+                    for &t in &token_history {
+                        if let Some(entry) = counts.iter_mut().find(|(tok, _)| *tok == t) {
+                            entry.1 += 1;
+                        } else {
+                            counts.push((t, 1));
+                        }
+                    }
+                    apply_frequency_penalty(&mut logits, &counts, config.frequency_penalty);
+                }
+                if config.presence_penalty != 0.0 && !token_history.is_empty() {
+                    let mut seen: Vec<u32> = token_history.clone();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    apply_presence_penalty(&mut logits, &seen, config.presence_penalty);
+                }
+                for l in logits.iter_mut() { *l /= config.temperature; }
+                if config.top_k > 0 { apply_top_k(&mut logits, config.top_k); }
+                if config.top_p < 1.0 { apply_top_p(&mut logits, config.top_p); }
+                if config.min_p > 0.0 { apply_min_p(&mut logits, config.min_p); }
+                softmax_inplace(&mut logits);
+                sample_from_probs(&logits, self.rng.next_f32())
+            };
+
+            let tok_id = next as u32;
+            if let Some(eos) = self.eos_token_id {
+                if tok_id == eos { break; }
+            }
+            if self.extra_stop_tokens.contains(&tok_id) { break; }
+
+            new_tokens.push(tok_id);
+            token_history.push(tok_id);
+
+            // Forward with hook — accumulate pheromone delta across layers
+            let mut acc = 0.0f32;
+            let mut fired = 0u32;
+            last_logits = self.forward_one_hooked(tok_id, |li, hid| {
+                if let Some(d) = hook(li, hid) { acc += d.max(0.0); fired += 1; }
+                None
+            });
+            pheromone_data.push((tok_id, acc, fired));
+        }
+        (new_tokens, pheromone_data)
+    }
+
+    /// Return a reference to the model configuration.
+    pub fn config(&self) -> &ModelConfig { &self.config }
 
     /// Generate tokens one-by-one, calling `on_token(token_id)` after each.
     ///

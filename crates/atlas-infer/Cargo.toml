@@ -1,6 +1,6 @@
 [package]
-name        = "atlas-api"
-description = "ATLAS api: OpenAI-compatible HTTP/1.1 inference endpoint — zero external deps"
+name        = "atlas-infer"
+description = "ATLAS infer: StigmergicHook trait, InferEngine facade — zero external deps"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 atlas-core     = { path = "../atlas-core" }
-atlas-json     = { path = "../atlas-json" }
-atlas-infer    = { path = "../atlas-infer" }
 atlas-model    = { path = "../atlas-model" }
+atlas-tensor   = { path = "../atlas-tensor" }
 atlas-tokenize = { path = "../atlas-tokenize" }

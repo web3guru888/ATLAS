@@ -45,7 +45,19 @@ mod ffi {
             a_bf16: *const u16, b: *const f32, c: *mut f32,
             m: c_int, n: c_int, k: c_int,
         );
+        /// Explicitly drain all pending GPU work (cudaDeviceSynchronize).
+        /// Rarely needed — use only when CPU must read GPU output without going
+        /// through GpuVec::download() (which syncs implicitly via cudaMemcpy D2H).
+        pub fn atlas_sync();
     }
+}
+
+/// Drain all pending GPU work (cudaDeviceSynchronize).
+/// Rarely needed in normal use — GpuVec::download() syncs implicitly.
+/// Call this when you need to measure GPU timing or confirm all kernels have finished.
+pub fn device_sync() {
+    #[cfg(atlas_cuda)]
+    unsafe { ffi::atlas_sync() }
 }
 
 /// Returns true if CUDA was compiled in AND a device is reachable at runtime.
