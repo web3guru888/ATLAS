@@ -84,6 +84,10 @@ mod ffi {
             n_heads: c_int, n_kv_heads: c_int, head_dim: c_int,
             pos: c_int, scale: f32, window_size: c_int,
         );
+        /// GPU argmax: finds the index of the maximum element in x[0..n].
+        /// Both x and out_idx must be device pointers.
+        /// GPU argmax: writes index as f32 to out_f32 (index < 2^24 is exact).
+        pub fn atlas_gpu_argmax(x: *const f32, out_f32: *mut f32, n: c_int);
     }
 }
 
@@ -93,6 +97,32 @@ mod ffi {
 pub fn device_sync() {
     #[cfg(atlas_cuda)]
     unsafe { ffi::atlas_sync() }
+}
+
+/// GPU argmax: returns the index of the maximum element in a GPU vector.
+///
+/// Returns  when CUDA is unavailable or the vector is not GPU-resident.
+/// This is 10× faster than downloading all logits to CPU for greedy decoding
+/// (transfers only 4 bytes instead of vocab_size × 4 bytes ≈ 400 KB for OLMo-3).
+pub fn gpu_argmax(x: &GpuVec) -> Option<u32> {
+    #[cfg(atlas_cuda)]
+    if let Some(xp) = x.gpu_ptr() {
+        // Result stored as f32: indices < 2^24 (~16M) are exact in f32, vocab is ~100K
+        if let Some(out_buf) = gpu::GpuBuf::alloc(1) {
+            unsafe {
+                ffi::atlas_gpu_argmax(xp, out_buf.ptr, x.len as i32);
+            }
+            // Download 4 bytes (float representation of the int index)
+            let floats = out_buf.download();
+            if !floats.is_empty() {
+                return Some(floats[0] as u32);
+            }
+        }
+    }
+    // CPU fallback
+    x.cpu.iter().enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
 }
 
 /// Returns true if CUDA was compiled in AND a device is reachable at runtime.

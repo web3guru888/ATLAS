@@ -11,7 +11,7 @@
 //! ```
 //! use atlas_model::{ModelConfig, OlmoModel};
 //! let cfg = ModelConfig::tiny(); // 2 layers, 64 dim
-//! let mut model = OlmoModel::new(cfg);
+//! let mut model = OlmoModel::new(cfg.clone());
 //! let logits = model.forward(&[0u32, 1, 2], 0);
 //! assert_eq!(logits.shape()[0], 3);
 //! ```
@@ -870,11 +870,12 @@ impl Attention {
     }
 
     fn reset_cache(&mut self) {
-        self.kv_cache.keys.iter_mut().for_each(|v| *v = 0.0);
-        self.kv_cache.values.iter_mut().for_each(|v| *v = 0.0);
-        // Also reset GPU KV cache
+        // CPU KV cache intentionally NOT zeroed — same correctness argument as GpuKvCache::reset():
+        // OlmoModel::reset() sets pos=0, attention only reads t ∈ [0, pos), and every
+        // position is written (K/V) before it is read.  Stale data beyond pos is never accessed.
+        // Zeroing 4 GB of RAM (32 layers × 128 MB each) costs ~600 ms per generate() call.
         if let Some(gpu_kv) = &mut self.gpu_kv {
-            gpu_kv.reset();
+            gpu_kv.reset();  // also a no-op for the same reason
         }
     }
 }
@@ -1304,6 +1305,8 @@ pub struct OlmoModel {
     /// GPU-resident precomputed RoPE cos/sin tables.
     /// Shared across all layers. Initialized after weight loading.
     rope_gpu: Option<atlas_tensor::GpuRopeTables>,
+    /// GPU-resident final RMSNorm weights — cached to avoid per-token H2D upload.
+    norm_gpu: Option<atlas_tensor::GpuVec>,
     /// Position counter (for autoregressive generation).
     pos:     usize,
     /// EOS token id — generation stops when the model emits this token.
@@ -1346,7 +1349,7 @@ impl OlmoModel {
             cfg.vocab_size,
         );
         let eos_token_id = cfg.eos_token_id;
-        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy() }
+        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy() }
     }
 
     /// Upload precomputed RoPE tables and allocate GPU KV caches.
@@ -1371,6 +1374,9 @@ impl OlmoModel {
                 &cos_flat, &sin_flat, max_seq, half_dim,
             );
         }
+
+        // Upload final RMSNorm weights to GPU (eliminates per-token H2D after layers)
+        self.norm_gpu = Some(atlas_tensor::GpuVec::from_slice(&self.norm));
 
         // Allocate GPU KV cache per attention layer
         let max_seq_kv = self.config.max_seq_len;
@@ -1403,7 +1409,7 @@ impl OlmoModel {
     /// ```rust
     /// # use atlas_model::{OlmoModel, ModelConfig};
     /// let cfg = ModelConfig::tiny();
-    /// let mut model = OlmoModel::new(cfg);
+    /// let mut model = OlmoModel::new(cfg.clone());
     /// let logits = model.forward_one_hooked(0u32, |layer_idx, hidden| {
     ///     // e.g. deposit mean-abs as pheromone on layers ≥ 24
     ///     if layer_idx >= 24 {
@@ -1485,19 +1491,16 @@ impl OlmoModel {
             }
         }
 
-        // Final RMSNorm (GPU) — use pre-cached if available
-        let tmp_norm;
-        let norm_gvec;
-        // Re-borrow self.norm_gpu (we don't have a cached gpu norm for the final norm yet)
-        // For now create from slice — small one-time cost at end of forward pass
-        norm_gvec = GpuVec::from_slice(&self.norm);
-        tmp_norm = &norm_gvec;
-        x.rmsnorm_inplace(tmp_norm, self.config.rms_norm_eps);
-
-        // LM head projection (GPU)
+        // Use pre-cached GPU norm weights (avoids H2D upload + sync after layers)
+        let tmp_norm_gvec;
+        let norm_w = if let Some(ng) = &self.norm_gpu {
+            ng
+        } else {
+            tmp_norm_gvec = GpuVec::from_slice(&self.norm);
+            &tmp_norm_gvec
+        };
+        x.rmsnorm_inplace(norm_w, self.config.rms_norm_eps);
         let logits_gpu = self.lm_head.forward_vec(&x)?;
-
-        // D2H: download logits (one PCIe transfer per token)
         Some(logits_gpu.download())
     }
 
@@ -1600,7 +1603,6 @@ impl OlmoModel {
         config: &SamplingConfig,
     ) -> Vec<u32> {
         self.reset();
-        // Re-seed PRNG from system entropy so each call produces different output.
         self.rng = Rng::from_entropy();
 
         let mut new_tokens: Vec<u32> = Vec::new();
@@ -2768,7 +2770,7 @@ mod tests {
     #[test]
     fn forward_tiny_model() {
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
         let logits = model.forward(&[0u32, 1, 2], 0);
         assert_eq!(logits.shape(), [3, 256]);
     }
@@ -2776,7 +2778,7 @@ mod tests {
     #[test]
     fn forward_single_token() {
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
         let logits = model.forward_one(42);
         assert_eq!(logits.len(), 256);
         // Sanity check: finite values
@@ -2786,7 +2788,7 @@ mod tests {
     #[test]
     fn generate_tokens() {
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
         let out = model.generate(&[0u32, 1], 5, 0.0);
         assert_eq!(out.len(), 5);
         // All token ids should be valid
@@ -2796,7 +2798,7 @@ mod tests {
     #[test]
     fn generate_stops_on_eos() {
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
 
         // First, do a greedy generate to find out what token is produced at step 0.
         let full = model.generate(&[0u32, 1], 10, 0.0);
@@ -2812,7 +2814,7 @@ mod tests {
     #[test]
     fn generate_eos_mid_sequence() {
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
 
         // Greedy generate 10 tokens
         let full = model.generate(&[0u32, 1], 10, 0.0);
@@ -2828,7 +2830,7 @@ mod tests {
     #[test]
     fn generate_temperature_varies() {
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
 
         // Generate with temperature > 0 twice — outputs should (almost certainly) differ
         // because the RNG is re-seeded from system time each call.
@@ -3040,7 +3042,7 @@ mod tests {
     #[test]
     fn generate_with_repetition_penalty() {
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
         // Greedy without penalty
         let plain = model.generate(&[0, 1], 20, 0.0);
         // Greedy with high repetition penalty
@@ -3064,7 +3066,7 @@ mod tests {
     #[test]
     fn cross_entropy_loss() {
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
         let logits = model.forward(&[0u32, 1, 2], 0);
         // targets: predict token 1, 2, 3 from positions 0, 1, 2
         let loss = logits.cross_entropy_loss(&[1, 2, 3]);
@@ -3106,7 +3108,7 @@ mod tests {
     #[test]
     fn reset_clears_kv() {
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
         // Run forward to populate KV cache
         model.forward_one(0);
         model.forward_one(1);
@@ -3805,7 +3807,7 @@ mod tests {
     fn bench_forward_tiny_model() {
         use atlas_core::bench::Bench;
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
         let b = Bench::run("forward_tiny_3tok", 100, || {
             model.pos = 0; // reset position
             std::hint::black_box(model.forward(&[0u32, 1, 2], 0));
@@ -3848,7 +3850,7 @@ mod tests {
     fn gpu_forward_tiny_model_explicit() {
         if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
         let cfg = ModelConfig::tiny();
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
         let logits = model.forward_one_gpu(42);
         assert!(logits.is_some(), "forward_one_gpu returned None");
         let logits = logits.unwrap();
@@ -4475,7 +4477,7 @@ mod tests {
         let mut cfg = ModelConfig::tiny();
         cfg.layer_types    = vec![LayerType::Sliding, LayerType::Full];
         cfg.sliding_window = Some(2);
-        let mut model = OlmoModel::new(cfg);
+        let mut model = OlmoModel::new(cfg.clone());
 
         // Wiring check
         assert_eq!(model.layers[0].attn.window_size, Some(2), "layer 0 must be SWA(2)");

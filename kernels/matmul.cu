@@ -932,4 +932,77 @@ void atlas_decode_attention(
         n_heads, n_kv_heads, head_dim, pos, scale, window_size);
 }
 
+
+/* ── GPU argmax for greedy decoding ──────────────────────────────────────── */
+/* Two-pass parallel reduction to find argmax of x[0..n].                    */
+/* Both x and out_idx must be device pointers.                               */
+
+#define ARGMAX_THREADS 256
+
+__global__ void argmax_first_pass_kernel(
+    const float* __restrict__ x,
+    float* __restrict__ block_max_vals,
+    int*   __restrict__ block_max_idxs,
+    int n
+) {
+    __shared__ float  sh_vals[ARGMAX_THREADS];
+    __shared__ int    sh_idxs[ARGMAX_THREADS];
+
+    int tid = threadIdx.x;
+    int i   = blockIdx.x * blockDim.x + tid;
+
+    float local_val = -1e38f;
+    int   local_idx = 0;
+    if (i < n) { local_val = x[i]; local_idx = i; }
+
+    sh_vals[tid] = local_val;
+    sh_idxs[tid] = local_idx;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (sh_vals[tid + s] > sh_vals[tid]) {
+                sh_vals[tid] = sh_vals[tid + s];
+                sh_idxs[tid] = sh_idxs[tid + s];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        block_max_vals[blockIdx.x] = sh_vals[0];
+        block_max_idxs[blockIdx.x] = sh_idxs[0];
+    }
+}
+
+/* Writes the argmax index as (float)idx into a float output.            */
+/* Indices < 2^24 are exactly representable in f32 — vocab <= 100K safe. */
+__global__ void argmax_second_pass_kernel(
+    const float* __restrict__ block_max_vals,
+    const int*   __restrict__ block_max_idxs,
+    float* __restrict__ result_f32,
+    int n_blocks
+) {
+    if (threadIdx.x != 0) return;
+    float best = -1e38f;
+    int   idx  = 0;
+    for (int i = 0; i < n_blocks; i++) {
+        if (block_max_vals[i] > best) {
+            best = block_max_vals[i];
+            idx  = block_max_idxs[i];
+        }
+    }
+    *result_f32 = (float)idx;  /* exact for idx < 2^24 */
+}
+
+void atlas_gpu_argmax(const float* x, float* out_f32, int n) {
+    int n_blocks = (n + ARGMAX_THREADS - 1) / ARGMAX_THREADS;
+    float* d_block_vals;
+    int*   d_block_idxs;
+    cudaMalloc((void**)&d_block_vals, n_blocks * sizeof(float));
+    cudaMalloc((void**)&d_block_idxs, n_blocks * sizeof(int));
+    argmax_first_pass_kernel<<<n_blocks, ARGMAX_THREADS>>>(x, d_block_vals, d_block_idxs, n);
+    argmax_second_pass_kernel<<<1, ARGMAX_THREADS>>>(d_block_vals, d_block_idxs, out_f32, n_blocks);
+    cudaFree(d_block_vals);
+    cudaFree(d_block_idxs);
+}
 } /* extern "C" */
