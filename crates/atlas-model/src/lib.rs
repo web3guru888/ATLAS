@@ -856,6 +856,11 @@ struct TransformerBlock {
     ffn:      FeedForward,
     attn_norm: Vec<f32>,   // pre-attn norm (Llama) OR post-attn norm (OLMo-2)
     ffn_norm:  Vec<f32>,   // pre-FFN norm (Llama) OR post-FFN norm (OLMo-2)
+    /// GPU-resident copies of norm weights, uploaded once at model load.
+    /// Eliminates 2 × 16 KB H2D transfers per layer per token (64 per 32-layer model).
+    /// Call `cache_norm_weights()` after weight loading to populate.
+    attn_norm_gpu: Option<atlas_tensor::GpuVec>,
+    ffn_norm_gpu:  Option<atlas_tensor::GpuVec>,
     eps:       f32,
     d_model:   usize,
     /// OLMo-2: norm applied after residual add rather than before sub-layer
@@ -865,14 +870,37 @@ struct TransformerBlock {
 impl TransformerBlock {
     fn new(cfg: &ModelConfig, layer: usize) -> Self {
         Self {
-            attn:      Attention::new(cfg, layer),
-            ffn:       FeedForward::new(cfg, layer),
-            attn_norm: vec![1.0f32; cfg.d_model],
-            ffn_norm:  vec![1.0f32; cfg.d_model],
-            eps:       cfg.rms_norm_eps,
-            d_model:   cfg.d_model,
-            post_norm: false,
+            attn:          Attention::new(cfg, layer),
+            ffn:           FeedForward::new(cfg, layer),
+            attn_norm:     vec![1.0f32; cfg.d_model],
+            ffn_norm:      vec![1.0f32; cfg.d_model],
+            attn_norm_gpu: None,
+            ffn_norm_gpu:  None,
+            eps:           cfg.rms_norm_eps,
+            d_model:       cfg.d_model,
+            post_norm:     false,
         }
+    }
+
+    /// Upload norm weights to GPU. Call once after all weights are loaded.
+    /// Subsequent forward passes use the cached GPU vecs instead of re-uploading.
+    fn cache_norm_weights(&mut self) {
+        if atlas_tensor::cuda_available() {
+            self.attn_norm_gpu = Some(atlas_tensor::GpuVec::from_slice(&self.attn_norm));
+            self.ffn_norm_gpu  = Some(atlas_tensor::GpuVec::from_slice(&self.ffn_norm));
+        }
+    }
+
+    /// Get a reference to the GPU attn_norm, or upload it on demand.
+    #[inline]
+    fn attn_norm_gpu_ref(&self) -> Option<&atlas_tensor::GpuVec> {
+        self.attn_norm_gpu.as_ref()
+    }
+
+    /// Get a reference to the GPU ffn_norm, or upload it on demand.
+    #[inline]
+    fn ffn_norm_gpu_ref(&self) -> Option<&atlas_tensor::GpuVec> {
+        self.ffn_norm_gpu.as_ref()
     }
 
     /// CPU-only path for one token at position `pos`. x: [d_model] → modified in-place.
@@ -920,9 +948,16 @@ impl TransformerBlock {
             //   x = residual + attn_out                      ← residual AFTER norm
             //   (same pattern for FFN)
             if let Some(attn_out) = self.attn.forward_token_gpu(x, pos, rope) {
-                let norm_w = GpuVec::from_slice(&self.attn_norm);
+                // Use pre-cached GPU norm weights to avoid per-token H2D upload.
+                let tmp_norm;
+                let norm_w = if let Some(g) = self.attn_norm_gpu_ref() {
+                    g
+                } else {
+                    tmp_norm = GpuVec::from_slice(&self.attn_norm);
+                    &tmp_norm
+                };
                 let mut normed = attn_out;
-                normed.rmsnorm_inplace(&norm_w, self.eps);
+                normed.rmsnorm_inplace(norm_w, self.eps);
                 x.add_inplace(&normed);
             } else {
                 let mut x_cpu = x.download();
@@ -931,16 +966,28 @@ impl TransformerBlock {
                 return;
             }
             if let Some(ffn_out) = self.ffn.forward_gpu(x) {
-                let ffn_norm_w = GpuVec::from_slice(&self.ffn_norm);
+                let tmp_ffn_norm;
+                let ffn_norm_w = if let Some(g) = self.ffn_norm_gpu_ref() {
+                    g
+                } else {
+                    tmp_ffn_norm = GpuVec::from_slice(&self.ffn_norm);
+                    &tmp_ffn_norm
+                };
                 let mut normed = ffn_out;
-                normed.rmsnorm_inplace(&ffn_norm_w, self.eps);
+                normed.rmsnorm_inplace(ffn_norm_w, self.eps);
                 x.add_inplace(&normed);
             }
         } else {
             // ── Llama pre-norm path (default) ─────────────────────────────────
-            let norm_w = GpuVec::from_slice(&self.attn_norm);
+            let tmp_norm;
+            let norm_w = if let Some(g) = self.attn_norm_gpu_ref() {
+                g
+            } else {
+                tmp_norm = GpuVec::from_slice(&self.attn_norm);
+                &tmp_norm
+            };
             let mut x_norm = GpuVec::from_slice(&x.download());
-            x_norm.rmsnorm_inplace(&norm_w, self.eps);
+            x_norm.rmsnorm_inplace(norm_w, self.eps);
             if let Some(attn_out) = self.attn.forward_token_gpu(&x_norm, pos, rope) {
                 x.add_inplace(&attn_out);
             } else {
@@ -949,9 +996,15 @@ impl TransformerBlock {
                 *x = GpuVec::from_slice(&x_cpu);
                 return;
             }
-            let ffn_norm_w = GpuVec::from_slice(&self.ffn_norm);
+            let tmp_ffn_norm;
+            let ffn_norm_w = if let Some(g) = self.ffn_norm_gpu_ref() {
+                g
+            } else {
+                tmp_ffn_norm = GpuVec::from_slice(&self.ffn_norm);
+                &tmp_ffn_norm
+            };
             let mut x_norm2 = GpuVec::from_slice(&x.download());
-            x_norm2.rmsnorm_inplace(&ffn_norm_w, self.eps);
+            x_norm2.rmsnorm_inplace(ffn_norm_w, self.eps);
             if let Some(ffn_out) = self.ffn.forward_gpu(&x_norm2) {
                 x.add_inplace(&ffn_out);
             }
@@ -2083,6 +2136,10 @@ pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoM
             }
         }
     }
+    // Pre-upload norm weights to GPU once — eliminates per-token H2D transfers.
+    for layer in &mut model.layers {
+        layer.cache_norm_weights();
+    }
     Ok(model)
 }
 
@@ -2288,6 +2345,10 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
                 break;
             }
         }
+    }
+    // Pre-upload norm weights to GPU once — eliminates per-token H2D transfers.
+    for layer in &mut model.layers {
+        layer.cache_norm_weights();
     }
     Ok(model)
 }

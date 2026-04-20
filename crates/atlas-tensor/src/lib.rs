@@ -87,14 +87,34 @@ mod gpu {
         fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> i32;
         fn cudaFree(ptr: *mut c_void) -> i32;
         fn cudaMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: i32) -> i32;
+        /// Async allocation on stream `stream` (pass null for the default stream).
+        /// Does NOT block the host. Available since CUDA 11.2.
+        fn cudaMallocAsync(ptr: *mut *mut c_void, size: usize, stream: *mut c_void) -> i32;
+        /// Async free on stream `stream`. Memory is returned to the pool after
+        /// all preceding operations on `stream` complete.
+        fn cudaFreeAsync(ptr: *mut c_void, stream: *mut c_void) -> i32;
     }
 
     const CUDA_MEMCPY_H2D: i32 = 1;
     const CUDA_MEMCPY_D2H: i32 = 2;
 
+    /// Activation scratch buffer for inference temporaries (Q, K, V, gate, etc.).
+    ///
+    /// # Allocation strategy
+    ///
+    /// We try `cudaMallocAsync` first (CUDA 11.2+, our server has 13.0).
+    /// Unlike `cudaMalloc`, async allocation does NOT synchronize with the device —
+    /// it submits the allocation into stream-0 ordering without blocking the CPU.
+    /// This allows consecutive kernel launches to proceed without implicit sync
+    /// barriers between them, which is the primary driver of throughput for decode.
+    ///
+    /// Fallback: if `cudaMallocAsync` returns an error (shouldn't on CUDA 11.2+),
+    /// we fall back to synchronous `cudaMalloc`.
     pub struct GpuBuf {
         pub ptr: *mut f32,
         pub len: usize,
+        /// True if allocated with cudaMallocAsync; drop uses cudaFreeAsync.
+        async_alloc: bool,
     }
     unsafe impl Send for GpuBuf {}
     unsafe impl Sync for GpuBuf {}
@@ -107,9 +127,18 @@ mod gpu {
     impl GpuBuf {
         pub fn alloc(len: usize) -> Option<Self> {
             let mut ptr: *mut c_void = std::ptr::null_mut();
+            // Try async allocation on stream-0 (null = default stream).
+            // cudaMallocAsync does not synchronize — no implicit device barrier.
+            let async_err = unsafe {
+                cudaMallocAsync(&mut ptr, len * 4, std::ptr::null_mut())
+            };
+            if async_err == 0 {
+                return Some(Self { ptr: ptr as *mut f32, len, async_alloc: true });
+            }
+            // Fall back to synchronous cudaMalloc (CUDA < 11.2 or pool exhausted).
             let err = unsafe { cudaMalloc(&mut ptr, len * 4) };
             if err != 0 { return None; }
-            Some(Self { ptr: ptr as *mut f32, len })
+            Some(Self { ptr: ptr as *mut f32, len, async_alloc: false })
         }
         pub fn upload(data: &[f32]) -> Option<Self> {
             let buf = Self::alloc(data.len())?;
@@ -132,13 +161,19 @@ mod gpu {
     impl Drop for GpuBuf {
         fn drop(&mut self) {
             if !self.ptr.is_null() {
-                unsafe { cudaFree(self.ptr as *mut c_void); }
+                if self.async_alloc {
+                    // Async free: memory returned to pool after preceding stream-0 work.
+                    unsafe { cudaFreeAsync(self.ptr as *mut c_void, std::ptr::null_mut()); }
+                } else {
+                    unsafe { cudaFree(self.ptr as *mut c_void); }
+                }
             }
         }
     }
 
     /// GPU buffer for BF16 weights (u16, 2 bytes/element).
-    /// Used by `GpuBufKind::BF16` to store weight matrices in half the VRAM of f32.
+    /// Model weights are loaded once and live in VRAM for the process lifetime —
+    /// no need for async alloc here; sync cudaMalloc is fine at load time.
     pub struct GpuBufBf16 {
         pub ptr: *mut u16,
         pub len: usize,
