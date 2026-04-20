@@ -652,4 +652,284 @@ void atlas_sgemm_bf16_f32(
     /* Async: downstream kernels on stream-0 wait automatically. */
 }
 
+/* ── Per-head QK RMSNorm (in-place) ──────────────────────────────────────── */
+/*                                                                             */
+/* OLMo-2/3 applies a per-head RMSNorm to Q and K before RoPE.               */
+/* Implemented as n_heads blocks × head_dim threads.  Weights layout:         */
+/*   w[n_heads × head_dim] (i.e. per-head norm weights concatenated)          */
+/*                                                                             */
+/* xh[i] = xh[i] / rms(xh) × wh[i]  (in-place, no aliasing issue)           */
+__global__ void qk_norm_inplace_kernel(
+    float* __restrict__ x,
+    const float* __restrict__ w,
+    int n_heads, int head_dim, float eps
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    float* xh        = x + h * head_dim;
+    const float* wh  = w + h * head_dim;
+    int tid = threadIdx.x;
+
+    /* Compute partial sum of squares. */
+    float sum = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x)
+        sum += xh[i] * xh[i];
+
+    /* Warp-level reduce. */
+    int warp_lane = tid % 32;
+    int warp_n    = min(32, blockDim.x - (tid / 32) * 32);
+    unsigned mask = (warp_n >= 32) ? 0xffffffffu : ((1u << warp_n) - 1u);
+    for (int d = warp_n / 2; d > 0; d >>= 1)
+        sum += __shfl_down_sync(mask, sum, d);
+
+    /* Accumulate across warps via smem. */
+    extern __shared__ float smem[];
+    if (warp_lane == 0) smem[tid / 32] = sum;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < (blockDim.x + 31) / 32; w++) total += smem[w];
+        smem[0] = rsqrtf(total / (float)head_dim + eps);
+    }
+    __syncthreads();
+    float rms_inv = smem[0];
+
+    /* Apply in-place. */
+    for (int i = tid; i < head_dim; i += blockDim.x)
+        xh[i] = xh[i] * rms_inv * wh[i];
+}
+
+void atlas_qk_norm_inplace(
+    float* x, const float* w,
+    int n_heads, int head_dim, float eps
+) {
+    int threads  = (head_dim < 128) ? head_dim : 128;
+    int smem     = ((threads + 31) / 32) * sizeof(float);
+    qk_norm_inplace_kernel<<<n_heads, threads, smem>>>(x, w, n_heads, head_dim, eps);
+}
+
+/* ── GPU Decode Attention ───────────────────────────────────────────────── */
+
+/* Apply precomputed RoPE cos/sin tables to Q or K in-place.
+ *
+ * x:       [n_heads × head_dim] — all heads contiguous
+ * cos_tab: [max_seq × half_dim] — precomputed cosines
+ * sin_tab: [max_seq × half_dim] — precomputed sines
+ * half = head_dim / 2; standard "rotate half" implementation.
+ *
+ * Launch config: blocks = n_heads, threads = min(half, 256).
+ */
+__global__ void rope_precomputed_kernel(
+    float* __restrict__ x,
+    const float* __restrict__ cos_tab,
+    const float* __restrict__ sin_tab,
+    int n_heads, int head_dim, int pos, int half_dim, int max_seq
+) {
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    float* xh = x + h * head_dim;
+    const float* c = cos_tab + (size_t)pos * half_dim;
+    const float* s = sin_tab + (size_t)pos * half_dim;
+
+    /* Each thread handles one or more dimension pairs. */
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x) {
+        float x0 = xh[i];
+        float x1 = xh[i + half_dim];
+        xh[i]          = x0 * c[i] - x1 * s[i];
+        xh[i + half_dim] = x0 * s[i] + x1 * c[i];
+    }
+}
+
+/* Write new K and V vectors into GPU KV cache at position `pos`.
+ *
+ * k_cache: [max_seq × n_kv_heads × head_dim]
+ * v_cache: [max_seq × n_kv_heads × head_dim]
+ * new_k:   [n_kv_heads × head_dim]
+ * new_v:   [n_kv_heads × head_dim]
+ */
+__global__ void kv_cache_write_kernel(
+    float* __restrict__ k_cache,
+    float* __restrict__ v_cache,
+    const float* __restrict__ new_k,
+    const float* __restrict__ new_v,
+    int pos, int n_kv_heads, int head_dim
+) {
+    int elem = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_kv_heads * head_dim;
+    if (elem < total) {
+        size_t off = (size_t)pos * total + elem;
+        k_cache[off] = new_k[elem];
+        v_cache[off] = new_v[elem];
+    }
+}
+
+/* Grouped-query decode attention: one CUDA block per Q-head.
+ *
+ * Computes:  scores[t] = dot(q_h, k_cache[t, kv_h]) * scale,  t in [0..pos]
+ *            apply sliding-window mask (set -inf if pos - t >= window_size)
+ *            softmax(scores)
+ *            out_h = sum_t scores[t] * v_cache[t, kv_h]
+ *
+ * Shared memory: holds the scores array [pos+1].  Max context = 65536 tokens.
+ *
+ * grid:  n_heads blocks
+ * block: ATTN_THREADS = 128 threads (tune for occupancy)
+ *
+ * k_cache: [max_seq × n_kv_heads × head_dim]
+ * v_cache: [max_seq × n_kv_heads × head_dim]
+ * q:       [n_heads × head_dim]
+ * out:     [n_heads × head_dim]
+ */
+#define ATTN_THREADS 128
+__global__ void decode_attention_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache,
+    float*       __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim,
+    int pos,            /* current position (seq_len - 1) */
+    float scale,        /* 1/sqrt(head_dim) × attn_factor */
+    int window_size     /* 0 = full attention, >0 = sliding window */
+) {
+    extern __shared__ float smem[];  /* scores [pos+1] */
+
+    int h    = blockIdx.x;
+    if (h >= n_heads) return;
+    int group = n_heads / n_kv_heads;
+    int kv_h  = h / group;
+
+    const float* q_h = q       + (size_t)h    * head_dim;
+    /* k_cache layout: [max_seq, n_kv_heads, head_dim] */
+    const float* k_base = k_cache + (size_t)kv_h * head_dim; /* offset for kv_h within one pos */
+    const float* v_base = v_cache + (size_t)kv_h * head_dim;
+    int kv_stride = n_kv_heads * head_dim;
+
+    int seq = pos + 1;  /* number of tokens to attend to */
+
+    /* ── Step 1: compute dot products → scores ─────────────────────────── */
+    /* Each thread handles a subset of past positions. */
+    for (int t = threadIdx.x; t < seq; t += ATTN_THREADS) {
+        /* Sliding window: mask positions outside window. */
+        if (window_size > 0 && (pos - t) >= window_size) {
+            smem[t] = -1e20f;
+            continue;
+        }
+        const float* kt = k_base + (size_t)t * kv_stride;
+        float acc = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            acc += q_h[d] * kt[d];
+        }
+        smem[t] = acc * scale;
+    }
+    __syncthreads();
+
+    /* ── Step 2: softmax in-place on smem[0..seq] ──────────────────────── */
+    /* Find max (parallel reduction). */
+    float local_max = -1e20f;
+    for (int t = threadIdx.x; t < seq; t += ATTN_THREADS) {
+        local_max = fmaxf(local_max, smem[t]);
+    }
+    /* Warp-level reduction for max. */
+    for (int d = 16; d > 0; d >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, d));
+    /* Block-level max via shared mem. */
+    __shared__ float block_max;
+    if (threadIdx.x % 32 == 0) {
+        /* Lane 0 of each warp contributes — atomic max. */
+        /* Init before warps write. */
+    }
+    /* Simple approach: use a single accumulator. One warp takes result. */
+    __shared__ float block_vals[ATTN_THREADS / 32];
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) block_vals[warp_id] = local_max;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float gmax = -1e20f;
+        for (int w = 0; w < (ATTN_THREADS/32); w++) gmax = fmaxf(gmax, block_vals[w]);
+        block_max = gmax;
+    }
+    __syncthreads();
+    float gmax = block_max;
+
+    /* Compute exp and sum. */
+    float local_sum = 0.0f;
+    for (int t = threadIdx.x; t < seq; t += ATTN_THREADS) {
+        float e = expf(smem[t] - gmax);
+        smem[t] = e;
+        local_sum += e;
+    }
+    /* Reduce sum. */
+    for (int d = 16; d > 0; d >>= 1)
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, d);
+    __shared__ float block_sums[ATTN_THREADS / 32];
+    if (lane_id == 0) block_sums[warp_id] = local_sum;
+    __syncthreads();
+    __shared__ float block_sum;
+    if (threadIdx.x == 0) {
+        float gs = 0.0f;
+        for (int w = 0; w < (ATTN_THREADS/32); w++) gs += block_sums[w];
+        block_sum = gs;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / block_sum;
+    /* Normalize. */
+    for (int t = threadIdx.x; t < seq; t += ATTN_THREADS) {
+        smem[t] *= inv_sum;
+    }
+    __syncthreads();
+
+    /* ── Step 3: weighted sum of V → out_h ─────────────────────────────── */
+    float* out_h = out + (size_t)h * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += ATTN_THREADS) {
+        float val = 0.0f;
+        for (int t = 0; t < seq; t++) {
+            const float* vt = v_base + (size_t)t * kv_stride;
+            val += smem[t] * vt[d];
+        }
+        out_h[d] = val;
+    }
+}
+
+/* ── Host-callable wrappers ─────────────────────────────────────────────── */
+
+void atlas_rope_precomputed(
+    float* x,
+    const float* cos_tab, const float* sin_tab,
+    int n_heads, int head_dim, int pos, int max_seq
+) {
+    int half = head_dim / 2;
+    int threads = (half < 64) ? half : 64;
+    rope_precomputed_kernel<<<n_heads, threads>>>(
+        x, cos_tab, sin_tab, n_heads, head_dim, pos, half, max_seq);
+}
+
+void atlas_kv_cache_write(
+    float* k_cache, float* v_cache,
+    const float* new_k, const float* new_v,
+    int pos, int n_kv_heads, int head_dim
+) {
+    int total   = n_kv_heads * head_dim;
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    kv_cache_write_kernel<<<blocks, threads>>>(
+        k_cache, v_cache, new_k, new_v, pos, n_kv_heads, head_dim);
+}
+
+void atlas_decode_attention(
+    const float* q,
+    const float* k_cache, const float* v_cache,
+    float* out,
+    int n_heads, int n_kv_heads, int head_dim,
+    int pos, float scale, int window_size
+) {
+    int smem_bytes = (pos + 1) * sizeof(float);
+    /* One block per head; ATTN_THREADS threads per block. */
+    decode_attention_kernel<<<n_heads, ATTN_THREADS, smem_bytes>>>(
+        q, k_cache, v_cache, out,
+        n_heads, n_kv_heads, head_dim, pos, scale, window_size);
+}
+
 } /* extern "C" */

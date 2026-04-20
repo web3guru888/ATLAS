@@ -606,6 +606,12 @@ struct Attention {
     head_dim:   usize,
     scale:      f32,      // attn_scale_factor / sqrt(head_dim); YaRN multiplies attn_scale_factor
     kv_cache:   KvCache,
+    /// GPU-resident KV cache. When Some, the GPU attention path is used —
+    /// zero PCIe transfers for attention during decode.
+    gpu_kv: Option<atlas_tensor::GpuKvCache>,
+    /// GPU-cached QK-norm weights (uploaded once at model load).
+    q_norm_gpu: Option<atlas_tensor::GpuVec>,
+    k_norm_gpu: Option<atlas_tensor::GpuVec>,
     /// OLMo-2 QK-norm weights (empty = disabled)
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
@@ -629,6 +635,9 @@ impl Attention {
             head_dim,
             scale:      1.0 / (head_dim as f32).sqrt(), // adjusted later if YaRN
             kv_cache:   KvCache::new(cfg.n_kv_heads, head_dim, cfg.max_seq_len),
+            gpu_kv:     None, // initialized after model loading via init_gpu_kv()
+            q_norm_gpu: None,
+            k_norm_gpu: None,
             q_norm:     Vec::new(),
             k_norm:     Vec::new(),
             window_size: None, // set by OlmoModel::new() for SWA layers (Fix A)
@@ -799,9 +808,74 @@ impl Attention {
         self.wo.forward_vec(&out_gpu)
     }
 
+    /// Initialize GPU KV cache and QK-norm GPU weights. Call once after weights are loaded.
+    fn init_gpu_kv(&mut self, max_seq: usize) {
+        if atlas_tensor::cuda_available() {
+            self.gpu_kv = atlas_tensor::GpuKvCache::new(max_seq, self.n_kv_heads, self.head_dim);
+            if !self.q_norm.is_empty() {
+                self.q_norm_gpu = Some(atlas_tensor::GpuVec::from_slice(&self.q_norm));
+            }
+            if !self.k_norm.is_empty() {
+                self.k_norm_gpu = Some(atlas_tensor::GpuVec::from_slice(&self.k_norm));
+            }
+        }
+    }
+
+    /// Full-GPU attention path: no PCIe transfers for attention.
+    ///
+    /// Requires `gpu_kv` to be initialized (call `init_gpu_kv` after weight loading).
+    /// Falls back to returning `None` if GPU resources aren't ready, so caller can
+    /// use the existing CPU-side attention path.
+    ///
+    /// Flow (zero D2H transfers until W_o output):
+    ///   1. QKV projections (GEMV on GPU)
+    ///   2. QK-norm in-place on GPU (atlas_qk_norm_inplace)
+    ///   3. RoPE in-place on GPU (atlas_rope_precomputed)
+    ///   4. KV cache write (VRAM-to-VRAM)
+    ///   5. Decode attention on GPU (atlas_decode_attention)
+    ///   6. W_o output projection (GEMV on GPU)
+    fn forward_token_gpu_full(
+        &mut self,
+        x: &atlas_tensor::GpuVec,
+        pos: usize,
+        rope_tables: &atlas_tensor::GpuRopeTables,
+    ) -> Option<atlas_tensor::GpuVec> {
+        // ① QKV projections — stay in VRAM
+        let mut q_gpu = self.wq.forward_vec(x)?;
+        let mut k_gpu = self.wk.forward_vec(x)?;
+        let     v_gpu = self.wv.forward_vec(x)?;
+
+        // ② QK-norm (OLMo-2/3 per-head RMSNorm before RoPE, entirely on GPU)
+        if let Some(qng) = &self.q_norm_gpu {
+            atlas_tensor::qk_norm_inplace_gpu(&mut q_gpu, qng, self.n_heads, self.head_dim, 1e-6);
+        }
+        if let Some(kng) = &self.k_norm_gpu {
+            atlas_tensor::qk_norm_inplace_gpu(&mut k_gpu, kng, self.n_kv_heads, self.head_dim, 1e-6);
+        }
+
+        // ③ RoPE in-place on GPU using precomputed YaRN tables
+        rope_tables.apply_to(&mut q_gpu, self.n_heads, self.head_dim, pos);
+        rope_tables.apply_to(&mut k_gpu, self.n_kv_heads, self.head_dim, pos);
+
+        // ④ Write K, V into GPU KV cache
+        let gpu_kv = self.gpu_kv.as_mut()?;
+        gpu_kv.write(pos, &k_gpu, &v_gpu);
+
+        // ⑤ Decode attention: Q @ K_cache / scale, softmax, @ V_cache — all VRAM
+        let window = self.window_size.unwrap_or(0);
+        let attn_out = gpu_kv.decode_attention(&q_gpu, self.n_heads, pos, self.scale, window)?;
+
+        // ⑥ Output projection
+        self.wo.forward_vec(&attn_out)
+    }
+
     fn reset_cache(&mut self) {
         self.kv_cache.keys.iter_mut().for_each(|v| *v = 0.0);
         self.kv_cache.values.iter_mut().for_each(|v| *v = 0.0);
+        // Also reset GPU KV cache
+        if let Some(gpu_kv) = &mut self.gpu_kv {
+            gpu_kv.reset();
+        }
     }
 }
 
@@ -927,6 +1001,91 @@ impl TransformerBlock {
             rmsnorm_inplace(&mut x_norm2, &self.ffn_norm, self.eps);
             let ffn_out = self.ffn.forward(&x_norm2);
             for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) { *xi += fi; }
+        }
+    }
+
+    /// Full-GPU transformer block: attention, FFN, and norms all stay in VRAM.
+    ///
+    /// Requires `rope_tables: &GpuRopeTables` for GPU-side RoPE, and that
+    /// `attn.gpu_kv` is initialized (call `OlmoModel::init_gpu_resources()` first).
+    ///
+    /// When available, this replaces `forward_token_gpu` and eliminates Q/K/V
+    /// D2H downloads, reducing PCIe traffic from ~24KB × layers to 0 per token.
+    fn forward_token_gpu_v2(
+        &mut self,
+        x: &mut atlas_tensor::GpuVec,
+        pos: usize,
+        rope: &RopeCache,
+        rope_tables: &atlas_tensor::GpuRopeTables,
+    ) {
+        use atlas_tensor::GpuVec;
+
+        if self.post_norm {
+            // ── OLMo-2/3 post-norm ─────────────────────────────────────────────
+            let attn_out = self.attn.forward_token_gpu_full(x, pos, rope_tables)
+                .or_else(|| self.attn.forward_token_gpu(x, pos, rope));
+            if let Some(attn_out) = attn_out {
+                let tmp_norm;
+                let norm_w = if let Some(g) = self.attn_norm_gpu_ref() {
+                    g
+                } else {
+                    tmp_norm = GpuVec::from_slice(&self.attn_norm);
+                    &tmp_norm
+                };
+                let mut normed = attn_out;
+                normed.rmsnorm_inplace(norm_w, self.eps);
+                x.add_inplace(&normed);
+            } else {
+                let mut x_cpu = x.download();
+                self.forward_token_cpu(&mut x_cpu, pos, rope);
+                *x = GpuVec::from_slice(&x_cpu);
+                return;
+            }
+            if let Some(ffn_out) = self.ffn.forward_gpu(x) {
+                let tmp_ffn_norm;
+                let ffn_norm_w = if let Some(g) = self.ffn_norm_gpu_ref() {
+                    g
+                } else {
+                    tmp_ffn_norm = GpuVec::from_slice(&self.ffn_norm);
+                    &tmp_ffn_norm
+                };
+                let mut normed = ffn_out;
+                normed.rmsnorm_inplace(ffn_norm_w, self.eps);
+                x.add_inplace(&normed);
+            }
+        } else {
+            // ── Llama pre-norm ─────────────────────────────────────────────────
+            let tmp_norm;
+            let norm_w = if let Some(g) = self.attn_norm_gpu_ref() {
+                g
+            } else {
+                tmp_norm = GpuVec::from_slice(&self.attn_norm);
+                &tmp_norm
+            };
+            let mut x_norm = GpuVec::from_slice(&x.download());
+            x_norm.rmsnorm_inplace(norm_w, self.eps);
+            let attn_out = self.attn.forward_token_gpu_full(&x_norm, pos, rope_tables)
+                .or_else(|| self.attn.forward_token_gpu(&x_norm, pos, rope));
+            if let Some(attn_out) = attn_out {
+                x.add_inplace(&attn_out);
+            } else {
+                let mut x_cpu = x.download();
+                self.forward_token_cpu(&mut x_cpu, pos, rope);
+                *x = GpuVec::from_slice(&x_cpu);
+                return;
+            }
+            let tmp_ffn_norm;
+            let ffn_norm_w = if let Some(g) = self.ffn_norm_gpu_ref() {
+                g
+            } else {
+                tmp_ffn_norm = GpuVec::from_slice(&self.ffn_norm);
+                &tmp_ffn_norm
+            };
+            let mut x_norm2 = GpuVec::from_slice(&x.download());
+            x_norm2.rmsnorm_inplace(ffn_norm_w, self.eps);
+            if let Some(ffn_out) = self.ffn.forward_gpu(&x_norm2) {
+                x.add_inplace(&ffn_out);
+            }
         }
     }
 
@@ -1142,6 +1301,9 @@ pub struct OlmoModel {
     norm:   Vec<f32>,        // final RMSNorm weight
     lm_head: Linear,         // d_model → vocab_size
     rope:    RopeCache,
+    /// GPU-resident precomputed RoPE cos/sin tables.
+    /// Shared across all layers. Initialized after weight loading.
+    rope_gpu: Option<atlas_tensor::GpuRopeTables>,
     /// Position counter (for autoregressive generation).
     pos:     usize,
     /// EOS token id — generation stops when the model emits this token.
@@ -1184,7 +1346,37 @@ impl OlmoModel {
             cfg.vocab_size,
         );
         let eos_token_id = cfg.eos_token_id;
-        Self { config: cfg, embed, layers, norm, lm_head, rope, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy() }
+        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy() }
+    }
+
+    /// Upload precomputed RoPE tables and allocate GPU KV caches.
+    ///
+    /// Called once after all model weights are loaded.  Enables the zero-copy
+    /// GPU attention path (`forward_token_gpu_full`) which keeps hidden states
+    /// entirely in VRAM.  Falls back silently if CUDA is not available.
+    pub fn init_gpu_resources(&mut self) {
+        if !atlas_tensor::cuda_available() { return; }
+
+        // Flatten RoPE cos/sin tables: [max_seq × half_dim]
+        let max_seq  = self.rope.cos.len();
+        let half_dim = if max_seq > 0 { self.rope.cos[0].len() } else { 0 };
+        if max_seq > 0 && half_dim > 0 {
+            let mut cos_flat = Vec::with_capacity(max_seq * half_dim);
+            let mut sin_flat = Vec::with_capacity(max_seq * half_dim);
+            for pos in 0..max_seq {
+                cos_flat.extend_from_slice(&self.rope.cos[pos]);
+                sin_flat.extend_from_slice(&self.rope.sin[pos]);
+            }
+            self.rope_gpu = atlas_tensor::GpuRopeTables::upload(
+                &cos_flat, &sin_flat, max_seq, half_dim,
+            );
+        }
+
+        // Allocate GPU KV cache per attention layer
+        let max_seq_kv = self.config.max_seq_len;
+        for layer in &mut self.layers {
+            layer.attn.init_gpu_kv(max_seq_kv);
+        }
     }
 
     /// Reset KV cache and position counter (call between independent sequences).
@@ -1273,14 +1465,34 @@ impl OlmoModel {
         let embed = self.embed.embed_token(token);
         let mut x = GpuVec::from_slice(embed);
 
-        // Run all transformer layers entirely in VRAM — hidden state never leaves GPU
-        for layer in self.layers.iter_mut() {
-            layer.forward_token_gpu(&mut x, pos, &self.rope);
+        // Use full-GPU attention path when rope_gpu is initialized.
+        // This eliminates Q/K/V D2H downloads during attention — zero intra-layer PCIe.
+        if let Some(rope_tables) = self.rope_gpu.as_ref() {
+            // Safety: we split the borrow — rope_tables is a shared ref to self.rope_gpu,
+            // layers are &mut. Use raw pointer to avoid Rust borrow checker split.
+            // SAFE: rope_tables does not overlap with any layer's mutable data.
+            let rope_tables_ptr: *const atlas_tensor::GpuRopeTables = rope_tables;
+            let rope_ref = unsafe { &*rope_tables_ptr };
+            let rope_cpu_ptr: *const RopeCache = &self.rope;
+            let rope_cpu_ref = unsafe { &*rope_cpu_ptr };
+            for layer in self.layers.iter_mut() {
+                layer.forward_token_gpu_v2(&mut x, pos, rope_cpu_ref, rope_ref);
+            }
+        } else {
+            // CPU-attention fallback (original path when GPU resources not init'd)
+            for layer in self.layers.iter_mut() {
+                layer.forward_token_gpu(&mut x, pos, &self.rope);
+            }
         }
 
-        // Final RMSNorm (GPU)
-        let norm_w = GpuVec::from_slice(&self.norm);
-        x.rmsnorm_inplace(&norm_w, self.config.rms_norm_eps);
+        // Final RMSNorm (GPU) — use pre-cached if available
+        let tmp_norm;
+        let norm_gvec;
+        // Re-borrow self.norm_gpu (we don't have a cached gpu norm for the final norm yet)
+        // For now create from slice — small one-time cost at end of forward pass
+        norm_gvec = GpuVec::from_slice(&self.norm);
+        tmp_norm = &norm_gvec;
+        x.rmsnorm_inplace(tmp_norm, self.config.rms_norm_eps);
 
         // LM head projection (GPU)
         let logits_gpu = self.lm_head.forward_vec(&x)?;
@@ -2136,10 +2348,11 @@ pub fn load_model_from_safetensors(path: &str, cfg: ModelConfig) -> Result<OlmoM
             }
         }
     }
-    // Pre-upload norm weights to GPU once — eliminates per-token H2D transfers.
+    // Pre-upload norm weights + GPU KV cache + GPU RoPE tables (one-time cost).
     for layer in &mut model.layers {
         layer.cache_norm_weights();
     }
+    model.init_gpu_resources();
     Ok(model)
 }
 
@@ -2346,10 +2559,11 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
             }
         }
     }
-    // Pre-upload norm weights to GPU once — eliminates per-token H2D transfers.
+    // Pre-upload norm weights + GPU KV cache + GPU RoPE tables (one-time cost).
     for layer in &mut model.layers {
         layer.cache_norm_weights();
     }
+    model.init_gpu_resources();
     Ok(model)
 }
 

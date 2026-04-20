@@ -49,6 +49,41 @@ mod ffi {
         /// Rarely needed — use only when CPU must read GPU output without going
         /// through GpuVec::download() (which syncs implicitly via cudaMemcpy D2H).
         pub fn atlas_sync();
+
+        // ── GPU Decode Attention (Issue #18) ─────────────────────────────────
+        /// Per-head RMSNorm in-place: OLMo-2/3 QK-norm before RoPE.
+        /// x: [n_heads × head_dim], w: [n_heads × head_dim] (per-head weights).
+        pub fn atlas_qk_norm_inplace(
+            x: *mut f32, w: *const f32,
+            n_heads: c_int, head_dim: c_int, eps: f32,
+        );
+        /// Apply precomputed YaRN RoPE cos/sin tables to Q or K in-place.
+        /// x:       [n_heads × head_dim] in VRAM (f32)
+        /// cos_tab: [max_seq × half_dim] in VRAM
+        /// sin_tab: [max_seq × half_dim] in VRAM
+        pub fn atlas_rope_precomputed(
+            x: *mut f32,
+            cos_tab: *const f32, sin_tab: *const f32,
+            n_heads: c_int, head_dim: c_int, pos: c_int, max_seq: c_int,
+        );
+        /// Write new K,V into GPU KV cache at position `pos`.
+        pub fn atlas_kv_cache_write(
+            k_cache: *mut f32, v_cache: *mut f32,
+            new_k: *const f32, new_v: *const f32,
+            pos: c_int, n_kv_heads: c_int, head_dim: c_int,
+        );
+        /// Grouped-query decode attention: no Q,K,V PCIe transfers.
+        /// q:       [n_heads × head_dim]
+        /// k_cache: [max_seq × n_kv_heads × head_dim]
+        /// v_cache: [max_seq × n_kv_heads × head_dim]
+        /// out:     [n_heads × head_dim]
+        pub fn atlas_decode_attention(
+            q: *const f32,
+            k_cache: *const f32, v_cache: *const f32,
+            out: *mut f32,
+            n_heads: c_int, n_kv_heads: c_int, head_dim: c_int,
+            pos: c_int, scale: f32, window_size: c_int,
+        );
     }
 }
 
@@ -560,6 +595,159 @@ pub fn adamw_step_gpu(
         return true;
     }
     false
+}
+
+/// Apply per-head RMSNorm in-place on Q or K (OLMo-2/3 QK-norm).
+/// `x`: [n_heads × head_dim] in VRAM.
+/// `w`: [n_heads × head_dim] norm weights in VRAM.
+pub fn qk_norm_inplace_gpu(x: &mut GpuVec, w: &GpuVec, n_heads: usize, head_dim: usize, eps: f32) {
+    #[cfg(atlas_cuda)]
+    if let (Some(xp), Some(wp)) = (x.gpu_ptr_mut(), w.gpu_ptr()) {
+        unsafe {
+            ffi::atlas_qk_norm_inplace(xp, wp, n_heads as i32, head_dim as i32, eps);
+        }
+        return;
+    }
+    // CPU fallback: per-head RMSNorm
+    let n = n_heads * head_dim;
+    for h in 0..n_heads {
+        let s = h * head_dim;
+        let xe = &mut x.cpu[s..s + head_dim];
+        let we = &w.cpu[s..s + head_dim];
+        let rms_inv = (xe.iter().map(|&v| v * v).sum::<f32>() / head_dim as f32 + eps)
+            .sqrt()
+            .recip();
+        for i in 0..head_dim {
+            xe[i] = xe[i] * rms_inv * we[i];
+        }
+    }
+}
+
+// ── GPU KV Cache (decode attention without PCIe round-trips) ─────────────────
+
+/// Precomputed RoPE cos/sin tables resident in VRAM.
+///
+/// Uploaded once at model load. Eliminates CPU-side RoPE and the
+/// Q/K D2H + H2D round-trips that dominate decode latency.
+pub struct GpuRopeTables {
+    /// cos[pos × half_dim] — flat, row-major, in VRAM
+    pub cos: GpuVec,
+    /// sin[pos × half_dim] — flat, row-major, in VRAM
+    pub sin: GpuVec,
+    pub max_seq:  usize,
+    pub half_dim: usize,
+}
+
+impl GpuRopeTables {
+    /// Upload precomputed tables. `cos_flat` / `sin_flat` are each `max_seq × half_dim`.
+    pub fn upload(cos_flat: &[f32], sin_flat: &[f32], max_seq: usize, half_dim: usize) -> Option<Self> {
+        if !cuda_available() { return None; }
+        let cos = GpuVec::from_slice(cos_flat);
+        let sin = GpuVec::from_slice(sin_flat);
+        Some(Self { cos, sin, max_seq, half_dim })
+    }
+
+    /// Apply RoPE in-place to `x` (shape [n_heads × head_dim]) at position `pos`.
+    pub fn apply_to(&self, x: &mut GpuVec, n_heads: usize, head_dim: usize, pos: usize) {
+        #[cfg(atlas_cuda)]
+        if let (Some(xp), Some(cp), Some(sp)) = (x.gpu_ptr_mut(), self.cos.gpu_ptr(), self.sin.gpu_ptr()) {
+            unsafe {
+                ffi::atlas_rope_precomputed(
+                    xp, cp, sp,
+                    n_heads as i32, head_dim as i32, pos as i32, self.max_seq as i32,
+                );
+            }
+        }
+        // CPU fallback: do nothing (caller handles CPU path separately)
+    }
+}
+
+/// GPU-resident key-value cache for autoregressive decode.
+///
+/// Stores K and V for all past positions in VRAM. On A100 BF16:
+///   OLMo-3-7B, 4096 max context: 32 × 8 × 128 × 4096 × 4 B × 2 = 268 MB
+///
+/// All cache reads/writes stay in VRAM — zero PCIe transfers for attention.
+pub struct GpuKvCache {
+    /// keys:   [max_seq × n_kv_heads × head_dim] f32 in VRAM
+    pub keys:   GpuVec,
+    /// values: [max_seq × n_kv_heads × head_dim] f32 in VRAM
+    pub values: GpuVec,
+    pub max_seq:    usize,
+    pub n_kv_heads: usize,
+    pub head_dim:   usize,
+}
+
+impl GpuKvCache {
+    /// Allocate a zeroed GPU KV cache.
+    pub fn new(max_seq: usize, n_kv_heads: usize, head_dim: usize) -> Option<Self> {
+        if !cuda_available() { return None; }
+        let total = max_seq * n_kv_heads * head_dim;
+        let keys   = GpuVec::zeros(total);
+        let values = GpuVec::zeros(total);
+        Some(Self { keys, values, max_seq, n_kv_heads, head_dim })
+    }
+
+    /// Write new K and V vectors (size [n_kv_heads × head_dim]) at position `pos`.
+    pub fn write(&mut self, pos: usize, new_k: &GpuVec, new_v: &GpuVec) {
+        #[cfg(atlas_cuda)]
+        if let (Some(kp), Some(vp), Some(nkp), Some(nvp)) = (
+            self.keys.gpu_ptr_mut(), self.values.gpu_ptr_mut(),
+            new_k.gpu_ptr(), new_v.gpu_ptr()
+        ) {
+            unsafe {
+                ffi::atlas_kv_cache_write(
+                    kp, vp, nkp, nvp,
+                    pos as i32, self.n_kv_heads as i32, self.head_dim as i32,
+                );
+            }
+        }
+    }
+
+    /// Compute grouped-query decode attention. Returns output [n_heads × head_dim].
+    ///
+    /// `q`: [n_heads × head_dim] query vector (after RoPE).
+    /// `n_heads`: total Q heads (n_kv_heads × group).
+    /// `scale`: attention scale = 1/sqrt(head_dim) × attn_factor.
+    /// `window_size`: 0 for full attention, >0 for sliding window.
+    pub fn decode_attention(
+        &self,
+        q: &GpuVec,
+        n_heads: usize,
+        pos: usize,
+        scale: f32,
+        window_size: usize,
+    ) -> Option<GpuVec> {
+        #[cfg(atlas_cuda)]
+        if let (Some(qp), Some(kp), Some(vp)) = (q.gpu_ptr(), self.keys.gpu_ptr(), self.values.gpu_ptr()) {
+            let out_len = n_heads * self.head_dim;
+            if let Some(out_buf) = gpu::GpuBuf::alloc(out_len) {
+                unsafe {
+                    ffi::atlas_decode_attention(
+                        qp, kp, vp, out_buf.ptr,
+                        n_heads as i32, self.n_kv_heads as i32, self.head_dim as i32,
+                        pos as i32, scale, window_size as i32,
+                    );
+                }
+                return Some(GpuVec {
+                    buf: Some(out_buf),
+                    cpu: vec![0.0f32; out_len],
+                    len: out_len,
+                });
+            }
+        }
+        None
+    }
+
+    /// Reset cache for a new sequence (all positions → 0).
+    pub fn reset(&mut self) {
+        // Overwrite with zeros via CPU upload for correctness
+        // (GPU memset would be faster but this is called rarely)
+        let zeros_k = vec![0.0f32; self.max_seq * self.n_kv_heads * self.head_dim];
+        let zeros_v = zeros_k.clone();
+        self.keys   = GpuVec::from_slice(&zeros_k);
+        self.values = GpuVec::from_slice(&zeros_v);
+    }
 }
 
 // ── Tensor ─────────────────────────────────────────────────────────────────
