@@ -10,7 +10,7 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v4.0.9-success.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v4.1.0-success.svg)](#status)
 [![Tests](https://img.shields.io/badge/tests-579%2F579%20passing-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-21-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
@@ -36,6 +36,15 @@ It fuses four architectural innovations:
 | **GraphPalace** | Stigmergic memory | Pheromone-guided curriculum, O(1/√T) convergence |
 | **TRM-CausalValidator** | Recursive validator | 7M params, 0.1% compute, Quality Gate 6 |
 | **ZK Schnorr proofs** | Provenance chain | LLM output → live API, cryptographically verifiable |
+
+**v4.1.0** — Full GPU Attention Path + 61 tok/s BF16 (Issue #18):
+   - Vendor-fork mistral.rs SQLite philosophy: ATLAS owns every kernel
+   - StigmergicHook trait: per-layer pheromone deposits into GraphPalace
+   - GpuKvCache + GpuRopeTables: zero intra-layer PCIe transfers
+   - decode_attention_kernel: GQA attention entirely in VRAM
+   - CPU/GPU KV reset made NO-OP: eliminates 605ms overhead/generate()
+   - Performance: 15.4 → **61.7 tok/s** (OLMo-3-7B-Think, A100 BF16)
+   - Tests: **600** (was 579)
 
 **v4.0.0** — Champagnat n-morphic Framework + OLMo-3-7B Fix:
 - 🧬 **InvasionFitnessScorer** — morphic fitness f(y) = success − cost − Σcos_sim·n̄ (fixes pheromone saturation)

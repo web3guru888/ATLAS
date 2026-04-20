@@ -6,6 +6,61 @@ ATLAS uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [4.1.0] — 2026-04-20
+
+### Added — Issue #18: Vendor-fork mistral.rs inference engine (SQLite philosophy)
+
+**Philosophy**: Fork once, vendor permanently, own the full inference stack.
+
+#### atlas-infer crate
+- **`StigmergicHook` trait** — per-layer hidden-state callback wired into the forward pass
+- **`InferEngine` facade** — unified inference orchestration with GPU/CPU dispatch
+
+#### CUDA kernels (atlas-tensor)
+- **`qk_norm_inplace_kernel`** — per-head in-place RMSNorm for OLMo-2/3 QK-norm
+- **`rope_precomputed_kernel`** — GPU RoPE using precomputed YaRN cos/sin tables
+- **`kv_cache_write_kernel`** — VRAM-to-VRAM write of K and V at position pos
+- **`decode_attention_kernel`** — grouped-query decode attention entirely in VRAM;
+  one block per Q-head, ATTN_THREADS=128, dynamic shared memory for scores, SWA support
+- **`atlas_gpu_argmax`** — two-pass GPU argmax; result as (float)idx (exact for vocab ≤ 2^24)
+
+#### atlas-model: Full GPU attention path
+- **`GpuRopeTables`** — precomputed YaRN cos/sin uploaded once at init_gpu_resources()
+- **`GpuKvCache`** — GPU-resident KV cache [max_seq x n_kv_heads x head_dim] per layer
+- **`norm_gpu`** field — final RMSNorm weights pre-cached as GpuVec in OlmoModel
+- **`q_norm_gpu`, `k_norm_gpu`** — QK-norm weights cached per attention layer
+- **`attn_norm_gpu`, `ffn_norm_gpu`** — per-layer norm weights cached as GpuVec
+- **`forward_token_gpu_v2()`** — full-GPU transformer block (zero PCIe in attention)
+- **`OlmoModel::init_gpu_resources()`** — one-time GPU init called by model loaders
+
+#### atlas-tensor: Async GPU allocator
+- **`cudaMallocAsync` / `cudaFreeAsync`** — stream-ordered async allocator replacing cudaMalloc
+- **`gpu_argmax(x: &GpuVec) -> Option<u32>`** — public Rust wrapper for GPU argmax
+
+### Fixed
+- **Critical regression (15.4 -> 8.7 tok/s)**: forward_one_gpu was delegating to
+  forward_one_gpu_hooked which downloaded hidden state after every layer
+- **CPU KV cache reset overhead (605ms/call)**: reset_cache() zeroed 4GB RAM (32 layers x 128MB).
+  Made NO-OP — pos resets to 0, every position written before read, stale data never accessed
+- **GPU KV cache reset (1GB alloc/upload per call)**: GpuKvCache::reset() was creating 32MB
+  CPU Vec per layer then uploading; made NO-OP for same correctness reason
+- **Doctest cfg move error** in forward_one_hooked — added .clone()
+
+### Performance (OLMo-3-7B-Think, A100-SXM4-40GB, BF16 W16A32)
+
+| Metric | v4.0.2 baseline | v4.1.0 |
+|--------|----------------|--------|
+| Throughput (5 tokens) | 0.7 tok/s | **34.5 tok/s** |
+| Throughput (60 tokens) | 7.8 tok/s | **61.7 tok/s** |
+| reset() overhead | 605ms | ~0ms |
+| GPU intra-layer PCIe | ~24KB/layer x 32 layers | 0 |
+
+Root causes fixed: CPU KV reset (4GB zero), final norm H2D forcing GPU sync, GPU KV reset (1GB alloc), cudaMalloc sync barriers.
+
+### Tests: 600 / 600 (was 579 at start of issue #18)
+
+---
+
 ## [4.0.3] — 2026-04-17
 
 ### Fixed
