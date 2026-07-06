@@ -34,11 +34,13 @@ mod ffi {
         pub fn atlas_rope_apply_f32(x: *mut f32, pos: c_int, head_dim: c_int, theta_base: f32);
         pub fn atlas_silu_mul_f32(gate: *const f32, up: *const f32, out: *mut f32, n: c_int);
         pub fn atlas_vram_copy_f32(src: *const f32, dst: *mut f32, n: c_int);
+        /// AdamW step on HOST buffers (staged through device memory in C).
+        /// Returns 0 on success, non-zero CUDA error code on failure.
         pub fn atlas_adamw_step(
             param: *mut f32, m: *mut f32, v: *mut f32, grad: *const f32,
             lr: f32, beta1: f32, beta2: f32, eps: f32, wd: f32,
             bc1: f32, bc2: f32, n: c_int,
-        );
+        ) -> c_int;
         /// BF16 weight × F32 activation GEMM (W16A32).
         /// A_bf16[M,K] stored as uint16_t (BF16 bit pattern), B[K,N] F32, C[M,N] F32.
         pub fn atlas_sgemm_bf16_f32(
@@ -610,21 +612,37 @@ pub fn silu_mul_gpu(gate: &GpuVec, up: &GpuVec) -> GpuVec {
 
 /// Call the GPU AdamW step kernel for one parameter group.
 ///
-/// `param`, `m`, `v` are updated in-place.
-/// Returns true if GPU kernel was called, false if fell back to CPU.
+/// `param`, `m`, `v` are HOST pointers, updated in-place. The C wrapper
+/// stages them through device memory (H2D → kernel → D2H) and returns a
+/// CUDA error code, which is propagated here as `Err`.
+///
+/// Returns `Ok(true)` if the GPU kernel ran successfully, `Ok(false)` if
+/// CUDA is unavailable (caller should use the CPU path), and `Err` if the
+/// kernel or a memcpy failed — in which case host buffers for this group
+/// are unchanged (the D2H copy-back only happens after a successful kernel).
 pub fn adamw_step_gpu(
     param: *mut f32, m: *mut f32, v: *mut f32, grad: *const f32,
     lr: f32, beta1: f32, beta2: f32, eps: f32, wd: f32,
     bc1: f32, bc2: f32, n: usize,
-) -> bool {
+) -> Result<bool> {
     #[cfg(atlas_cuda)]
     if cuda_available() {
-        unsafe {
-            ffi::atlas_adamw_step(param, m, v, grad, lr, beta1, beta2, eps, wd, bc1, bc2, n as i32);
+        let code = unsafe {
+            ffi::atlas_adamw_step(param, m, v, grad, lr, beta1, beta2, eps, wd, bc1, bc2, n as i32)
+        };
+        if code != 0 {
+            return Err(AtlasError::Other(format!(
+                "CUDA adamw_step failed with error code {code} (see stderr for cudaGetErrorString)"
+            )));
         }
-        return true;
+        return Ok(true);
     }
-    false
+    #[cfg(not(atlas_cuda))]
+    {
+        // Silence unused-parameter warnings on CPU-only builds.
+        let _ = (param, m, v, grad, lr, beta1, beta2, eps, wd, bc1, bc2, n);
+    }
+    Ok(false)
 }
 
 /// Apply per-head RMSNorm in-place on Q or K (OLMo-2/3 QK-norm).

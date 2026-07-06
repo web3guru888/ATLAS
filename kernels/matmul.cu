@@ -460,9 +460,14 @@ static cublasHandle_t atlas_cublas(void) {
 
 extern "C" {
 
-/* Explicit drain — call only when you need all GPU work flushed to CPU. */
+/* Explicit drain — call only when you need all GPU work flushed to CPU.
+ * Logs (but cannot propagate) any pending async error from earlier kernels. */
 void atlas_sync(void) {
-    cudaDeviceSynchronize();
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[atlas-tensor] CUDA error surfaced in atlas_sync: %s (%d)\n",
+                cudaGetErrorString(err), (int)err);
+    }
 }
 
 /* ── F32 GEMM / GEMV ──────────────────────────────────────────────────────── */
@@ -543,17 +548,72 @@ void atlas_softmax_f32(const float* x, float* out, int rows, int cols) {
 
 /* ── Training ops (AdamW, quantize) — left synchronous for safety ────────── */
 
-void atlas_adamw_step(
+/* Check for pending CUDA errors after a kernel launch + sync.
+ * Logs to stderr and returns the error code (cudaSuccess == 0). */
+static cudaError_t atlas_check_cuda(const char* op) {
+    cudaError_t err = cudaGetLastError();
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[atlas-tensor] CUDA error in %s: %s (%d)\n",
+                op, cudaGetErrorString(err), (int)err);
+    }
+    return err;
+}
+
+/* AdamW step for one parameter group.
+ *
+ * IMPORTANT: `param`, `m`, `v`, `grad` are HOST pointers (optimizer state
+ * lives in host RAM in atlas-optim).  This wrapper stages them through
+ * device memory: H2D upload → kernel → D2H download of param/m/v.
+ *
+ * Historical bug (fixed 2026-07-06): host pointers were passed directly to
+ * the kernel, which faulted on every thread; the fault was never checked, so
+ * training silently applied ZERO weight updates while reporting success.
+ *
+ * Returns 0 on success, or the CUDA error code (non-zero) on failure so the
+ * Rust caller can propagate the error instead of assuming success. */
+int atlas_adamw_step(
     float* param, float* m, float* v, const float* grad,
     float lr, float beta1, float beta2, float eps, float wd,
     float bc1, float bc2, int n
 ) {
-    int threads = 256;
-    int blocks  = (n + threads - 1) / threads;
-    adamw_step_kernel<<<blocks, threads>>>(param, m, v, grad,
-        lr, beta1, beta2, eps, wd, bc1, bc2, n);
-    /* Training: sync to match historical behaviour and avoid out-of-order updates */
-    cudaDeviceSynchronize();
+    if (n <= 0) return 0;
+    size_t bytes = (size_t)n * sizeof(float);
+    float *d_param = NULL, *d_m = NULL, *d_v = NULL, *d_grad = NULL;
+    cudaError_t err = cudaSuccess;
+
+    do {
+        if ((err = cudaMalloc((void**)&d_param, bytes)) != cudaSuccess) break;
+        if ((err = cudaMalloc((void**)&d_m,     bytes)) != cudaSuccess) break;
+        if ((err = cudaMalloc((void**)&d_v,     bytes)) != cudaSuccess) break;
+        if ((err = cudaMalloc((void**)&d_grad,  bytes)) != cudaSuccess) break;
+
+        if ((err = cudaMemcpy(d_param, param, bytes, cudaMemcpyHostToDevice)) != cudaSuccess) break;
+        if ((err = cudaMemcpy(d_m,     m,     bytes, cudaMemcpyHostToDevice)) != cudaSuccess) break;
+        if ((err = cudaMemcpy(d_v,     v,     bytes, cudaMemcpyHostToDevice)) != cudaSuccess) break;
+        if ((err = cudaMemcpy(d_grad,  grad,  bytes, cudaMemcpyHostToDevice)) != cudaSuccess) break;
+
+        int threads = 256;
+        int blocks  = (n + threads - 1) / threads;
+        adamw_step_kernel<<<blocks, threads>>>(d_param, d_m, d_v, d_grad,
+            lr, beta1, beta2, eps, wd, bc1, bc2, n);
+        /* Training: sync + check so faults are surfaced, not swallowed. */
+        if ((err = atlas_check_cuda("atlas_adamw_step")) != cudaSuccess) break;
+
+        if ((err = cudaMemcpy(param, d_param, bytes, cudaMemcpyDeviceToHost)) != cudaSuccess) break;
+        if ((err = cudaMemcpy(m,     d_m,     bytes, cudaMemcpyDeviceToHost)) != cudaSuccess) break;
+        if ((err = cudaMemcpy(v,     d_v,     bytes, cudaMemcpyDeviceToHost)) != cudaSuccess) break;
+    } while (0);
+
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[atlas-tensor] atlas_adamw_step failed: %s (%d)\n",
+                cudaGetErrorString(err), (int)err);
+    }
+    if (d_param) cudaFree(d_param);
+    if (d_m)     cudaFree(d_m);
+    if (d_v)     cudaFree(d_v);
+    if (d_grad)  cudaFree(d_grad);
+    return (int)err;
 }
 
 void atlas_quantize_int8(
@@ -561,7 +621,7 @@ void atlas_quantize_int8(
     int n_rows, int n_cols
 ) {
     quantize_int8_kernel<<<n_rows, 32>>>(input, output, scale, n_rows, n_cols);
-    cudaDeviceSynchronize();
+    atlas_check_cuda("atlas_quantize_int8");
 }
 
 void atlas_dequantize_int8(
@@ -569,12 +629,12 @@ void atlas_dequantize_int8(
     int n_rows, int n_cols
 ) {
     dequantize_int8_kernel<<<n_rows, 32>>>(input, scale, output, n_rows, n_cols);
-    cudaDeviceSynchronize();
+    atlas_check_cuda("atlas_dequantize_int8");
 }
 
 void atlas_quantize_int4(const float* input, uint8_t* output, float* scale, int n) {
     quantize_int4_kernel<<<1, 32>>>(input, output, scale, n);
-    cudaDeviceSynchronize();
+    atlas_check_cuda("atlas_quantize_int4");
 }
 
 /* ── Device detection (needs sync to be reliable) ─────────────────────────── */

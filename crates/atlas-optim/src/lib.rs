@@ -185,8 +185,12 @@ impl AdamW {
 
     /// GPU-accelerated AdamW step. Calls the `atlas_adamw_step` CUDA kernel.
     ///
-    /// Returns true if GPU kernel was used, false if CUDA is not available
-    /// (in which case the standard CPU `step()` should be called instead).
+    /// Returns `Ok(true)` if the GPU kernel was used, `Ok(false)` if CUDA is
+    /// not available (in which case the standard CPU `step()` should be
+    /// called instead), and `Err` if the CUDA kernel or a device memcpy
+    /// failed. On `Err`, `self.step` has already been incremented and earlier
+    /// parameter groups may have been updated — treat the optimizer state as
+    /// suspect and fail the training step.
     ///
     /// `grads`: one `Vec<f32>` per parameter group, same layout as `step()`.
     pub fn step_gpu(&mut self, grads: &[Vec<f32>]) -> Result<bool> {
@@ -224,8 +228,10 @@ impl AdamW {
                 self.cfg.weight_decay,
                 bc1, bc2,
                 n,
-            );
+            )?;
             if !did_gpu {
+                // CUDA became unavailable mid-loop (should not happen after the
+                // cuda_available() check above, but stay defensive).
                 return Ok(false);
             }
         }

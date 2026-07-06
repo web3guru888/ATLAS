@@ -21,3 +21,10 @@ atlas-palace   = { path = "../atlas-palace" }
 atlas-zk       = { path = "../atlas-zk" }
 atlas-mcp      = { path = "../atlas-mcp" }
 atlas-api      = { path = "../atlas-api" }
+
+# cfg(atlas_cuda) is set by atlas-tensor's build.rs for that crate only.
+# atlas-cli references it via cfg!() for a status string; declare it so the
+# unexpected_cfgs lint does not warn. NOTE: it is never actually set for this
+# crate — the runtime nvidia-smi/device check is the authoritative signal.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(atlas_cuda)"] }
