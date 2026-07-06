@@ -756,61 +756,55 @@ void atlas_sgemm_bf16_f32(
     /* Async: downstream kernels on stream-0 wait automatically. */
 }
 
-/* ── Per-head QK RMSNorm (in-place) ──────────────────────────────────────── */
+/* ── QK RMSNorm (in-place, whole-vector) ─────────────────────────────────── */
 /*                                                                             */
-/* OLMo-2/3 applies a per-head RMSNorm to Q and K before RoPE.               */
-/* Implemented as n_heads blocks × head_dim threads.  Weights layout:         */
-/*   w[n_heads × head_dim] (i.e. per-head norm weights concatenated)          */
+/* OLMo-2/3 applies RMSNorm over the FULL concatenated Q (or K) projection —  */
+/* HF reference: Olmo3RMSNorm(num_attention_heads * head_dim) applied BEFORE  */
+/* the [heads, head_dim] reshape. One RMS statistic across ALL heads.         */
 /*                                                                             */
-/* xh[i] = xh[i] / rms(xh) × wh[i]  (in-place, no aliasing issue)           */
+/* (Fixed 2026-07-06: the previous implementation normalized PER-HEAD, which  */
+/* rescales each head's relative magnitude and corrupts attention — long-    */
+/* range retrieval heads were most affected.)                                 */
 __global__ void qk_norm_inplace_kernel(
     float* __restrict__ x,
     const float* __restrict__ w,
-    int n_heads, int head_dim, float eps
+    int n, float eps            /* n = n_heads * head_dim */
 ) {
-    int h = blockIdx.x;
-    if (h >= n_heads) return;
-
-    float* xh        = x + h * head_dim;
-    const float* wh  = w + h * head_dim;
     int tid = threadIdx.x;
 
-    /* Compute partial sum of squares. */
+    /* Partial sum of squares over the whole vector. */
     float sum = 0.0f;
-    for (int i = tid; i < head_dim; i += blockDim.x)
-        sum += xh[i] * xh[i];
+    for (int i = tid; i < n; i += blockDim.x)
+        sum += x[i] * x[i];
 
-    /* Warp-level reduce. */
-    int warp_lane = tid % 32;
-    int warp_n    = min(32, blockDim.x - (tid / 32) * 32);
-    unsigned mask = (warp_n >= 32) ? 0xffffffffu : ((1u << warp_n) - 1u);
-    for (int d = warp_n / 2; d > 0; d >>= 1)
-        sum += __shfl_down_sync(mask, sum, d);
+    /* Warp-level reduce (blockDim.x is a multiple of 32). */
+    for (int d = 16; d > 0; d >>= 1)
+        sum += __shfl_down_sync(0xffffffffu, sum, d);
 
-    /* Accumulate across warps via smem. */
     extern __shared__ float smem[];
-    if (warp_lane == 0) smem[tid / 32] = sum;
+    if ((tid & 31) == 0) smem[tid >> 5] = sum;
     __syncthreads();
     if (tid == 0) {
         float total = 0.0f;
-        for (int w = 0; w < (blockDim.x + 31) / 32; w++) total += smem[w];
-        smem[0] = rsqrtf(total / (float)head_dim + eps);
+        for (int i = 0; i < (blockDim.x + 31) / 32; i++) total += smem[i];
+        smem[0] = rsqrtf(total / (float)n + eps);
     }
     __syncthreads();
     float rms_inv = smem[0];
 
     /* Apply in-place. */
-    for (int i = tid; i < head_dim; i += blockDim.x)
-        xh[i] = xh[i] * rms_inv * wh[i];
+    for (int i = tid; i < n; i += blockDim.x)
+        x[i] = x[i] * rms_inv * w[i];
 }
 
 void atlas_qk_norm_inplace(
     float* x, const float* w,
     int n_heads, int head_dim, float eps
 ) {
-    int threads  = (head_dim < 128) ? head_dim : 128;
-    int smem     = ((threads + 31) / 32) * sizeof(float);
-    qk_norm_inplace_kernel<<<n_heads, threads, smem>>>(x, w, n_heads, head_dim, eps);
+    int n       = n_heads * head_dim;
+    int threads = 256;
+    int smem    = ((threads + 31) / 32) * sizeof(float);
+    qk_norm_inplace_kernel<<<1, threads, smem>>>(x, w, n, eps);
     atlas_note_launch_err("atlas_qk_norm_inplace");
 }
 

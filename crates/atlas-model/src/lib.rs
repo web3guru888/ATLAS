@@ -364,8 +364,10 @@ struct RopeCache {
     cos: Vec<Vec<f32>>,
     /// sin[pos][i]
     sin: Vec<Vec<f32>>,
-    /// Attention score multiplier from YaRN `attention_factor` (1.0 for standard RoPE).
-    /// Applied as: scale = attn_scale_factor / sqrt(head_dim).
+    /// Attention score multiplier derived from YaRN `attention_factor`
+    /// (1.0 for standard RoPE). Stored SQUARED because HF applies the factor
+    /// to the cos/sin tables (touching both q and k); we apply it once at
+    /// score level: scale = attn_scale_factor / sqrt(head_dim).
     pub attn_scale_factor: f32,
 }
 
@@ -382,32 +384,48 @@ impl RopeCache {
         let two_pi = 2.0 * std::f32::consts::PI;
 
         // Compute per-dimension frequencies (potentially YaRN-scaled).
-        let freqs: Vec<f32> = (0..half).map(|i| {
-            let base_freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
-            match scaling {
-                RopeScaling::None => base_freq,
-                RopeScaling::Yarn { factor, orig_max_pos, beta_fast, beta_slow, .. } => {
-                    let wavelength = two_pi / base_freq;
-                    // Boundaries from Peng et al. Algorithm 1
-                    let low  = *orig_max_pos as f32 / (two_pi * beta_slow);  // low-freq
-                    let high = *orig_max_pos as f32 / (two_pi * beta_fast);  // high-freq
-                    if wavelength < high {
-                        // High-frequency dims: use original frequency
-                        base_freq
-                    } else if wavelength > low {
-                        // Low-frequency dims: full interpolation
-                        base_freq / factor
-                    } else {
-                        // Mid-frequency: linear ramp between no-scaling and full-scaling
-                        let alpha = (wavelength - high) / (low - high);
-                        base_freq / (alpha * factor + (1.0 - alpha))
-                    }
-                }
+        //
+        // YaRN reference (Peng et al. 2023, §3.4; matches HF transformers
+        // `_compute_yarn_parameters`): the correction range is computed in
+        // DIMENSION-INDEX space via the log formula, and the ramp between
+        // extrapolation (no scaling) and interpolation (÷factor) is linear
+        // in the dimension index — NOT in wavelength.
+        //
+        // The previous implementation compared wavelengths λ = 2π/f against
+        // boundaries orig_max/(2π·β), conflating 1/f with λ (an extra 2π),
+        // and ramped linearly in wavelength. Result: 25 of 64 dims got wrong
+        // frequencies for OLMo-3, with RoPE angle error growing linearly in
+        // position (~1.6 rad by pos 100) — output quality collapsed into
+        // word salad beyond ~100–200 tokens of total sequence length.
+        let freqs: Vec<f32> = match scaling {
+            RopeScaling::None => (0..half)
+                .map(|i| 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32))
+                .collect(),
+            RopeScaling::Yarn { factor, orig_max_pos, beta_fast, beta_slow, .. } => {
+                let d = head_dim as f32;
+                let ln_theta = theta.ln();
+                // Dimension index whose inv-freq completes `num_rot` full
+                // rotations over the original (pre-extension) context length.
+                let corr_dim = |num_rot: f32| -> f32 {
+                    (d * (*orig_max_pos as f32 / (num_rot * two_pi)).ln()) / (2.0 * ln_theta)
+                };
+                let low  = corr_dim(*beta_fast).floor().max(0.0);          // below: extrapolate (no scale)
+                let high = corr_dim(*beta_slow).ceil().min(d - 1.0);       // above: interpolate (÷factor)
+                let denom = (high - low).max(0.001);
+                (0..half).map(|i| {
+                    let base_freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+                    // ramp ∈ [0,1]: 0 → pure extrapolation, 1 → full interpolation
+                    let ramp = ((i as f32 - low) / denom).clamp(0.0, 1.0);
+                    base_freq * (1.0 - ramp) + (base_freq / factor) * ramp
+                }).collect()
             }
-        }).collect();
+        };
 
+        // HF applies `attention_factor` by scaling the cos/sin tables, which
+        // touches BOTH q and k — so QK^T logits are scaled by attn_factor².
+        // We apply it once at the attention-score level, hence the square.
         let attn_scale_factor = match scaling {
-            RopeScaling::Yarn { attn_factor, .. } => *attn_factor,
+            RopeScaling::Yarn { attn_factor, .. } => attn_factor * attn_factor,
             RopeScaling::None => 1.0,
         };
 
@@ -674,17 +692,14 @@ impl Attention {
         self.wv.forward(x, &mut v);
 
         // OLMo-2/3 QK-norm: per-head RMSNorm on Q and K BEFORE RoPE
+        // QK-norm is applied over the FULL concatenated projection (one RMS
+        // statistic across all heads) — HF: Olmo3RMSNorm(n_heads * head_dim)
+        // applied BEFORE the per-head reshape. NOT per-head.
         if !self.q_norm.is_empty() {
-            for h in 0..self.n_heads {
-                let s = h * self.head_dim;
-                rmsnorm_inplace(&mut q[s..s+self.head_dim], &self.q_norm[s..s+self.head_dim], 1e-6);
-            }
+            rmsnorm_inplace(&mut q, &self.q_norm, 1e-6);
         }
         if !self.k_norm.is_empty() {
-            for h in 0..self.n_kv_heads {
-                let s = h * self.head_dim;
-                rmsnorm_inplace(&mut k[s..s+self.head_dim], &self.k_norm[s..s+self.head_dim], 1e-6);
-            }
+            rmsnorm_inplace(&mut k, &self.k_norm, 1e-6);
         }
 
         // Apply RoPE to each Q head
@@ -770,19 +785,14 @@ impl Attention {
         let mut k = k_gpu.download();
         let     v = v_gpu.download();
 
-        // OLMo-2 QK-norm: per-head RMSNorm on Q and K before RoPE
-        // Each head has its own norm weights: q_norm[h*head_dim..(h+1)*head_dim]
+        // QK-norm is applied over the FULL concatenated projection (one RMS
+        // statistic across all heads) — HF: Olmo3RMSNorm(n_heads * head_dim)
+        // applied BEFORE the per-head reshape. NOT per-head.
         if !self.q_norm.is_empty() {
-            for h in 0..self.n_heads {
-                let s = h * self.head_dim;
-                rmsnorm_inplace(&mut q[s..s+self.head_dim], &self.q_norm[s..s+self.head_dim], 1e-6);
-            }
+            rmsnorm_inplace(&mut q, &self.q_norm, 1e-6);
         }
         if !self.k_norm.is_empty() {
-            for h in 0..self.n_kv_heads {
-                let s = h * self.head_dim;
-                rmsnorm_inplace(&mut k[s..s+self.head_dim], &self.k_norm[s..s+self.head_dim], 1e-6);
-            }
+            rmsnorm_inplace(&mut k, &self.k_norm, 1e-6);
         }
 
         // Apply RoPE
@@ -1435,10 +1445,19 @@ pub struct OlmoModel {
     layers: Vec<TransformerBlock>,
     norm:   Vec<f32>,        // final RMSNorm weight
     lm_head: Linear,         // d_model → vocab_size
+    /// RoPE tables for FULL-attention layers. Per HF `configuration_olmo3.py`
+    /// (`convert_rope_params_to_dict`), the old-format `rope_scaling` (YaRN)
+    /// applies ONLY to `full_attention` layers.
     rope:    RopeCache,
-    /// GPU-resident precomputed RoPE cos/sin tables.
-    /// Shared across all layers. Initialized after weight loading.
+    /// RoPE tables for SLIDING-window layers: standard (unscaled) RoPE with
+    /// the same theta. For models without SWA or without rope_scaling this
+    /// is identical to `rope`.
+    rope_local: RopeCache,
+    /// GPU-resident precomputed RoPE cos/sin tables (full-attention layers).
+    /// Initialized after weight loading.
     rope_gpu: Option<atlas_tensor::GpuRopeTables>,
+    /// GPU-resident RoPE tables for sliding-window layers (unscaled).
+    rope_local_gpu: Option<atlas_tensor::GpuRopeTables>,
     /// GPU-resident final RMSNorm weights — cached to avoid per-token H2D upload.
     norm_gpu: Option<atlas_tensor::GpuVec>,
     /// Position counter (for autoregressive generation).
@@ -1461,15 +1480,24 @@ impl OlmoModel {
     pub fn new(cfg: ModelConfig) -> Self {
         let head_dim = cfg.d_model / cfg.n_heads;
         // Fix B: build RopeCache with YaRN scaling if configured.
+        // YaRN applies only to full-attention layers (HF Olmo3 reference);
+        // sliding-window layers always use standard RoPE at the same theta.
         let rope = RopeCache::new(head_dim, cfg.max_seq_len, cfg.rope_theta, &cfg.rope_scaling);
+        let rope_local = RopeCache::new(head_dim, cfg.max_seq_len, cfg.rope_theta, &RopeScaling::None);
         let embed = Embedding::new(cfg.vocab_size, cfg.d_model, 0);
         let mut layers: Vec<_> = (0..cfg.n_layers)
             .map(|i| TransformerBlock::new(&cfg, i))
             .collect();
-        // Fix B: multiply attention scale by YaRN attn_factor (1.0 for standard RoPE).
+        // Fix B: multiply attention scale by YaRN attn_factor² (1.0 for standard
+        // RoPE). Applies ONLY to full-attention layers — sliding layers use
+        // unscaled RoPE and therefore unscaled attention (HF Olmo3 reference).
         if (rope.attn_scale_factor - 1.0).abs() > 1e-6 {
-            for layer in &mut layers {
-                layer.attn.scale *= rope.attn_scale_factor;
+            for (i, layer) in layers.iter_mut().enumerate() {
+                let is_sliding = cfg.layer_types.get(i)
+                    .map_or(false, |lt| *lt == LayerType::Sliding);
+                if !is_sliding {
+                    layer.attn.scale *= rope.attn_scale_factor;
+                }
             }
         }
         // Fix A: wire sliding window size for each SWA layer.
@@ -1488,7 +1516,7 @@ impl OlmoModel {
             cfg.vocab_size,
         );
         let eos_token_id = cfg.eos_token_id;
-        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy(), gpu_poisoned: false }
+        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_local, rope_gpu: None, rope_local_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy(), gpu_poisoned: false }
     }
 
     /// Upload precomputed RoPE tables and allocate GPU KV caches.
@@ -1499,20 +1527,27 @@ impl OlmoModel {
     pub fn init_gpu_resources(&mut self) {
         if !atlas_tensor::cuda_available() { return; }
 
-        // Flatten RoPE cos/sin tables: [max_seq × half_dim]
-        let max_seq  = self.rope.cos.len();
-        let half_dim = if max_seq > 0 { self.rope.cos[0].len() } else { 0 };
-        if max_seq > 0 && half_dim > 0 {
+        // Flatten RoPE cos/sin tables: [max_seq × half_dim].
+        // Two sets: YaRN-scaled (full-attention layers) and standard
+        // (sliding-window layers).
+        let upload_tables = |cache: &RopeCache| -> Option<atlas_tensor::GpuRopeTables> {
+            let max_seq  = cache.cos.len();
+            let half_dim = if max_seq > 0 { cache.cos[0].len() } else { 0 };
+            if max_seq == 0 || half_dim == 0 { return None; }
             let mut cos_flat = Vec::with_capacity(max_seq * half_dim);
             let mut sin_flat = Vec::with_capacity(max_seq * half_dim);
             for pos in 0..max_seq {
-                cos_flat.extend_from_slice(&self.rope.cos[pos]);
-                sin_flat.extend_from_slice(&self.rope.sin[pos]);
+                cos_flat.extend_from_slice(&cache.cos[pos]);
+                sin_flat.extend_from_slice(&cache.sin[pos]);
             }
-            self.rope_gpu = atlas_tensor::GpuRopeTables::upload(
-                &cos_flat, &sin_flat, max_seq, half_dim,
-            );
-        }
+            atlas_tensor::GpuRopeTables::upload(&cos_flat, &sin_flat, max_seq, half_dim)
+        };
+        self.rope_gpu = upload_tables(&self.rope);
+        self.rope_local_gpu = upload_tables(&self.rope_local);
+        // The full-GPU path needs BOTH table sets — if the local one failed
+        // to upload, disable the fast path entirely rather than silently
+        // applying YaRN to sliding layers.
+        if self.rope_local_gpu.is_none() { self.rope_gpu = None; }
 
         // Upload final RMSNorm weights to GPU (eliminates per-token H2D after layers)
         self.norm_gpu = Some(atlas_tensor::GpuVec::from_slice(&self.norm));
@@ -1571,8 +1606,12 @@ impl OlmoModel {
         self.pos += 1;
 
         let mut x: Vec<f32> = self.embed.embed_token(token).to_vec();
+        let rope_full:  *const RopeCache = &self.rope;
+        let rope_local: *const RopeCache = &self.rope_local;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            layer.forward_token(&mut x, pos, &self.rope);
+            // Sliding-window layers use unscaled RoPE; full layers use YaRN.
+            let rope = unsafe { if layer.attn.window_size.is_some() { &*rope_local } else { &*rope_full } };
+            layer.forward_token(&mut x, pos, rope);
             // StigmergicHook: call after post-residual hidden state is ready.
             // The return value is handed back to the caller for pheromone
             // deposit aggregation — the model itself is hook-agnostic.
@@ -1648,21 +1687,31 @@ impl OlmoModel {
 
         // Use full-GPU attention path when rope_gpu is initialized.
         // This eliminates Q/K/V D2H downloads during attention — zero intra-layer PCIe.
-        if let Some(rope_tables) = self.rope_gpu.as_ref() {
+        if let (Some(rope_tables), Some(rope_tables_local)) =
+            (self.rope_gpu.as_ref(), self.rope_local_gpu.as_ref())
+        {
             // Safety: we split the borrow — rope_tables is a shared ref to self.rope_gpu,
             // layers are &mut. Use raw pointer to avoid Rust borrow checker split.
             // SAFE: rope_tables does not overlap with any layer's mutable data.
-            let rope_tables_ptr: *const atlas_tensor::GpuRopeTables = rope_tables;
-            let rope_ref = unsafe { &*rope_tables_ptr };
-            let rope_cpu_ptr: *const RopeCache = &self.rope;
-            let rope_cpu_ref = unsafe { &*rope_cpu_ptr };
+            let rt_full:  *const atlas_tensor::GpuRopeTables = rope_tables;
+            let rt_local: *const atlas_tensor::GpuRopeTables = rope_tables_local;
+            let rc_full:  *const RopeCache = &self.rope;
+            let rc_local: *const RopeCache = &self.rope_local;
             for layer in self.layers.iter_mut() {
+                // Sliding layers → unscaled RoPE; full layers → YaRN tables.
+                let sliding = layer.attn.window_size.is_some();
+                let (rope_cpu_ref, rope_ref) = unsafe {
+                    if sliding { (&*rc_local, &*rt_local) } else { (&*rc_full, &*rt_full) }
+                };
                 layer.forward_token_gpu_v2(&mut x, pos, rope_cpu_ref, rope_ref);
             }
         } else {
             // CPU-attention fallback (original path when GPU resources not init'd)
+            let rc_full:  *const RopeCache = &self.rope;
+            let rc_local: *const RopeCache = &self.rope_local;
             for layer in self.layers.iter_mut() {
-                layer.forward_token_gpu(&mut x, pos, &self.rope);
+                let rope = unsafe { if layer.attn.window_size.is_some() { &*rc_local } else { &*rc_full } };
+                layer.forward_token_gpu(&mut x, pos, rope);
             }
         }
 
@@ -1712,8 +1761,11 @@ impl OlmoModel {
         let mut x = GpuVec::from_slice(embed);
 
         // Run all transformer layers entirely in VRAM
+        let rc_full:  *const RopeCache = &self.rope;
+        let rc_local: *const RopeCache = &self.rope_local;
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            layer.forward_token_gpu(&mut x, pos, &self.rope);
+            let rope = unsafe { if layer.attn.window_size.is_some() { &*rc_local } else { &*rc_full } };
+            layer.forward_token_gpu(&mut x, pos, rope);
 
             // StigmergicHook: download hidden state so the hook can read it.
             // ~16 KB per layer for d=4096 f32 model.
@@ -3614,76 +3666,129 @@ mod tests {
 
     // ── Fix B: YaRN RoPE unit tests ───────────────────────────────────────────
 
-    /// YaRN scales low-frequency dimensions (long wavelength) by 1/factor, leaves
-    /// high-frequency dimensions (short wavelength) unscaled, and ramps linearly for mid.
-    /// Verify against reference for OLMo-3 params: factor=8, orig_max=8192, beta_fast=32, beta_slow=1.
+    /// YaRN must match the HF-transformers reference (`_compute_yarn_parameters`)
+    /// for OLMo-3 params: factor=8, orig_max=8192, beta_fast=32, beta_slow=1,
+    /// theta=500000, head_dim=128. Correction range in dim-index space is
+    /// low=18, high=35; the ramp is linear in the dimension index.
+    /// Reference frequencies below were computed independently with the
+    /// published YaRN formula (Peng et al. 2023 / HF transformers).
     #[test]
-    fn yarn_rope_scale_factors_olmo3() {
+    fn yarn_rope_matches_hf_reference_olmo3() {
         let head_dim = 128usize;     // OLMo-3 head dim = 4096/32
         let theta    = 500_000.0f32;
         let factor   = 8.0f32;
         let orig_max = 8192usize;
         let beta_fast = 32.0f32;
         let beta_slow = 1.0f32;
-        let attn_factor = 1.2079f32;
-        let two_pi = 2.0 * std::f32::consts::PI;
-        let low_bound  = orig_max as f32 / (two_pi * beta_slow);
-        let high_bound = orig_max as f32 / (two_pi * beta_fast);
+        let attn_factor = 1.207_944_2_f32; // 0.1·ln(8)+1
 
         let yarn = RopeScaling::Yarn { factor, orig_max_pos: orig_max,
                                        attn_factor, beta_fast, beta_slow };
-        let std_rope = RopeScaling::None;
+        let yarn_cache = RopeCache::new(head_dim, 8, theta, &yarn);
+        let std_cache  = RopeCache::new(head_dim, 8, theta, &RopeScaling::None);
 
-        let yarn_cache = RopeCache::new(head_dim, 256, theta, &yarn);
-        let std_cache  = RopeCache::new(head_dim, 256, theta, &std_rope);
+        // attention_factor scales cos/sin in HF (hits both q and k), so the
+        // single score-level multiplier must be attn_factor².
+        assert!((yarn_cache.attn_scale_factor - attn_factor * attn_factor).abs() < 1e-4,
+            "attn_scale_factor={} expected {}", yarn_cache.attn_scale_factor, attn_factor * attn_factor);
+        assert!((std_cache.attn_scale_factor - 1.0).abs() < 1e-6);
 
-        // attn_scale_factor: YaRN cache should return 1.2079, standard should return 1.0
-        assert!((yarn_cache.attn_scale_factor - attn_factor).abs() < 1e-4,
-            "attn_scale_factor={} expected {attn_factor}", yarn_cache.attn_scale_factor);
-        assert!((std_cache.attn_scale_factor - 1.0).abs() < 1e-6,
-            "std attn_scale_factor should be 1.0");
+        // Recover per-dim frequency from the pos=1 tables: f = atan2(sin, cos).
+        let freq_at = |cache: &RopeCache, j: usize| -> f32 {
+            cache.sin[1][j].atan2(cache.cos[1][j])
+        };
 
-        let half = head_dim / 2;
-        let mut n_unscaled = 0usize;  // high-freq: YaRN ≈ standard
-        let mut n_scaled   = 0usize;  // low-freq:  YaRN ≈ standard / factor
-
-        for i in 0..half {
-            let base_freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
-            let wavelength = two_pi / base_freq;
-
-            // Compare at pos=100 (arbitrary non-zero position)
-            let pos = 100usize;
-            let yarn_cos = yarn_cache.cos[pos][i];
-            let std_cos  = std_cache.cos[pos][i];
-
-            if wavelength < high_bound {
-                // High-freq: no scaling — angles should be equal
-                let diff = (yarn_cos - std_cos).abs();
-                assert!(diff < 1e-4,
-                    "dim {i} (high-freq wavelength={wavelength:.1}): YaRN cos != std cos, diff={diff:.6}");
-                n_unscaled += 1;
-            } else if wavelength > low_bound {
-                // Low-freq: full interpolation — YaRN angle = std_angle / factor
-                let std_angle  = pos as f32 * base_freq;
-                let yarn_angle = pos as f32 * (base_freq / factor);
-                let expected_cos = yarn_angle.cos();
-                let diff = (yarn_cos - expected_cos).abs();
-                assert!(diff < 1e-4,
-                    "dim {i} (low-freq wavelength={wavelength:.1}): YaRN cos diff={diff:.6}");
-                // YaRN and standard should be measurably different (unless the angle wraps to same)
-                let angle_diff = (yarn_angle - std_angle).abs();
-                if angle_diff > 0.01 {
-                    assert!((yarn_cos - std_cos).abs() > 1e-5,
-                        "dim {i}: low-freq but YaRN≈standard (angle_diff={angle_diff:.4})");
-                }
-                n_scaled += 1;
-            }
-            // Mid-freq: intermediate — just verify the cache produces finite values
-            assert!(yarn_cos.is_finite(), "dim {i}: non-finite YaRN cos");
+        // (dim index, expected YaRN frequency) — independent reference values.
+        let reference: &[(usize, f32)] = &[
+            (0,  1.0),
+            (10, 1.286_873_7e-1),
+            (17, 3.063_452_1e-2),  // last unscaled dim (ramp = 0 through j=18)
+            (18, 2.495_540_9e-2),
+            (25, 3.800_320_2e-3),  // mid-ramp
+            (30, 8.148_398_2e-4),  // mid-ramp
+            (34, 1.656_130_4e-4),  // near end of ramp
+            (35, 9.556_212_4e-5),  // full interpolation from here on
+            (40, 3.428_102_2e-5),
+            (63, 3.068_926_0e-7),
+        ];
+        for &(j, expected) in reference {
+            let got = freq_at(&yarn_cache, j);
+            let rel = ((got - expected) / expected).abs();
+            assert!(rel < 1e-3,
+                "dim {j}: yarn freq {got:.6e} != reference {expected:.6e} (rel err {rel:.2e})");
         }
-        eprintln!("  yarn_rope: {n_unscaled} high-freq (no-scale), {n_scaled} low-freq (÷{factor}) dims");
-        assert!(n_unscaled > 0, "no high-frequency dimensions found");
-        assert!(n_scaled   > 0, "no low-frequency dimensions found");
+
+        // Dims below the correction range must exactly match standard RoPE.
+        for j in 0..=17 {
+            let y = freq_at(&yarn_cache, j);
+            let s = freq_at(&std_cache, j);
+            assert!(((y - s) / s).abs() < 1e-5, "dim {j}: should be unscaled");
+        }
+        // Dims above the correction range must be standard/8.
+        for j in 35..(head_dim / 2) {
+            let y = freq_at(&yarn_cache, j);
+            let s = freq_at(&std_cache, j);
+            assert!(((y - s / factor) / (s / factor)).abs() < 1e-3,
+                "dim {j}: should be fully interpolated (÷{factor})");
+        }
+    }
+
+    /// GPU vs CPU parity over a LONG sequence (uses seeded random weights).
+    /// Feeds the same 300-token stream through the CPU path (`forward_one`)
+    /// and the GPU path (`forward_one_gpu`) of two identically-seeded models
+    /// and reports the first position where logits diverge. Guards against
+    /// position-dependent GPU attention/rope/cache bugs that short tests miss.
+    #[test]
+    fn gpu_cpu_parity_long_sequence() {
+        if !atlas_tensor::cuda_available() {
+            eprintln!("  [skip] CUDA not available");
+            return;
+        }
+        let mut cfg = ModelConfig::tiny();
+        cfg.max_seq_len = 512;
+        cfg.n_layers = 2;
+        cfg.layer_types = vec![LayerType::Sliding, LayerType::Full];
+        cfg.sliding_window = Some(96); // exercise the SWA mask past pos 96
+        cfg.rope_theta = 500_000.0;
+        cfg.rope_scaling = RopeScaling::Yarn {
+            factor: 8.0, orig_max_pos: 8192,
+            attn_factor: 1.207_944_2, beta_fast: 32.0, beta_slow: 1.0,
+        };
+
+        let mut m_cpu = OlmoModel::new(cfg.clone());
+        let mut m_gpu = OlmoModel::new(cfg.clone());
+        m_gpu.init_gpu_resources();
+        eprintln!("  rope_gpu={} rope_local_gpu={} gpu_kv0={} kv_on_gpu={}",
+            m_gpu.rope_gpu.is_some(), m_gpu.rope_local_gpu.is_some(),
+            m_gpu.layers[0].attn.gpu_kv.is_some(),
+            m_gpu.layers[0].attn.gpu_kv.as_ref().map_or(false, |kv| kv.keys.is_on_gpu()));
+
+        m_cpu.reset();
+        m_gpu.reset();
+
+        let mut first_diverge: Option<(usize, f32)> = None;
+        let mut worst: f32 = 0.0;
+        for pos in 0..300usize {
+            let tok = ((pos * 2654435761) % 256) as u32;
+            let l_cpu = m_cpu.forward_one(tok);
+            let l_gpu = match m_gpu.forward_one_gpu(tok) {
+                Some(l) => l,
+                None => { eprintln!("  [skip] GPU path unavailable at pos {pos} (VRAM?)"); return; }
+            };
+            let mut max_d = 0.0f32;
+            for (a, b) in l_cpu.iter().zip(l_gpu.iter()) {
+                let d = (a - b).abs();
+                if d > max_d { max_d = d; }
+            }
+            if max_d > worst { worst = max_d; }
+            if max_d > 5e-2 && first_diverge.is_none() {
+                first_diverge = Some((pos, max_d));
+            }
+        }
+        eprintln!("  gpu_cpu_parity: worst logit diff over 300 pos = {worst:.6}");
+        if let Some((pos, d)) = first_diverge {
+            panic!("GPU/CPU logits diverge starting at pos {pos} (max diff {d:.4})");
+        }
     }
 
     // ── Fix A: Sliding Window Attention unit tests ────────────────────────────
@@ -4713,30 +4818,34 @@ mod tests {
         let yarn_cache = RopeCache::new(head_dim, 16, theta, &scaling);
         let std_cache  = RopeCache::new(head_dim, 16, theta, &RopeScaling::None);
 
-        let low_boundary  = orig_max as f32 / (two_pi * beta_slow);
-        let high_boundary = orig_max as f32 / (two_pi * beta_fast);
+        // HF-reference correction range in dim-index space (log formula):
+        // low = floor(corr(beta_fast)) = 18, high = ceil(corr(beta_slow)) = 35.
+        let ln_theta = theta.ln();
+        let corr = |num_rot: f32| (head_dim as f32
+            * (orig_max as f32 / (num_rot * two_pi)).ln()) / (2.0 * ln_theta);
+        let low_idx  = corr(beta_fast).floor().max(0.0) as usize;   // 18
+        let high_idx = corr(beta_slow).ceil() as usize;              // 35
+        assert_eq!(low_idx, 18);
+        assert_eq!(high_idx, 35);
 
         for i in 0..half {
-            let base_freq  = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
-            let wavelength = two_pi / base_freq;
-            // At pos=1 the angle = freq (small enough to use acos safely)
-            // Instead compare the raw cos/sin at pos=2 to avoid acos precision issues
-            // For high-freq: yarn_cos[2][i] ≈ std_cos[2][i]
-            // For low-freq:  yarn angle = std angle / factor → cos values differ
-            if wavelength < high_boundary {
+            // Compare the raw cos at pos=2 to avoid acos precision issues.
+            // Dims below the ramp: yarn_cos[2][i] must equal std_cos[2][i].
+            // Dims at/above `high_idx`: angle = std angle / factor.
+            if i < low_idx {
                 let diff = (yarn_cache.cos[2][i] - std_cache.cos[2][i]).abs();
                 assert!(diff < 0.05, "dim {i} (high-freq): cos diff={diff:.4}");
-            } else if wavelength > low_boundary && i > 0 {
-                // Low-freq: scaled angle = std_angle / factor
-                // Check that yarn_cache rotates slower than std_cache
-                // cos(x/factor) > cos(x) for x in (0,pi) since smaller angle → closer to 1
+            } else if i >= high_idx {
+                // Low-freq: yarn rotates slower; cos(x/factor) >= cos(x) for small x
                 let yarn_c = yarn_cache.cos[2][i];
                 let std_c  = std_cache.cos[2][i];
                 assert!(yarn_c >= std_c - 0.01,
                     "dim {i} (low-freq): YaRN should rotate slower; yarn={yarn_c:.4} std={std_c:.4}");
             }
         }
-        assert!((yarn_cache.attn_scale_factor - attn_f).abs() < 1e-5);
+        // attention_factor scales cos/sin (both q and k) in HF -> score-level
+        // multiplier is the square.
+        assert!((yarn_cache.attn_scale_factor - attn_f * attn_f).abs() < 1e-4);
         assert!((std_cache.attn_scale_factor - 1.0).abs() < 1e-6);
     }
 
