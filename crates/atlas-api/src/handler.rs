@@ -108,6 +108,21 @@ pub fn http_json_response_with(
     .into_bytes()
 }
 
+/// Build an HTTP/1.1 HTML response (e.g. the `/privacy` policy page).
+pub fn http_html_response(status: u16, reason: &str, body: &str) -> Vec<u8> {
+    let len = body.len();
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {len}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}"
+    )
+    .into_bytes()
+}
+
 /// Build HTTP headers for a chunked SSE stream.
 pub fn http_sse_header() -> Vec<u8> {
     b"HTTP/1.1 200 OK\r\n\

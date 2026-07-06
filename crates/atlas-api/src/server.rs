@@ -46,9 +46,9 @@ use atlas_model::{ModelConfig, OlmoModel, load_model_from_safetensors, load_mode
 use atlas_tokenize::Tokenizer;
 
 use crate::handler::{
-    bearer_ok, handle_inference, http_json_response, http_options_response,
-    http_too_many_requests_response, http_unauthorized_response, parse_http_request,
-    InferState,
+    bearer_ok, handle_inference, http_html_response, http_json_response,
+    http_options_response, http_too_many_requests_response, http_unauthorized_response,
+    parse_http_request, InferState,
 };
 use crate::types::{json_string, openrouter_models_json, unix_ts, ChatTemplate, ErrorResponse, ServerConfig};
 
@@ -128,6 +128,7 @@ impl ApiServer {
         eprintln!("│    GET  /health                 (no auth)");
         eprintln!("│    GET  /v1/models              (no auth)");
         eprintln!("│    GET  /openrouter/models      (no auth, OpenRouter provider schema)");
+        eprintln!("│    GET  /privacy                (no auth, privacy policy HTML)");
         eprintln!("│    POST /v1/chat/completions");
         eprintln!("│    POST /v1/completions");
         eprintln!("│");
@@ -412,6 +413,13 @@ fn route_connection(mut stream: TcpStream, ctx: &ConnCtx) {
                 ts = ts,
             );
             stream.write_all(&http_json_response(200, "OK", &body)).ok();
+            return;
+        }
+        ("GET", "/privacy") => {
+            // Privacy policy page — OpenRouter requires providers to host and
+            // link a privacy policy. Static HTML compiled into the binary.
+            let body = include_str!("privacy.html");
+            stream.write_all(&http_html_response(200, "OK", body)).ok();
             return;
         }
         ("GET", "/openrouter/models") => {

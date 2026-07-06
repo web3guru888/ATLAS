@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — ATLAS Inference API</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         max-width: 760px; margin: 0 auto; padding: 2rem 1.25rem 4rem; color: #1a1a2e; line-height: 1.6; }
+  h1 { font-size: 1.6rem; border-bottom: 2px solid #4a4e69; padding-bottom: .5rem; }
+  h2 { font-size: 1.15rem; margin-top: 2rem; color: #22223b; }
+  code { background: #f2f2f7; padding: .1em .35em; border-radius: 4px; font-size: .9em; }
+  .meta { color: #6b7280; font-size: .9rem; }
+  a { color: #3a5a98; }
+</style>
+</head>
+<body>
+<h1>Privacy Policy — ATLAS Inference API</h1>
+<p class="meta">Effective date: 6 July 2026 · Service: <code>atlas.thebeastagi.com</code></p>
+
+<p>The ATLAS Inference API ("the Service") is an OpenAI-compatible large-language-model
+inference endpoint operated by ATLAS AGI (Robin Dey, Chiang Mai, Thailand). It serves
+open-weight models (currently <code>allenai/Olmo-3-7B-Think</code>) on dedicated,
+single-tenant hardware, primarily to users of aggregation platforms such as OpenRouter.</p>
+
+<h2>1. Data we process</h2>
+<p>When you (or a platform acting on your behalf) send an inference request, the Service
+processes the request body — including prompts, messages, and sampling parameters — solely
+to generate the requested completion.</p>
+
+<h2>2. Zero retention of prompts and completions</h2>
+<ul>
+  <li>Prompt and completion content is processed <strong>in memory only</strong> and is
+      discarded as soon as the response is delivered.</li>
+  <li>We do <strong>not</strong> write prompt or completion content to disk, log files,
+      or databases.</li>
+  <li>We do <strong>not</strong> use your inputs or outputs to train, fine-tune, or
+      evaluate any model.</li>
+  <li>We do <strong>not</strong> sell, share, or disclose request content to third
+      parties.</li>
+</ul>
+
+<h2>3. Operational metadata</h2>
+<p>For reliability and capacity management, minimal operational metadata (timestamps,
+HTTP status codes, token counts, error messages) may appear transiently in service logs.
+These logs never contain request or response content and are periodically rotated and
+discarded.</p>
+
+<h2>4. Infrastructure and subprocessors</h2>
+<ul>
+  <li><strong>Google Cloud Platform</strong> — hosts the dedicated GPU server
+      (Singapore region, <code>asia-southeast1</code>). Google does not have application-level
+      access to request content.</li>
+  <li><strong>Cloudflare</strong> — provides TLS termination and secure tunneling between
+      the public hostname and the origin server. Traffic transits Cloudflare's network
+      subject to <a href="https://www.cloudflare.com/privacypolicy/">Cloudflare's privacy
+      policy</a>; Cloudflare does not retain request bodies on our behalf.</li>
+</ul>
+
+<h2>5. Security</h2>
+<p>All traffic is encrypted in transit (TLS 1.2+). Inference endpoints require bearer-token
+authentication. The model runs on single-tenant hardware — no other customers' workloads
+share the machine.</p>
+
+<h2>6. Cookies, analytics, and accounts</h2>
+<p>The Service is an API. It sets no cookies, runs no analytics or trackers, and maintains
+no user accounts or profiles.</p>
+
+<h2>7. Children</h2>
+<p>The Service is not directed at children under 13, and we do not knowingly process their
+personal information.</p>
+
+<h2>8. Changes</h2>
+<p>Updates to this policy will be posted at this URL with a revised effective date.</p>
+
+<h2>9. Contact</h2>
+<p>Questions or requests: open an issue at
+<a href="https://github.com/web3guru888/ATLAS/issues">github.com/web3guru888/ATLAS</a>.</p>
+</body>
+</html>

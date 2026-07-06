@@ -510,6 +510,7 @@ pub fn unix_ts() -> u64 {
 /// |---|---|---|
 /// | `ATLAS_OR_MODEL_ID` | `id` (slug OpenRouter calls us with) | server model id |
 /// | `ATLAS_OR_HF_ID` | `hugging_face_id` | omitted |
+/// | `ATLAS_OR_DESCRIPTION` | `description` | omitted |
 /// | `ATLAS_OR_NAME` | `name` | `"ATLAS: <model id>"` |
 /// | `ATLAS_OR_PROMPT_PRICE` | `pricing.prompt` (USD/token) | `"0"` |
 /// | `ATLAS_OR_COMPLETION_PRICE` | `pricing.completion` (USD/token) | `"0"` |
@@ -530,6 +531,9 @@ pub fn openrouter_models_json(model_id: &str, context_length: usize, max_output_
 
     let hf_field = env("ATLAS_OR_HF_ID")
         .map(|hf| format!("\"hugging_face_id\":{},", json_string(&hf)))
+        .unwrap_or_default();
+    let desc_field = env("ATLAS_OR_DESCRIPTION")
+        .map(|d| format!("\"description\":{},", json_string(&d)))
         .unwrap_or_default();
     let capacity_field = env("ATLAS_OR_CAPACITY_TPM")
         .and_then(|v| v.parse::<u64>().ok())
@@ -553,6 +557,7 @@ pub fn openrouter_models_json(model_id: &str, context_length: usize, max_output_
             "\"supported_sampling_parameters\":[\"temperature\",\"top_p\",\"top_k\",",
             "\"frequency_penalty\",\"presence_penalty\",\"repetition_penalty\",\"seed\",\"max_tokens\"],",
             "\"supported_features\":[],",
+            "{desc}",
             "{capacity}",
             "\"is_ready\":{ready},",
             "\"datacenters\":[{{\"country_code\":{cc}}}]",
@@ -567,6 +572,7 @@ pub fn openrouter_models_json(model_id: &str, context_length: usize, max_output_
         max_out  = max_output_length,
         pp       = json_string(&prompt_price),
         cp       = json_string(&completion_price),
+        desc     = desc_field,
         capacity = capacity_field,
         ready    = is_ready,
         cc       = json_string(&ccode),
