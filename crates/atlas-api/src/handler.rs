@@ -15,9 +15,10 @@
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use atlas_infer::InferEngine;
-use atlas_model::SamplingConfig;
+use atlas_model::{GenEvent, SamplingConfig};
 use atlas_tokenize::Tokenizer;
 
 use crate::types::{
@@ -126,6 +127,16 @@ pub fn write_sse_chunk(stream: &mut TcpStream, data: &str) -> std::io::Result<()
     stream.write_all(bytes)?;
     stream.write_all(b"\r\n")?;
     stream.flush()
+}
+
+/// Write an SSE comment line (`: keep-alive`) in chunked framing.
+///
+/// SSE comments are ignored by spec-compliant clients but reset proxy/client
+/// idle timeouts. OpenRouter explicitly requires keep-alive comments from
+/// providers while a slow model is still processing (prefill on this engine
+/// runs at ~decode speed, so long prompts mean long silent gaps otherwise).
+pub fn write_sse_keepalive(stream: &mut TcpStream) -> std::io::Result<()> {
+    write_sse_chunk(stream, ": keep-alive\n\n")
 }
 
 /// Write the chunked-transfer terminating chunk.
@@ -626,10 +637,19 @@ fn handle_chat_stream(
         return;
     }
 
-    // True token-by-token streaming: generate_streaming calls our closure
-    // after each token, and we immediately decode + flush an SSE chunk.
+    // True token-by-token streaming: generate_streaming_events calls our
+    // closure during prefill and after each token; visible tokens are decoded
+    // and flushed as SSE chunks immediately.
     let mut token_count: usize = 0;
     let mut write_ok = true;
+
+    // Keep-alive: emit an SSE comment whenever KEEPALIVE_EVERY elapses with
+    // nothing written — during prompt prefill (runs at ~decode speed, so a
+    // 4K-token prompt is ~a minute of silence otherwise) and during <think>
+    // suppression. Prevents proxy/fetch timeouts (OpenRouter requirement;
+    // Cloudflare proxies time out at 100s of idle).
+    const KEEPALIVE_EVERY: Duration = Duration::from_secs(10);
+    let mut last_write = Instant::now();
 
     // Think block suppression: track <think> blocks and hide them from the
     // client. Small models often generate <think> despite system prompts;
@@ -639,13 +659,25 @@ fn handle_chat_stream(
     let mut in_think_block = false;
     let mut think_tokens: usize = 0;
 
-    // InferEngine::generate_streaming closure takes (tok_id, deposit);
+    // InferEngine::generate_streaming_events closure takes (event, deposit);
     // deposit is None when no StigmergicHook is configured (the common case).
-    model.generate_streaming(
+    model.generate_streaming_events(
         &prompt_tokens,
         max_tokens,
         &config,
-        |tok_id: u32, _deposit| {
+        |ev, _deposit| {
+            let tok_id = match ev {
+                GenEvent::Prefill { .. } => {
+                    if last_write.elapsed() >= KEEPALIVE_EVERY {
+                        match write_sse_keepalive(stream) {
+                            Ok(()) => last_write = Instant::now(),
+                            Err(_) => { write_ok = false; return false; }
+                        }
+                    }
+                    return true;
+                }
+                GenEvent::Token(t) => t,
+            };
             token_count += 1;
 
             // Decode this single token
@@ -677,7 +709,15 @@ fn handle_chat_stream(
                     in_think_block = false;
                     return true;
                 }
-                // Still inside think block — suppress this token
+                // Still inside think block — suppress this token, but keep
+                // the idle connection alive (up to think_budget tokens pass
+                // with nothing visible written).
+                if last_write.elapsed() >= KEEPALIVE_EVERY {
+                    match write_sse_keepalive(stream) {
+                        Ok(()) => last_write = Instant::now(),
+                        Err(_) => { write_ok = false; return false; }
+                    }
+                }
                 return true;
             }
 
@@ -696,7 +736,7 @@ fn handle_chat_stream(
                 usage: None,
             };
             match write_sse_chunk(stream, &chunk.to_sse()) {
-                Ok(()) => true,   // keep generating
+                Ok(()) => { last_write = Instant::now(); true } // keep generating
                 Err(_) => {
                     write_ok = false;
                     false // client disconnected — stop generation

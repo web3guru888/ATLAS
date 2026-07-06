@@ -64,7 +64,7 @@ pub use streaming::StreamToken;
 
 // Re-export the most commonly used types so callers only need `atlas-infer`.
 pub use atlas_model::{
-    ModelConfig, OlmoModel, SamplingConfig,
+    GenEvent, ModelConfig, OlmoModel, SamplingConfig,
     load_model_from_dir, load_model_from_safetensors,
 };
 pub use atlas_tokenize::Tokenizer;

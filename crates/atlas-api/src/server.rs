@@ -50,7 +50,7 @@ use crate::handler::{
     http_too_many_requests_response, http_unauthorized_response, parse_http_request,
     InferState,
 };
-use crate::types::{json_string, unix_ts, ChatTemplate, ErrorResponse, ServerConfig};
+use crate::types::{json_string, openrouter_models_json, unix_ts, ChatTemplate, ErrorResponse, ServerConfig};
 
 /// Seconds advertised in the `Retry-After` header of early-429 responses.
 const RETRY_AFTER_SECS: u32 = 30;
@@ -74,6 +74,10 @@ struct ConnCtx {
     max_inflight: usize,
     api_key: Option<String>,
     model_id: String,
+    /// Model context window (for the OpenRouter `/openrouter/models` listing).
+    context_length: usize,
+    /// Hard cap on generated tokens (`ServerConfig::max_tokens`).
+    max_output_length: usize,
 }
 
 impl ApiServer {
@@ -123,6 +127,7 @@ impl ApiServer {
         eprintln!("│  Endpoints:");
         eprintln!("│    GET  /health                 (no auth)");
         eprintln!("│    GET  /v1/models              (no auth)");
+        eprintln!("│    GET  /openrouter/models      (no auth, OpenRouter provider schema)");
         eprintln!("│    POST /v1/chat/completions");
         eprintln!("│    POST /v1/completions");
         eprintln!("│");
@@ -137,6 +142,8 @@ impl ApiServer {
             max_inflight,
             api_key,
             model_id: self.cfg.model_id.clone(),
+            context_length: model_config_from_id(&self.cfg.model_id).max_seq_len,
+            max_output_length: self.cfg.max_tokens,
         });
 
         // Accept thread: owns the listener, spawns per-connection routers.
@@ -404,6 +411,15 @@ fn route_connection(mut stream: TcpStream, ctx: &ConnCtx) {
                 id = json_string(&ctx.model_id),
                 ts = ts,
             );
+            stream.write_all(&http_json_response(200, "OK", &body)).ok();
+            return;
+        }
+        ("GET", "/openrouter/models") => {
+            // OpenRouter's provider monitor polls this (their schema, richer
+            // than OpenAI /v1/models). Served from the connection thread —
+            // no InferState lock, responsive mid-generation.
+            let body = openrouter_models_json(
+                &ctx.model_id, ctx.context_length, ctx.max_output_length);
             stream.write_all(&http_json_response(200, "OK", &body)).ok();
             return;
         }

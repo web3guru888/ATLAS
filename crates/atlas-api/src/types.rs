@@ -495,6 +495,84 @@ pub fn unix_ts() -> u64 {
         .as_secs()
 }
 
+// ── OpenRouter provider schema ────────────────────────────────────────────────
+
+/// Build the OpenRouter provider `/models` listing JSON.
+///
+/// OpenRouter's provider monitor polls this endpoint and auto-stages models
+/// (spec: openrouter.ai/docs/guides/community/for-providers). The schema is
+/// OpenRouter-specific — richer than the OpenAI `/v1/models` list.
+///
+/// Deploy-specific fields are read from the environment so operators can set
+/// pricing/identity without a rebuild:
+///
+/// | Env var | Field | Default |
+/// |---|---|---|
+/// | `ATLAS_OR_MODEL_ID` | `id` (slug OpenRouter calls us with) | server model id |
+/// | `ATLAS_OR_HF_ID` | `hugging_face_id` | omitted |
+/// | `ATLAS_OR_NAME` | `name` | `"ATLAS: <model id>"` |
+/// | `ATLAS_OR_PROMPT_PRICE` | `pricing.prompt` (USD/token) | `"0"` |
+/// | `ATLAS_OR_COMPLETION_PRICE` | `pricing.completion` (USD/token) | `"0"` |
+/// | `ATLAS_OR_QUANT` | `quantization` | `"bf16"` |
+/// | `ATLAS_OR_COUNTRY` | `datacenters[0].country_code` | `"TH"` |
+/// | `ATLAS_OR_CAPACITY_TPM` | `capacity_tpm` | omitted |
+/// | `ATLAS_OR_READY` | `is_ready` (`"false"` stages hidden) | `true` |
+pub fn openrouter_models_json(model_id: &str, context_length: usize, max_output_length: usize) -> String {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+
+    let id     = env("ATLAS_OR_MODEL_ID").unwrap_or_else(|| model_id.to_string());
+    let name   = env("ATLAS_OR_NAME").unwrap_or_else(|| format!("ATLAS: {model_id}"));
+    let quant  = env("ATLAS_OR_QUANT").unwrap_or_else(|| "bf16".to_string());
+    let ccode  = env("ATLAS_OR_COUNTRY").unwrap_or_else(|| "TH".to_string());
+    let prompt_price     = env("ATLAS_OR_PROMPT_PRICE").unwrap_or_else(|| "0".to_string());
+    let completion_price = env("ATLAS_OR_COMPLETION_PRICE").unwrap_or_else(|| "0".to_string());
+    let is_ready = env("ATLAS_OR_READY").map(|v| v != "false" && v != "0").unwrap_or(true);
+
+    let hf_field = env("ATLAS_OR_HF_ID")
+        .map(|hf| format!("\"hugging_face_id\":{},", json_string(&hf)))
+        .unwrap_or_default();
+    let capacity_field = env("ATLAS_OR_CAPACITY_TPM")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|tpm| format!("\"capacity_tpm\":{tpm},"))
+        .unwrap_or_default();
+
+    format!(
+        concat!(
+            "{{\"data\":[{{",
+            "\"id\":{id},",
+            "{hf}",
+            "\"name\":{name},",
+            "\"created\":{created},",
+            "\"input_modalities\":[\"text\"],",
+            "\"output_modalities\":[\"text\"],",
+            "\"quantization\":{quant},",
+            "\"context_length\":{ctx},",
+            "\"max_output_length\":{max_out},",
+            "\"pricing\":{{\"prompt\":{pp},\"completion\":{cp},",
+            "\"image\":\"0\",\"request\":\"0\",\"input_cache_read\":\"0\"}},",
+            "\"supported_sampling_parameters\":[\"temperature\",\"top_p\",\"top_k\",",
+            "\"frequency_penalty\",\"presence_penalty\",\"repetition_penalty\",\"seed\",\"max_tokens\"],",
+            "\"supported_features\":[],",
+            "{capacity}",
+            "\"is_ready\":{ready},",
+            "\"datacenters\":[{{\"country_code\":{cc}}}]",
+            "}}]}}"
+        ),
+        id       = json_string(&id),
+        hf       = hf_field,
+        name     = json_string(&name),
+        created  = unix_ts(),
+        quant    = json_string(&quant),
+        ctx      = context_length,
+        max_out  = max_output_length,
+        pp       = json_string(&prompt_price),
+        cp       = json_string(&completion_price),
+        capacity = capacity_field,
+        ready    = is_ready,
+        cc       = json_string(&ccode),
+    )
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -756,6 +834,25 @@ mod tests {
     fn gen_id_prefixed() {
         let id = gen_id("chatcmpl");
         assert!(id.starts_with("chatcmpl-"));
+    }
+
+    #[test]
+    fn openrouter_models_json_valid_and_complete() {
+        let j = openrouter_models_json("olmo3-7b-think", 65536, 2048);
+        let v = Json::parse(&j).expect("must be valid JSON");
+        let m = &v.get("data").and_then(|d| d.as_array()).expect("data array")[0];
+        assert_eq!(m.get("id").and_then(|x| x.as_str()), Some("olmo3-7b-think"));
+        assert_eq!(m.get("context_length").and_then(|x| x.as_i64()), Some(65536));
+        assert_eq!(m.get("max_output_length").and_then(|x| x.as_i64()), Some(2048));
+        assert_eq!(m.get("quantization").and_then(|x| x.as_str()), Some("bf16"));
+        assert_eq!(m.get("is_ready").and_then(|x| x.as_bool()), Some(true));
+        let pricing = m.get("pricing").expect("pricing object");
+        assert_eq!(pricing.get("prompt").and_then(|x| x.as_str()), Some("0"));
+        let dc = m.get("datacenters").and_then(|d| d.as_array()).expect("datacenters");
+        assert_eq!(dc[0].get("country_code").and_then(|x| x.as_str()), Some("TH"));
+        // Optional env-driven fields are omitted (not null) by default
+        assert!(m.get("hugging_face_id").is_none());
+        assert!(m.get("capacity_tpm").is_none());
     }
 
     #[test]

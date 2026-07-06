@@ -1215,6 +1215,22 @@ impl Rng {
     }
 }
 
+/// Progress event emitted by [`OlmoModel::generate_streaming_events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenEvent {
+    /// Prompt-prefill progress: `done` of `total` prompt tokens processed.
+    /// Emitted after each prompt token — lets callers send keep-alives
+    /// during long prefills (prefill runs at ~decode speed on this engine).
+    Prefill {
+        /// Prompt tokens processed so far (1-based).
+        done: usize,
+        /// Total prompt tokens.
+        total: usize,
+    },
+    /// A newly generated (visible) token id.
+    Token(u32),
+}
+
 /// Configuration for text generation sampling controls.
 ///
 /// Pipeline order: repetition_penalty → frequency_penalty → presence_penalty
@@ -1862,19 +1878,49 @@ impl OlmoModel {
     where
         F: FnMut(u32) -> bool,
     {
+        self.generate_streaming_events(prompt, max_new, config, |ev| match ev {
+            GenEvent::Token(t) => on_token(t),
+            GenEvent::Prefill { .. } => true,
+        })
+    }
+
+    /// Generate tokens with progress events, calling `on_event` for both
+    /// prompt-prefill progress and each generated token.
+    ///
+    /// Prefill on this engine runs at roughly decode speed, so a long prompt
+    /// means many seconds before the first [`GenEvent::Token`] — API layers
+    /// use [`GenEvent::Prefill`] to emit SSE keep-alive comments so proxies
+    /// (and OpenRouter's fetch timeout) don't kill the connection.
+    ///
+    /// Return `false` from the callback to stop early. Same sampling pipeline
+    /// as `generate_with_sampling`.
+    pub fn generate_streaming_events<F>(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        config: &SamplingConfig,
+        mut on_event: F,
+    ) -> Vec<u32>
+    where
+        F: FnMut(GenEvent) -> bool,
+    {
         self.reset();
         self.rng = Rng::from_entropy();
 
         let mut new_tokens: Vec<u32> = Vec::new();
         let mut last_logits = vec![0.0f32; self.config.vocab_size];
 
-        // Process prompt
-        for &tok in prompt {
+        // Process prompt, reporting progress after each token.
+        let total = prompt.len();
+        for (i, &tok) in prompt.iter().enumerate() {
             last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
                 gl
             } else {
                 self.forward_one(tok)
             };
+            if !on_event(GenEvent::Prefill { done: i + 1, total }) {
+                return new_tokens; // client gone — abort before decode
+            }
         }
 
         let mut token_history: Vec<u32> = Vec::new();
@@ -1957,7 +2003,7 @@ impl OlmoModel {
             token_history.push(tok);
 
             // Notify caller — stop if they return false
-            if !on_token(tok) { break; }
+            if !on_event(GenEvent::Token(tok)) { break; }
 
             last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
                 gl
@@ -3816,6 +3862,49 @@ mod tests {
         assert!(b.ns_per_op() > 0.0);
     }
 
+
+    #[test]
+    fn generate_streaming_events_reports_prefill_then_tokens() {
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+        let prompt = [0u32, 1, 2, 3];
+
+        let mut prefills: Vec<(usize, usize)> = Vec::new();
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut prefill_done = false;
+        let out = model.generate_streaming_events(
+            &prompt, 4, &SamplingConfig { temperature: 0.0, ..Default::default() },
+            |ev| {
+                match ev {
+                    GenEvent::Prefill { done, total } => {
+                        assert!(!prefill_done, "prefill event after decode started");
+                        prefills.push((done, total));
+                    }
+                    GenEvent::Token(t) => { prefill_done = true; tokens.push(t); }
+                }
+                true
+            });
+
+        // One prefill event per prompt token, monotonically increasing.
+        assert_eq!(prefills.len(), prompt.len());
+        for (i, &(done, total)) in prefills.iter().enumerate() {
+            assert_eq!(done, i + 1);
+            assert_eq!(total, prompt.len());
+        }
+        // Token events match the returned tokens.
+        assert_eq!(tokens, out);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn generate_streaming_events_abort_during_prefill() {
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+        let out = model.generate_streaming_events(
+            &[0u32, 1, 2, 3], 4, &SamplingConfig::default(),
+            |ev| !matches!(ev, GenEvent::Prefill { done: 2, .. }));
+        assert!(out.is_empty(), "aborting in prefill must generate nothing");
+    }
 
     // ── GPU Inference Tests ──────────────────────────────────────────────────
     // Lightweight GPU tests (tiny synthetic models, no weights on disk) run by

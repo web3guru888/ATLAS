@@ -36,7 +36,7 @@
 
 use std::sync::Arc;
 
-use atlas_model::{OlmoModel, SamplingConfig};
+use atlas_model::{GenEvent, OlmoModel, SamplingConfig};
 
 use crate::hook::{ArcHook, StigmergicHook};
 
@@ -178,14 +178,38 @@ impl InferEngine {
     where
         F: FnMut(u32, Option<PheromoneDeposit>) -> bool,
     {
+        self.generate_streaming_events(prompt, max_new, cfg, |ev, deposit| match ev {
+            GenEvent::Token(tok) => on_token(tok, deposit),
+            GenEvent::Prefill { .. } => true,
+        })
+    }
+
+    /// Streaming generation with progress events — like [`generate_streaming`]
+    /// but the callback also receives [`GenEvent::Prefill`] progress during
+    /// prompt processing (no-hook path only), so API layers can emit SSE
+    /// keep-alives during long prefills.
+    ///
+    /// The hooked path generates in bulk and emits only `Token` events.
+    /// Return `false` from the callback to stop generation early.
+    ///
+    /// [`generate_streaming`]: Self::generate_streaming
+    pub fn generate_streaming_events<F>(
+        &mut self,
+        prompt: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
+        mut on_event: F,
+    ) -> usize
+    where
+        F: FnMut(GenEvent, Option<PheromoneDeposit>) -> bool,
+    {
         match &self.hook {
             None => {
-                // Zero-overhead streaming path.
+                // Zero-overhead streaming path with prefill progress.
                 let mut count = 0usize;
-                self.model.generate_streaming(prompt, max_new, cfg, |tok| {
-                    let keep_going = on_token(tok, None);
-                    count += 1;
-                    keep_going
+                self.model.generate_streaming_events(prompt, max_new, cfg, |ev| {
+                    if matches!(ev, GenEvent::Token(_)) { count += 1; }
+                    on_event(ev, None)
                 });
                 count
             }
@@ -208,7 +232,7 @@ impl InferEngine {
                         total_delta,
                         layers_fired,
                     });
-                    let keep_going = on_token(*tok, deposit);
+                    let keep_going = on_event(GenEvent::Token(*tok), deposit);
                     count += 1;
                     if !keep_going { break; }
                 }
@@ -226,6 +250,25 @@ mod tests {
 
     fn tiny_engine() -> InferEngine {
         InferEngine::new(OlmoModel::new(ModelConfig::tiny()))
+    }
+
+    #[test]
+    fn no_hook_streaming_events_include_prefill() {
+        let mut e = tiny_engine();
+        let mut prefills = 0usize;
+        let mut toks = 0usize;
+        let n = e.generate_streaming_events(
+            &[0u32, 1, 2], 4, &SamplingConfig::default(),
+            |ev, deposit| {
+                assert!(deposit.is_none(), "no hook → no deposits");
+                match ev {
+                    GenEvent::Prefill { .. } => prefills += 1,
+                    GenEvent::Token(_) => toks += 1,
+                }
+                true
+            });
+        assert_eq!(prefills, 3, "one prefill event per prompt token");
+        assert_eq!(n, toks, "returned count must match token events");
     }
 
     #[test]
