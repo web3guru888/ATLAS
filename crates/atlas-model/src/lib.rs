@@ -1063,7 +1063,7 @@ impl TransformerBlock {
                 tmp_norm = GpuVec::from_slice(&self.attn_norm);
                 &tmp_norm
             };
-            let mut x_norm = GpuVec::from_slice(&x.download());
+            let mut x_norm = x.dup(); // device-to-device — no PCIe round-trip
             x_norm.rmsnorm_inplace(norm_w, self.eps);
             let attn_out = self.attn.forward_token_gpu_full(&x_norm, pos, rope_tables)
                 .or_else(|| self.attn.forward_token_gpu(&x_norm, pos, rope));
@@ -1082,7 +1082,7 @@ impl TransformerBlock {
                 tmp_ffn_norm = GpuVec::from_slice(&self.ffn_norm);
                 &tmp_ffn_norm
             };
-            let mut x_norm2 = GpuVec::from_slice(&x.download());
+            let mut x_norm2 = x.dup(); // device-to-device — no PCIe round-trip
             x_norm2.rmsnorm_inplace(ffn_norm_w, self.eps);
             if let Some(ffn_out) = self.ffn.forward_gpu(&x_norm2) {
                 x.add_inplace(&ffn_out);
@@ -1146,7 +1146,7 @@ impl TransformerBlock {
                 tmp_norm = GpuVec::from_slice(&self.attn_norm);
                 &tmp_norm
             };
-            let mut x_norm = GpuVec::from_slice(&x.download());
+            let mut x_norm = x.dup(); // device-to-device — no PCIe round-trip
             x_norm.rmsnorm_inplace(norm_w, self.eps);
             if let Some(attn_out) = self.attn.forward_token_gpu(&x_norm, pos, rope) {
                 x.add_inplace(&attn_out);
@@ -1163,7 +1163,7 @@ impl TransformerBlock {
                 tmp_ffn_norm = GpuVec::from_slice(&self.ffn_norm);
                 &tmp_ffn_norm
             };
-            let mut x_norm2 = GpuVec::from_slice(&x.download());
+            let mut x_norm2 = x.dup(); // device-to-device — no PCIe round-trip
             x_norm2.rmsnorm_inplace(ffn_norm_w, self.eps);
             if let Some(ffn_out) = self.ffn.forward_gpu(&x_norm2) {
                 x.add_inplace(&ffn_out);

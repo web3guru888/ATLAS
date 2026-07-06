@@ -501,6 +501,32 @@ impl GpuVec {
         self.cpu.clone()
     }
 
+    /// Duplicate this vector **without leaving the device**.
+    ///
+    /// On GPU: allocates a fresh buffer and runs the device-to-device
+    /// `copy_kernel` — zero PCIe traffic, no synchronisation (stream-ordered).
+    /// On CPU (or CPU-only builds): clones the host data.
+    ///
+    /// Callers previously wrote `GpuVec::from_slice(&x.download())` to get a
+    /// scratch copy of a resident activation — a full D2H + H2D round-trip
+    /// plus an implicit sync, per call. The 2026-07-06 nsys baseline showed
+    /// PCIe staging at 79% of GPU time on small-model inference; the pre-norm
+    /// transformer path did two such round-trips per layer per token.
+    pub fn dup(&self) -> GpuVec {
+        #[cfg(atlas_cuda)]
+        if let Some(ref src) = self.buf {
+            if let Some(dst) = gpu::GpuBuf::alloc(self.len) {
+                unsafe { ffi::atlas_vram_copy_f32(src.ptr, dst.ptr, self.len as i32); }
+                return GpuVec {
+                    buf: Some(dst),
+                    cpu: vec![0.0f32; self.len],
+                    len: self.len,
+                };
+            }
+        }
+        GpuVec::from_slice(&self.download())
+    }
+
     /// Whether the data is resident in VRAM.
     pub fn is_on_gpu(&self) -> bool {
         #[cfg(atlas_cuda)]
@@ -1109,6 +1135,24 @@ impl Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// dup() must be an exact copy and must not alias the source buffer.
+    /// Runs by default; exercises the device path when CUDA is present and
+    /// the host path otherwise.
+    #[test]
+    fn gpuvec_dup_is_deep_copy() {
+        let data: Vec<f32> = (0..1000).map(|i| i as f32 * 0.5 - 250.0).collect();
+        let mut a = GpuVec::from_slice(&data);
+        let b = a.dup();
+        assert_eq!(b.len, a.len);
+        assert_eq!(a.is_on_gpu(), b.is_on_gpu(), "dup must stay on the same device");
+        assert_eq!(b.download(), data, "dup contents must match source");
+
+        // Mutating the original must not affect the copy (no aliasing).
+        let ones = GpuVec::from_slice(&vec![1.0f32; 1000]);
+        a.add_inplace(&ones);
+        assert_eq!(b.download(), data, "dup must not alias the source buffer");
+    }
 
     #[test]
     fn zeros_shape() {
