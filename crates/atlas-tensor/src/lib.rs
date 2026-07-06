@@ -471,10 +471,15 @@ pub struct GpuVec {
 impl GpuVec {
     /// Create a GPU vector filled with zeros.
     pub fn zeros(len: usize) -> Self {
+        let cpu = vec![0.0f32; len];
         Self {
+            // Upload the zero-filled host buffer instead of a bare alloc:
+            // cudaMalloc/cudaMallocAsync do NOT guarantee zeroed memory
+            // (async pool allocations recycle prior contents). Found via
+            // compute-sanitizer, which poisons fresh allocations.
             #[cfg(atlas_cuda)]
-            buf: if cuda_available() { gpu::GpuBuf::alloc(len) } else { None },
-            cpu: vec![0.0f32; len],
+            buf: if cuda_available() { gpu::GpuBuf::upload(&cpu) } else { None },
+            cpu,
             len,
         }
     }
