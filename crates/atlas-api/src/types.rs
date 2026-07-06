@@ -314,6 +314,9 @@ pub struct ChatCompletionResponse {
     pub model: String,
     /// Generated content.
     pub content: String,
+    /// Hidden <think> scratchpad content (reasoning models); serialized as
+    /// `message.reasoning` when non-empty (OpenRouter convention).
+    pub reasoning: String,
     /// Number of prompt tokens.
     pub prompt_tokens: usize,
     /// Number of generated tokens.
@@ -329,7 +332,7 @@ impl ChatCompletionResponse {
         format!(
             concat!(
                 r#"{{"id":{id},"object":"chat.completion","created":{created},"model":{model},"#,
-                r#""choices":[{{"index":0,"message":{{"role":"assistant","content":{content}}},"#,
+                r#""choices":[{{"index":0,"message":{{"role":"assistant","content":{content}{reasoning}}},"#,
                 r#""finish_reason":{finish}}}],"#,
                 r#""usage":{{"prompt_tokens":{pt},"completion_tokens":{ct},"total_tokens":{tt}}}}}"#
             ),
@@ -337,6 +340,8 @@ impl ChatCompletionResponse {
             created = self.created,
             model   = json_string(&self.model),
             content = json_string(&self.content),
+            reasoning = if self.reasoning.is_empty() { String::new() }
+                        else { format!(r#","reasoning":{}"#, json_string(&self.reasoning)) },
             finish  = json_string(self.finish_reason),
             pt      = self.prompt_tokens,
             ct      = self.completion_tokens,
@@ -353,6 +358,10 @@ pub struct StreamChunk {
     pub model: String,
     /// Token text (empty for [DONE]).
     pub delta: String,
+    /// When true, `delta` is REASONING text (hidden <think> scratchpad) and
+    /// is emitted as `delta.reasoning` instead of `delta.content`
+    /// (OpenRouter reasoning-model convention).
+    pub is_reasoning: bool,
     /// True if this is the final [DONE] sentinel.
     pub done: bool,
     /// Finish reason (present on last content chunk).
@@ -382,11 +391,12 @@ impl StreamChunk {
             let data = format!(
                 concat!(
                     r#"{{"id":{id},"object":"chat.completion.chunk","model":{model},"#,
-                    r#""choices":[{{"index":0,"delta":{{"role":"assistant","content":{content}}},"#,
+                    r#""choices":[{{"index":0,"delta":{{"role":"assistant",{field}:{content}}},"#,
                     r#""finish_reason":{finish}}}]{usage}}}"#
                 ),
                 id      = json_string(&self.id),
                 model   = json_string(&self.model),
+                field   = if self.is_reasoning { "\"reasoning\"" } else { "\"content\"" },
                 content = json_string(&self.delta),
                 finish  = fr_json,
                 usage   = usage_json,
@@ -738,6 +748,7 @@ mod tests {
             created: 1000,
             model: "atlas".to_string(),
             content: "Hello!".to_string(),
+            reasoning: String::new(),
             prompt_tokens: 5,
             completion_tokens: 1,
             finish_reason: "stop",
@@ -776,7 +787,7 @@ mod tests {
         let chunk = StreamChunk {
             id: "chatcmpl-1".to_string(),
             model: "atlas".to_string(),
-            delta: "Hi".to_string(),
+            delta: "Hi".to_string(), is_reasoning: false,
             done: false,
             finish_reason: None,
             usage: None,
@@ -795,7 +806,7 @@ mod tests {
         let chunk = StreamChunk {
             id: "chatcmpl-1".to_string(),
             model: "atlas".to_string(),
-            delta: String::new(),
+            delta: String::new(), is_reasoning: false,
             done: false,
             finish_reason: Some("stop"),
             usage: Some((12, 34)),
@@ -815,7 +826,7 @@ mod tests {
     fn stream_chunk_done_sentinel() {
         let chunk = StreamChunk {
             id: "x".to_string(), model: "atlas".to_string(),
-            delta: String::new(), done: true, finish_reason: Some("stop"),
+            delta: String::new(), is_reasoning: false, done: true, finish_reason: Some("stop"),
             usage: None,
         };
         assert_eq!(chunk.to_sse(), "data: [DONE]\n\n");

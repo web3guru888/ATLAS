@@ -320,7 +320,11 @@ pub fn handle_inference(
             // behavioral framing.
             inject_default_system_prompt(&mut req.messages);
             let template = state.lock().unwrap().chat_template;
-            let prompt = req.to_prompt_with(&template);
+            // Official OLMo-3-Think generation prompt ends INSIDE a think
+            // block: `<|im_start|>assistant\n<think>`. The model is RL-trained
+            // to reason first; the reasoning is stripped before the client
+            // sees it (see think handling below).
+            let prompt = format!("{}<think>", req.to_prompt_with(&template));
             let id     = gen_id("chatcmpl");
             if req.stream {
                 handle_chat_stream(stream, &req, &prompt, &id, state);
@@ -369,6 +373,13 @@ fn run_inference(
     };
     let prompt_count = prompt_tokens.len();
 
+    // Context-overflow guard: prompt + generation must fit the KV/RoPE
+    // capacity (max_seq_len). Without this, positions past capacity index
+    // out of bounds (CPU: panic; GPU: silent out-of-bounds VRAM read).
+    let ctx_cap = st.model.as_ref().map(|m| m.model.config().max_seq_len).unwrap_or(usize::MAX);
+    let max_tokens = if prompt_count >= ctx_cap { 0 }
+                     else { max_tokens.min(ctx_cap - prompt_count) };
+
     // Generate — InferEngine::generate handles reset() internally and
     // returns (tokens, pheromone_deposits); deposits are discarded here
     // unless a StigmergicHook is configured on the engine.
@@ -412,17 +423,20 @@ fn handle_chat_nonstream(
     let (content, prompt_tokens, completion_tokens) =
         run_inference(state, prompt, req.max_tokens, &config);
 
-    // Strip think blocks from output — users shouldn't see raw <think> text.
-    // 1. Close unclosed blocks (think budget)
-    // 2. Remove all <think>...</think> blocks from the final output
-    let content = enforce_think_budget(&content, 100);
-    let content = strip_think_blocks(&content);
+    // The prompt primes `<think>`, so the completion BEGINS inside a think
+    // block. Split it: scratchpad → `message.reasoning` (OpenRouter
+    // reasoning-model convention), remainder → `message.content`.
+    let (reasoning, content) = match content.find("</think>") {
+        Some(i) => (content[..i].trim().to_string(),
+                    content[i + 8..].trim_start().to_string()),
+        None    => (content.trim().to_string(), String::new()),
+    };
 
     let model_id = state.lock().unwrap().model_id.clone();
     let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
     let resp = ChatCompletionResponse {
         id: id.to_string(), created: unix_ts(),
-        model: model_id, content,
+        model: model_id, content, reasoning,
         prompt_tokens, completion_tokens, finish_reason: finish,
     };
     stream.write_all(&http_json_response(200, "OK", &resp.to_json())).ok();
@@ -611,7 +625,6 @@ fn handle_chat_stream(
 
     let mut st = state.lock().unwrap();
     let model_id = st.model_id.clone();
-    let max_tokens = req.max_tokens;
     let id_owned = id.to_string();
 
     // Encode prompt while we have the lock
@@ -620,6 +633,12 @@ fn handle_chat_stream(
     } else {
         prompt.bytes().map(|b| b as u32).collect()
     };
+
+    // Context-overflow guard (see run_inference): clamp generation to the
+    // remaining KV/RoPE capacity.
+    let ctx_cap = st.model.as_ref().map(|m| m.model.config().max_seq_len).unwrap_or(usize::MAX);
+    let max_tokens = if prompt_tokens.len() >= ctx_cap { 0 }
+                     else { req.max_tokens.min(ctx_cap - prompt_tokens.len()) };
 
     // Take model and tokenizer out of InferState so we can use them
     // independently (model needs &mut, tokenizer needs &, TCP stream needs &mut).
@@ -630,7 +649,7 @@ fn handle_chat_stream(
             if stream.write_all(&http_sse_header()).is_err() { return; }
             let done = StreamChunk {
                 id: id_owned, model: model_id,
-                delta: String::new(), done: true, finish_reason: None,
+                delta: String::new(), is_reasoning: false, done: true, finish_reason: None,
                 usage: None,
             };
             write_sse_chunk(stream, &done.to_sse()).ok();
@@ -669,9 +688,11 @@ fn handle_chat_stream(
     // Think block suppression: track <think> blocks and hide them from the
     // client. Small models often generate <think> despite system prompts;
     // we silently consume think tokens and only stream visible content.
-    let think_budget: usize = 100; // max tokens inside <think> before we stop
+    let think_budget: usize = 100_000; // effectively unlimited; bounded by max_tokens
     let mut accumulated_text = String::new();
-    let mut in_think_block = false;
+    // The prompt primes `<think>` (official OLMo-3-Think template), so the
+    // stream BEGINS inside a think block.
+    let mut in_think_block = true;
     let mut think_tokens: usize = 0;
 
     // InferEngine::generate_streaming_events closure takes (event, deposit);
@@ -716,24 +737,30 @@ fn handle_chat_stream(
                 think_tokens += 1;
                 if accumulated_text.contains("</think>") {
                     in_think_block = false;
-                    // Think block closed — resume sending visible content
+                    // Think block closed — the closing-tag token itself is
+                    // not sent; visible content follows.
                     return true;
                 }
                 if think_tokens > think_budget {
-                    // Budget exceeded — stop suppressing, let remaining tokens through
                     in_think_block = false;
                     return true;
                 }
-                // Still inside think block — suppress this token, but keep
-                // the idle connection alive (up to think_budget tokens pass
-                // with nothing visible written).
-                if last_write.elapsed() >= KEEPALIVE_EVERY {
-                    match write_sse_keepalive(stream) {
-                        Ok(()) => last_write = Instant::now(),
-                        Err(_) => { write_ok = false; return false; }
-                    }
+                // Inside the think block: stream the scratchpad as
+                // `delta.reasoning` chunks (OpenRouter reasoning-model
+                // convention). Real bytes also keep proxies from timing out.
+                let chunk = StreamChunk {
+                    id: id_owned.clone(),
+                    model: model_id.clone(),
+                    delta: text,
+                    is_reasoning: true,
+                    done: false,
+                    finish_reason: None,
+                    usage: None,
+                };
+                match write_sse_chunk(stream, &chunk.to_sse()) {
+                    Ok(()) => { last_write = Instant::now(); return true; }
+                    Err(_) => { write_ok = false; return false; }
                 }
-                return true;
             }
 
             let finish_reason: Option<&'static str> = if token_count >= max_tokens {
@@ -745,7 +772,7 @@ fn handle_chat_stream(
             let chunk = StreamChunk {
                 id: id_owned.clone(),
                 model: model_id.clone(),
-                delta: text,
+                delta: text, is_reasoning: false,
                 done: false,
                 finish_reason,
                 usage: None,
@@ -767,7 +794,7 @@ fn handle_chat_stream(
         let final_chunk = StreamChunk {
             id: id_owned.clone(),
             model: model_id.clone(),
-            delta: String::new(),
+            delta: String::new(), is_reasoning: false,
             done: false,
             finish_reason: Some(finish),
             usage: Some((prompt_tokens.len(), token_count)),
@@ -776,7 +803,7 @@ fn handle_chat_stream(
 
         let done = StreamChunk {
             id: id_owned, model: model_id,
-            delta: String::new(), done: true, finish_reason: None,
+            delta: String::new(), is_reasoning: false, done: true, finish_reason: None,
             usage: None,
         };
         write_sse_chunk(stream, &done.to_sse()).ok();
@@ -822,10 +849,9 @@ fn handle_completion(
 // ── System prompt ────────────────────────────────────────────────────────────
 
 /// Default system prompt injected when no system message is present.
-/// This dramatically improves output quality for small models (7B) by:
-/// - Preventing degenerate `<think>` loops
-/// - Providing clear behavioral framing
-/// - Encouraging concise, direct responses
+/// This is the EXACT system prompt from the official OLMo-3-Think
+/// `chat_template.jinja` — the model was trained with it; substituting a
+/// different persona (or banning thinking) measurably degrades quality.
 const DEFAULT_SYSTEM_PROMPT: &str =
     "You are ATLAS, a helpful and knowledgeable AI assistant. \
      Respond directly to questions. Keep answers clear, informative, \
@@ -843,6 +869,15 @@ fn inject_default_system_prompt(messages: &mut Vec<ChatMessage>) {
             role: "system".to_string(),
             content: DEFAULT_SYSTEM_PROMPT.to_string(),
         });
+    } else {
+        // Official template appends the functions suffix to user-supplied
+        // system prompts; keep the model in-distribution.
+        for m in messages.iter_mut() {
+            if m.role == "system" && !m.content.contains("<functions>") {
+                m.content.push_str(
+                    " You do not currently have access to any functions. <functions></functions>");
+            }
+        }
     }
 }
 
@@ -1089,7 +1124,10 @@ mod tests {
         ];
         inject_default_system_prompt(&mut messages);
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].content, "Custom system");
+        // User system prompt is preserved, with the official OLMo template
+        // functions-suffix appended (keeps the model in-distribution).
+        assert!(messages[0].content.starts_with("Custom system"));
+        assert!(messages[0].content.ends_with("<functions></functions>"));
     }
 
     #[test]

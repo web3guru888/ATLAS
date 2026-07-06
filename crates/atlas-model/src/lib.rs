@@ -258,7 +258,10 @@ impl ModelConfig {
             n_heads:       32,
             n_kv_heads:    32,
             ffn_hidden:    11008,
-            max_seq_len:   4096,
+            // Model supports 65,536 (YaRN factor 8 over 8,192 original);
+            // 16,384 fits the f32 KV cache (~17 GB) beside BF16 weights
+            // (~14 GB) on the A100-40GB.
+            max_seq_len:   16_384,
             rope_theta:    500_000.0,
             rms_norm_eps:  1e-6,
             layer_types:   Vec::new(),
@@ -1422,18 +1425,23 @@ impl SamplingConfig {
     pub fn olmo3() -> Self {
         Self {
             temperature: 0.6,
-            repetition_penalty: 1.15,
+            // 1.0 (was 1.15): AI2 reference sampling uses NO repetition
+            // penalty. The historical loops were caused by the (now-fixed)
+            // RoPE/QK-norm bugs + missing <think> primer, not the model.
+            // Measured: rep_pen 1.05 made simple math ramble past 2.5K
+            // tokens without concluding; 1.0 concludes cleanly ("5461").
+            repetition_penalty: 1.0,
             repetition_window: 256,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             top_p: 0.95,
             top_k: 50,
             min_p: 0.05,
-            // Suppress `<th` (token 14023) as the first generated token.
-            // This prevents OLMo-3-7B-Think from entering `<think>` mode
-            // which causes degenerate infinite reasoning loops that waste
-            // the entire token budget on internal monologue.
-            suppress_initial_tokens: vec![14023],
+            // No initial-token suppression: the chat handler now primes
+            // `<think>` explicitly (official OLMo-3-Think template), so the
+            // model reasons in a hidden scratchpad instead of being banned
+            // from its RL-trained format (the old ban degraded quality).
+            suppress_initial_tokens: vec![],
         }
     }
 }
@@ -3266,14 +3274,14 @@ mod tests {
     fn sampling_config_olmo3() {
         let config = SamplingConfig::olmo3();
         assert!((config.temperature - 0.6).abs() < 0.01);
-        assert!((config.repetition_penalty - 1.15).abs() < 0.01);
+        assert!((config.repetition_penalty - 1.0).abs() < 0.01);
         assert!((config.top_p - 0.95).abs() < 0.01);
         assert_eq!(config.top_k, 50);
         assert!((config.min_p - 0.05).abs() < 0.01);
         assert_eq!(config.repetition_window, 256);
         assert!((config.frequency_penalty - 0.0).abs() < 0.01);
-        assert_eq!(config.suppress_initial_tokens, vec![14023],
-            "olmo3 should suppress <th> (14023) to prevent <think> loops");
+        assert!(config.suppress_initial_tokens.is_empty(),
+            "no <think> ban: the chat handler primes <think> explicitly (official template)");
     }
 
     #[test]
