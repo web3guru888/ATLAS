@@ -1,9 +1,30 @@
 //! ATLAS API server — TCP listener, connection dispatch, model loading.
 //!
-//! Connections handled sequentially on the main thread. The inference state (model + tokenizer)
-//! is shared via `Arc<Mutex<InferState>>`. Connections block during inference
-//! (serialised through the mutex), which is safe and correct for a single-GPU
-//! scenario where the GPU is also the bottleneck.
+//! # Threading model
+//!
+//! - **Main thread**: loads the model, then acts as the *single inference
+//!   worker*, draining a channel of pre-parsed inference jobs. CUDA work
+//!   always runs on the thread that initialised the context — spawning
+//!   inference onto other threads caused garbage output in the past.
+//! - **Accept thread**: owns the `TcpListener` and spawns one lightweight
+//!   thread per connection.
+//! - **Connection threads**: read/parse the HTTP request, answer
+//!   non-inference routes inline (`/health`, `/v1/models`, CORS, 404),
+//!   enforce bearer-key auth and the early-429 concurrency gate, then hand
+//!   inference jobs to the worker. They never touch the GPU.
+//!
+//! This keeps `/health` and `/v1/models` responsive while a generation is in
+//! flight (required by uptime monitors, e.g. OpenRouter's), and rejects
+//! excess load with an immediate `429 + Retry-After` instead of queueing.
+//!
+//! # Auth
+//!
+//! A bearer API key is resolved at startup from (in priority order)
+//! [`ServerConfig::api_key`], the `ATLAS_API_KEY` environment variable, or a
+//! file named by `ATLAS_API_KEY_FILE`. When set, all `/v1/*` routes require
+//! `Authorization: Bearer <key>` — except `GET /v1/models` and `/health`,
+//! which stay open for health monitors. When no key is configured the server
+//! runs open (a warning is printed).
 //!
 //! # Usage
 //!
@@ -13,22 +34,46 @@
 //! ApiServer::new(cfg).serve().unwrap(); // blocks
 //! ```
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
-// thread import removed — connections handled on main thread (GPU inference is single-threaded)
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use atlas_infer::InferEngine;
 use atlas_model::{ModelConfig, OlmoModel, load_model_from_safetensors, load_model_from_dir};
 use atlas_tokenize::Tokenizer;
 
-use crate::handler::{handle, parse_http_request, InferState};
-use crate::types::{ChatTemplate, ServerConfig};
+use crate::handler::{
+    bearer_ok, handle_inference, http_json_response, http_options_response,
+    http_too_many_requests_response, http_unauthorized_response, parse_http_request,
+    InferState,
+};
+use crate::types::{json_string, unix_ts, ChatTemplate, ErrorResponse, ServerConfig};
+
+/// Seconds advertised in the `Retry-After` header of early-429 responses.
+const RETRY_AFTER_SECS: u32 = 30;
 
 /// The ATLAS OpenAI-compatible HTTP API server.
 pub struct ApiServer {
     cfg: ServerConfig,
+}
+
+/// A pre-parsed, pre-authenticated inference request handed to the worker.
+struct InferJob {
+    stream: TcpStream,
+    path: String,
+    body: Vec<u8>,
+}
+
+/// Shared context for connection-routing threads.
+struct ConnCtx {
+    tx: mpsc::Sender<InferJob>,
+    inflight: Arc<AtomicUsize>,
+    max_inflight: usize,
+    api_key: Option<String>,
+    model_id: String,
 }
 
 impl ApiServer {
@@ -52,8 +97,11 @@ impl ApiServer {
     /// This call **blocks** until the process receives SIGINT or the listener fails.
     pub fn serve(&self) -> std::io::Result<()> {
         let addr = self.addr();
+        let api_key = resolve_api_key(&self.cfg);
+        let max_inflight = resolve_max_inflight(self.cfg.max_inflight);
 
-        // Build shared inference state
+        // Build shared inference state on THIS thread — inference must stay
+        // on the same thread that initialised CUDA.
         let state = Arc::new(Mutex::new(self.load_infer_state()));
 
         // Bind
@@ -64,6 +112,8 @@ impl ApiServer {
         eprintln!("│  model    : {}", self.cfg.model_id);
         eprintln!("│  weights  : {}", self.cfg.weights_dir.as_deref().unwrap_or("(none — echo mode)"));
         eprintln!("│  max_tok  : {}", self.cfg.max_tokens);
+        eprintln!("│  auth     : {}", if api_key.is_some() { "bearer key REQUIRED on /v1/* (except GET /v1/models)" } else { "⚠ DISABLED — set ATLAS_API_KEY or ATLAS_API_KEY_FILE" });
+        eprintln!("│  inflight : max {max_inflight} concurrent inference request(s), then early 429");
         let olmo3 = atlas_model::SamplingConfig::olmo3();
         eprintln!("│  defaults : rep_pen={:.1} window={} freq_pen={:.1} top_p={:.2} top_k={} min_p={:.2}",
             olmo3.repetition_penalty, olmo3.repetition_window,
@@ -71,26 +121,46 @@ impl ApiServer {
         eprintln!("│");
         eprintln!("│  OpenAI base URL  : http://{addr}/v1");
         eprintln!("│  Endpoints:");
-        eprintln!("│    GET  /health");
-        eprintln!("│    GET  /v1/models");
+        eprintln!("│    GET  /health                 (no auth)");
+        eprintln!("│    GET  /v1/models              (no auth)");
         eprintln!("│    POST /v1/chat/completions");
         eprintln!("│    POST /v1/completions");
         eprintln!("│");
         eprintln!("│  Press Ctrl+C to stop.");
         eprintln!("└─────────────────────────────────────────────────────────────");
 
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    // Handle on main thread — GPU inference is single-threaded
-                    // anyway (Mutex serialises), and spawning threads caused
-                    // garbage output from CUDA context issues.
-                    handle_connection(stream, Arc::clone(&state));
-                }
-                Err(e) => {
-                    eprintln!("atlas-api: accept error: {e}");
+        let (tx, rx) = mpsc::channel::<InferJob>();
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let ctx = Arc::new(ConnCtx {
+            tx,
+            inflight: Arc::clone(&inflight),
+            max_inflight,
+            api_key,
+            model_id: self.cfg.model_id.clone(),
+        });
+
+        // Accept thread: owns the listener, spawns per-connection routers.
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => {
+                        let ctx = Arc::clone(&ctx);
+                        // Lightweight per-connection thread — parse, auth,
+                        // gate, respond to non-inference routes. Never
+                        // touches the GPU.
+                        thread::spawn(move || route_connection(s, &ctx));
+                    }
+                    Err(e) => {
+                        eprintln!("atlas-api: accept error: {e}");
+                    }
                 }
             }
+        });
+
+        // Main thread: the single inference worker. GPU work stays here.
+        for mut job in rx {
+            handle_inference(&mut job.stream, &job.path, &job.body, &state);
+            inflight.fetch_sub(1, Ordering::SeqCst);
         }
         Ok(())
     }
@@ -162,6 +232,41 @@ impl ApiServer {
             InferState { model: None, tokenizer: None, model_id: self.cfg.model_id.clone(), chat_template: ChatTemplate::default() }
         }
     }
+}
+
+/// Resolve the bearer API key: config field > `ATLAS_API_KEY` env >
+/// file named by `ATLAS_API_KEY_FILE`. Returns `None` (auth disabled) when
+/// nothing usable is found.
+pub(crate) fn resolve_api_key(cfg: &ServerConfig) -> Option<String> {
+    if let Some(ref k) = cfg.api_key {
+        let k = k.trim();
+        if !k.is_empty() { return Some(k.to_string()); }
+    }
+    if let Ok(k) = std::env::var("ATLAS_API_KEY") {
+        let k = k.trim().to_string();
+        if !k.is_empty() { return Some(k); }
+    }
+    if let Ok(path) = std::env::var("ATLAS_API_KEY_FILE") {
+        match std::fs::read_to_string(&path) {
+            Ok(k) => {
+                let k = k.trim().to_string();
+                if !k.is_empty() { return Some(k); }
+                eprintln!("atlas-api: ⚠ ATLAS_API_KEY_FILE {path} is empty — auth disabled");
+            }
+            Err(e) => eprintln!("atlas-api: ⚠ cannot read ATLAS_API_KEY_FILE {path}: {e} — auth disabled"),
+        }
+    }
+    None
+}
+
+/// Resolve the in-flight cap: `ATLAS_MAX_INFLIGHT` env override > config
+/// value, clamped to at least 1.
+pub(crate) fn resolve_max_inflight(cfg_value: usize) -> usize {
+    let v = std::env::var("ATLAS_MAX_INFLIGHT")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(cfg_value);
+    v.max(1)
 }
 
 /// Pick a `ModelConfig` based on the model-id string.
@@ -256,18 +361,91 @@ fn read_request(stream: &mut TcpStream) -> Option<Vec<u8>> {
     if raw.is_empty() { None } else { Some(raw) }
 }
 
-/// Handle one accepted TCP connection end-to-end.
-fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<InferState>>) {
+/// Handle one accepted TCP connection: parse, answer non-inference routes,
+/// enforce auth + the early-429 gate, and forward inference jobs to the
+/// worker thread. Runs on a per-connection thread — never touches the GPU.
+fn route_connection(mut stream: TcpStream, ctx: &ConnCtx) {
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
     // Inference can be slow — allow up to 5 minutes for the write side.
     stream.set_write_timeout(Some(Duration::from_secs(300))).ok();
 
-    if let Some(raw) = read_request(&mut stream) {
-        if let Some((method, path, _headers, body)) = parse_http_request(&raw) {
-            handle(&mut stream, &method, &path, &body, &state);
+    let raw = match read_request(&mut stream) {
+        Some(r) => r,
+        None => return,
+    };
+    let (method, path, headers, body) = match parse_http_request(&raw) {
+        Some(p) => p,
+        None => return,
+    };
+    // Strip query string.
+    let clean_path = path.split('?').next().unwrap_or(&path).to_string();
+
+    if method == "OPTIONS" {
+        stream.write_all(&http_options_response()).ok();
+        return;
+    }
+
+    // ── Unauthenticated routes (uptime monitors poll these) ──────────────
+    match (method.as_str(), clean_path.as_str()) {
+        ("GET", "/health") | ("GET", "/") => {
+            let body = r#"{"status":"ok","service":"atlas-api"}"#;
+            stream.write_all(&http_json_response(200, "OK", body)).ok();
+            return;
+        }
+        ("GET", "/v1/models") => {
+            // Served from the connection thread using the configured model id
+            // — no lock on InferState, so it stays responsive mid-generation.
+            let ts = unix_ts();
+            let body = format!(
+                concat!(
+                    r#"{{"object":"list","data":[{{"id":{id},"object":"model","created":{ts},"#,
+                    r#""owned_by":"atlas-agi","permission":[],"root":{id},"parent":null}}]}}"#
+                ),
+                id = json_string(&ctx.model_id),
+                ts = ts,
+            );
+            stream.write_all(&http_json_response(200, "OK", &body)).ok();
+            return;
+        }
+        _ => {}
+    }
+
+    // ── Bearer-key auth on all remaining /v1/* routes ─────────────────────
+    if clean_path.starts_with("/v1/") {
+        if let Some(ref key) = ctx.api_key {
+            if !bearer_ok(&headers, key) {
+                stream.write_all(&http_unauthorized_response()).ok();
+                return;
+            }
         }
     }
-    // TcpStream drop closes the connection.
+
+    match (method.as_str(), clean_path.as_str()) {
+        ("POST", "/v1/chat/completions") | ("POST", "/v1/completions") => {
+            // Early-429 concurrency gate: the engine is single-stream, so
+            // excess concurrent requests are rejected immediately instead of
+            // queueing (OpenRouter requirement).
+            let prev = ctx.inflight.fetch_add(1, Ordering::SeqCst);
+            if prev >= ctx.max_inflight {
+                ctx.inflight.fetch_sub(1, Ordering::SeqCst);
+                stream.write_all(&http_too_many_requests_response(RETRY_AFTER_SECS)).ok();
+                return;
+            }
+            // Hand off to the inference worker (main thread). The worker
+            // decrements the in-flight counter when the job completes.
+            if ctx.tx.send(InferJob { stream, path: clean_path, body }).is_err() {
+                ctx.inflight.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        _ => {
+            let err = ErrorResponse {
+                message: format!("unknown endpoint: {method} {clean_path}"),
+                error_type: "not_found",
+                status: 404,
+            };
+            stream.write_all(&http_json_response(404, "Not Found", &err.to_json())).ok();
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -353,5 +531,26 @@ mod tests {
         let srv = ApiServer::new(ServerConfig::default());
         assert_eq!(srv.cfg.port, 8080);
         assert_eq!(srv.cfg.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn resolve_api_key_from_config() {
+        let cfg = ServerConfig { api_key: Some("sk-atlas-test".to_string()), ..ServerConfig::default() };
+        assert_eq!(resolve_api_key(&cfg), Some("sk-atlas-test".to_string()));
+    }
+
+    #[test]
+    fn resolve_api_key_config_blank_is_none() {
+        // NOTE: assumes ATLAS_API_KEY / ATLAS_API_KEY_FILE are not set in the
+        // test environment (they are not set by CI or dev shells).
+        let cfg = ServerConfig { api_key: Some("   ".to_string()), ..ServerConfig::default() };
+        assert_eq!(resolve_api_key(&cfg), None);
+    }
+
+    #[test]
+    fn resolve_max_inflight_clamps_to_one() {
+        // Env override not set in tests → falls back to the argument.
+        assert_eq!(resolve_max_inflight(0), 1);
+        assert!(resolve_max_inflight(2) >= 1);
     }
 }

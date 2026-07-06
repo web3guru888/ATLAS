@@ -77,7 +77,21 @@ pub fn parse_http_request(raw: &[u8]) -> Option<(String, String, Vec<(String, St
 
 /// Build an HTTP/1.1 JSON response.
 pub fn http_json_response(status: u16, reason: &str, body: &str) -> Vec<u8> {
+    http_json_response_with(status, reason, body, &[])
+}
+
+/// Build an HTTP/1.1 JSON response with extra headers (e.g. `Retry-After`).
+pub fn http_json_response_with(
+    status: u16,
+    reason: &str,
+    body: &str,
+    extra_headers: &[(&str, &str)],
+) -> Vec<u8> {
     let len = body.len();
+    let mut extra = String::new();
+    for (k, v) in extra_headers {
+        extra.push_str(&format!("{k}: {v}\r\n"));
+    }
     format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: application/json\r\n\
@@ -85,6 +99,7 @@ pub fn http_json_response(status: u16, reason: &str, body: &str) -> Vec<u8> {
          Access-Control-Allow-Origin: *\r\n\
          Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
          Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         {extra}\
          Connection: close\r\n\
          \r\n\
          {body}"
@@ -117,6 +132,59 @@ pub fn write_sse_chunk(stream: &mut TcpStream, data: &str) -> std::io::Result<()
 pub fn write_chunk_end(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.write_all(b"0\r\n\r\n")?;
     stream.flush()
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+/// Check a parsed header list for a valid `Authorization: Bearer <key>`.
+///
+/// Header keys are expected lowercase (as produced by [`parse_http_request`]).
+/// Comparison is constant-time to avoid timing side channels.
+pub fn bearer_ok(headers: &[(String, String)], key: &str) -> bool {
+    let auth = headers
+        .iter()
+        .find(|(k, _)| k == "authorization")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let token = auth
+        .strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+        .unwrap_or("")
+        .trim();
+    ct_eq(token.as_bytes(), key.as_bytes())
+}
+
+/// Constant-time byte-slice equality (length mismatch short-circuits, which
+/// only leaks the key length — acceptable).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Standard `401 Unauthorized` response bytes.
+pub fn http_unauthorized_response() -> Vec<u8> {
+    let err = ErrorResponse {
+        message: "missing or invalid API key — pass `Authorization: Bearer <key>`".to_string(),
+        error_type: "authentication_error",
+        status: 401,
+    };
+    http_json_response_with(401, "Unauthorized", &err.to_json(), &[("WWW-Authenticate", "Bearer")])
+}
+
+/// Standard early-`429 Too Many Requests` response bytes (engine saturated).
+///
+/// OpenRouter requires providers to reject with 429 immediately instead of
+/// queueing — queued time counts against the public throughput metric.
+pub fn http_too_many_requests_response(retry_after_secs: u32) -> Vec<u8> {
+    let err = ErrorResponse {
+        message: "engine saturated (single-stream GPU) — retry shortly".to_string(),
+        error_type: "rate_limit_exceeded",
+        status: 429,
+    };
+    let ra = retry_after_secs.to_string();
+    http_json_response_with(429, "Too Many Requests", &err.to_json(), &[("Retry-After", &ra)])
 }
 
 /// CORS preflight response.
@@ -171,16 +239,47 @@ pub fn handle(
             stream.write_all(&http_json_response(200, "OK", &body)).ok();
         }
 
-        // ── Chat completions ──────────────────────────────────────────────
-        ("POST", "/v1/chat/completions") => {
-            let body_str = match std::str::from_utf8(body) {
-                Ok(s) => s,
-                Err(_) => {
-                    let err = ErrorResponse { message: "request body is not valid UTF-8".to_string(), error_type: "invalid_request_error", status: 400 };
-                    stream.write_all(&http_json_response(400, "Bad Request", &err.to_json())).ok();
-                    return;
-                }
+        // ── Inference endpoints ───────────────────────────────────────────
+        ("POST", "/v1/chat/completions") | ("POST", "/v1/completions") => {
+            handle_inference(stream, clean_path, body, state);
+        }
+
+        // ── 404 ───────────────────────────────────────────────────────────
+        _ => {
+            let err = ErrorResponse {
+                message: format!("unknown endpoint: {method} {clean_path}"),
+                error_type: "not_found",
+                status: 404,
             };
+            stream.write_all(&http_json_response(404, "Not Found", &err.to_json())).ok();
+        }
+    }
+}
+
+// ── Inference ─────────────────────────────────────────────────────────────────
+
+/// Dispatch a pre-routed (and, when auth is enabled, pre-authenticated)
+/// inference request: `POST /v1/chat/completions` or `POST /v1/completions`.
+///
+/// Called by [`handle`] and by the server's dedicated inference worker thread
+/// (see `server.rs`) so that GPU work always runs on the thread that loaded
+/// the model.
+pub fn handle_inference(
+    stream: &mut TcpStream,
+    clean_path: &str,
+    body: &[u8],
+    state: &Arc<Mutex<InferState>>,
+) {
+    let body_str = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => {
+            let err = ErrorResponse { message: "request body is not valid UTF-8".to_string(), error_type: "invalid_request_error", status: 400 };
+            stream.write_all(&http_json_response(400, "Bad Request", &err.to_json())).ok();
+            return;
+        }
+    };
+    match clean_path {
+        "/v1/chat/completions" => {
             let mut req = match ChatCompletionRequest::parse(body_str) {
                 Ok(r)  => r,
                 Err(e) => {
@@ -203,17 +302,7 @@ pub fn handle(
                 handle_chat_nonstream(stream, &req, &prompt, &id, state);
             }
         }
-
-        // ── Text completions ──────────────────────────────────────────────
-        ("POST", "/v1/completions") => {
-            let body_str = match std::str::from_utf8(body) {
-                Ok(s)  => s,
-                Err(_) => {
-                    let err = ErrorResponse { message: "request body is not valid UTF-8".to_string(), error_type: "invalid_request_error", status: 400 };
-                    stream.write_all(&http_json_response(400, "Bad Request", &err.to_json())).ok();
-                    return;
-                }
-            };
+        "/v1/completions" => {
             let req = match CompletionRequest::parse(body_str) {
                 Ok(r)  => r,
                 Err(e) => {
@@ -225,11 +314,9 @@ pub fn handle(
             let id = gen_id("cmpl");
             handle_completion(stream, &req, &id, state);
         }
-
-        // ── 404 ───────────────────────────────────────────────────────────
-        _ => {
+        other => {
             let err = ErrorResponse {
-                message: format!("unknown endpoint: {method} {clean_path}"),
+                message: format!("not an inference endpoint: {other}"),
                 error_type: "not_found",
                 status: 404,
             };
@@ -237,8 +324,6 @@ pub fn handle(
         }
     }
 }
-
-// ── Inference ─────────────────────────────────────────────────────────────────
 
 /// Run model inference for `prompt` with full sampling controls.
 /// Returns `(generated_text, prompt_token_count, completion_token_count)`.
@@ -520,6 +605,7 @@ fn handle_chat_stream(
             let done = StreamChunk {
                 id: id_owned, model: model_id,
                 delta: String::new(), done: true, finish_reason: None,
+                usage: None,
             };
             write_sse_chunk(stream, &done.to_sse()).ok();
             write_chunk_end(stream).ok();
@@ -607,6 +693,7 @@ fn handle_chat_stream(
                 delta: text,
                 done: false,
                 finish_reason,
+                usage: None,
             };
             match write_sse_chunk(stream, &chunk.to_sse()) {
                 Ok(()) => true,   // keep generating
@@ -618,7 +705,8 @@ fn handle_chat_stream(
         },
     );
 
-    // Write final finish-reason chunk + [DONE] sentinel
+    // Write final finish-reason chunk (with usage — required by OpenRouter
+    // for streaming responses) + [DONE] sentinel
     if write_ok {
         let finish: &'static str = if token_count >= max_tokens { "length" } else { "stop" };
         let final_chunk = StreamChunk {
@@ -627,12 +715,14 @@ fn handle_chat_stream(
             delta: String::new(),
             done: false,
             finish_reason: Some(finish),
+            usage: Some((prompt_tokens.len(), token_count)),
         };
         write_sse_chunk(stream, &final_chunk.to_sse()).ok();
 
         let done = StreamChunk {
             id: id_owned, model: model_id,
             delta: String::new(), done: true, finish_reason: None,
+            usage: None,
         };
         write_sse_chunk(stream, &done.to_sse()).ok();
         write_chunk_end(stream).ok();
@@ -823,6 +913,82 @@ mod tests {
         let s    = std::str::from_utf8(&resp).unwrap();
         assert!(s.starts_with("HTTP/1.1 204"));
         assert!(s.contains("Access-Control-Allow-Origin"));
+    }
+
+    // ── Auth / rate-limit middleware ──────────────────────────────────────
+
+    fn hdrs(auth: Option<&str>) -> Vec<(String, String)> {
+        let mut h = vec![("content-type".to_string(), "application/json".to_string())];
+        if let Some(a) = auth {
+            h.push(("authorization".to_string(), a.to_string()));
+        }
+        h
+    }
+
+    #[test]
+    fn bearer_ok_accepts_valid_key() {
+        assert!(bearer_ok(&hdrs(Some("Bearer sk-test-123")), "sk-test-123"));
+    }
+
+    #[test]
+    fn bearer_ok_accepts_lowercase_scheme() {
+        assert!(bearer_ok(&hdrs(Some("bearer sk-test-123")), "sk-test-123"));
+    }
+
+    #[test]
+    fn bearer_ok_rejects_wrong_key() {
+        assert!(!bearer_ok(&hdrs(Some("Bearer sk-wrong")), "sk-test-123"));
+        // same length, one byte off
+        assert!(!bearer_ok(&hdrs(Some("Bearer sk-test-124")), "sk-test-123"));
+    }
+
+    #[test]
+    fn bearer_ok_rejects_missing_header() {
+        assert!(!bearer_ok(&hdrs(None), "sk-test-123"));
+    }
+
+    #[test]
+    fn bearer_ok_rejects_non_bearer_scheme() {
+        assert!(!bearer_ok(&hdrs(Some("Basic c2stdGVzdA==")), "sk-test-123"));
+    }
+
+    #[test]
+    fn bearer_ok_rejects_empty_token() {
+        assert!(!bearer_ok(&hdrs(Some("Bearer ")), "sk-test-123"));
+    }
+
+    #[test]
+    fn ct_eq_basic() {
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn unauthorized_response_shape() {
+        let resp = http_unauthorized_response();
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(s.contains("WWW-Authenticate: Bearer"));
+        assert!(s.contains("authentication_error"));
+    }
+
+    #[test]
+    fn too_many_requests_response_shape() {
+        let resp = http_too_many_requests_response(30);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.starts_with("HTTP/1.1 429 Too Many Requests"));
+        assert!(s.contains("Retry-After: 30"));
+        assert!(s.contains("rate_limit_exceeded"));
+    }
+
+    #[test]
+    fn json_response_with_extra_headers() {
+        let resp = http_json_response_with(200, "OK", "{}", &[("X-Test", "1")]);
+        let s = std::str::from_utf8(&resp).unwrap();
+        assert!(s.contains("X-Test: 1"));
+        assert!(s.contains("Connection: close"));
     }
 
     #[test]

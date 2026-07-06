@@ -7,13 +7,19 @@
 //!
 //! # Endpoints
 //!
-//! | Method | Path                     | Description                    |
-//! |--------|--------------------------|--------------------------------|
-//! | GET    | `/health`                | Health / liveness check        |
-//! | GET    | `/v1/models`             | List available models          |
-//! | POST   | `/v1/chat/completions`   | Chat completions (+ streaming) |
-//! | POST   | `/v1/completions`        | Text completions               |
-//! | `*`    | `OPTIONS *`              | CORS preflight (204)           |
+//! | Method | Path                     | Description                    | Auth |
+//! |--------|--------------------------|--------------------------------|------|
+//! | GET    | `/health`                | Health / liveness check        | no   |
+//! | GET    | `/v1/models`             | List available models          | no   |
+//! | POST   | `/v1/chat/completions`   | Chat completions (+ streaming) | yes* |
+//! | POST   | `/v1/completions`        | Text completions               | yes* |
+//! | `*`    | `OPTIONS *`              | CORS preflight (204)           | no   |
+//!
+//! \* Bearer-key auth is enforced only when a key is configured — via
+//! [`types::ServerConfig::api_key`] or the `ATLAS_API_KEY` /
+//! `ATLAS_API_KEY_FILE` environment variables. The engine is single-stream:
+//! concurrent inference requests beyond `max_inflight` receive an immediate
+//! `429` with a `Retry-After` header instead of queueing.
 //!
 //! # Quick start
 //!
@@ -26,7 +32,7 @@
 //!     model_id:    "smollm2-135m".to_string(),
 //!     weights_dir: Some("/models/smollm2-135m".to_string()),
 //!     max_tokens:  2048,
-//!     workers:     4,
+//!     ..ServerConfig::default()
 //! };
 //! // Blocks until Ctrl-C:
 //! // ApiServer::new(cfg).serve().unwrap();

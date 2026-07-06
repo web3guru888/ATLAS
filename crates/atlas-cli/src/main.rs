@@ -1032,6 +1032,16 @@ fn cmd_api(args: &[String]) -> i32 {
                 .unwrap_or(8080);
             let host        = opt(args, "--host").unwrap_or("0.0.0.0").to_string();
             let max_tokens  = opt_usize(args, "--max-tokens", 2048);
+            // Bearer API key: --api-key-file <path> (preferred over a raw
+            // CLI value, which would leak via `ps`). Falls back to the
+            // ATLAS_API_KEY / ATLAS_API_KEY_FILE env vars inside serve().
+            let api_key = opt(args, "--api-key-file")
+                .and_then(|p| match std::fs::read_to_string(p) {
+                    Ok(s) => Some(s.trim().to_string()),
+                    Err(e) => { eprintln!("atlas api: ⚠ cannot read --api-key-file {p}: {e}"); None }
+                })
+                .filter(|s| !s.is_empty());
+            let max_inflight = opt_usize(args, "--max-inflight", 2);
 
             let cfg = ServerConfig {
                 host,
@@ -1040,6 +1050,8 @@ fn cmd_api(args: &[String]) -> i32 {
                 weights_dir,
                 max_tokens,
                 workers: 4,
+                api_key,
+                max_inflight,
             };
             let server = ApiServer::new(cfg);
             match server.serve() {

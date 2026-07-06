@@ -24,6 +24,19 @@ pub struct ServerConfig {
     pub max_tokens: usize,
     /// Number of worker threads.
     pub workers: usize,
+    /// Bearer API key required on `/v1/*` routes (except `GET /v1/models`).
+    ///
+    /// `None` disables authentication. If unset here, the server also checks
+    /// the `ATLAS_API_KEY` and `ATLAS_API_KEY_FILE` environment variables at
+    /// startup.
+    pub api_key: Option<String>,
+    /// Maximum in-flight inference requests before returning an early `429`.
+    ///
+    /// The engine is single-stream, so this is 1 running + (n−1) briefly
+    /// queued. Requests beyond the limit receive an immediate `429` with a
+    /// `Retry-After` header instead of queueing (OpenRouter requirement).
+    /// Overridable via the `ATLAS_MAX_INFLIGHT` environment variable.
+    pub max_inflight: usize,
 }
 
 impl Default for ServerConfig {
@@ -35,6 +48,8 @@ impl Default for ServerConfig {
             weights_dir: None,
             max_tokens:  2048,
             workers:     4,
+            api_key:     None,
+            max_inflight: 2,
         }
     }
 }
@@ -342,6 +357,9 @@ pub struct StreamChunk {
     pub done: bool,
     /// Finish reason (present on last content chunk).
     pub finish_reason: Option<&'static str>,
+    /// Usage counts `(prompt_tokens, completion_tokens)` — set on the final
+    /// content chunk only. OpenRouter requires usage in streaming responses.
+    pub usage: Option<(usize, usize)>,
 }
 
 impl StreamChunk {
@@ -354,16 +372,24 @@ impl StreamChunk {
                 Some(r) => json_string(r),
                 None    => "null".to_string(),
             };
+            let usage_json = match self.usage {
+                Some((pt, ct)) => format!(
+                    r#","usage":{{"prompt_tokens":{pt},"completion_tokens":{ct},"total_tokens":{tt}}}"#,
+                    pt = pt, ct = ct, tt = pt + ct,
+                ),
+                None => String::new(),
+            };
             let data = format!(
                 concat!(
                     r#"{{"id":{id},"object":"chat.completion.chunk","model":{model},"#,
                     r#""choices":[{{"index":0,"delta":{{"role":"assistant","content":{content}}},"#,
-                    r#""finish_reason":{finish}}}]}}"#
+                    r#""finish_reason":{finish}}}]{usage}}}"#
                 ),
                 id      = json_string(&self.id),
                 model   = json_string(&self.model),
                 content = json_string(&self.delta),
                 finish  = fr_json,
+                usage   = usage_json,
             );
             format!("data: {data}\n\n")
         }
@@ -669,6 +695,7 @@ mod tests {
             delta: "Hi".to_string(),
             done: false,
             finish_reason: None,
+            usage: None,
         };
         let sse = chunk.to_sse();
         assert!(sse.starts_with("data: {"));
@@ -676,6 +703,28 @@ mod tests {
         let data_json = &sse["data: ".len()..sse.len()-2];
         let v = Json::parse(data_json).unwrap();
         assert_eq!(v.get("object").and_then(|x| x.as_str()), Some("chat.completion.chunk"));
+        assert!(v.get("usage").is_none(), "usage should be absent on delta chunks");
+    }
+
+    #[test]
+    fn stream_chunk_final_carries_usage() {
+        let chunk = StreamChunk {
+            id: "chatcmpl-1".to_string(),
+            model: "atlas".to_string(),
+            delta: String::new(),
+            done: false,
+            finish_reason: Some("stop"),
+            usage: Some((12, 34)),
+        };
+        let sse = chunk.to_sse();
+        let data_json = &sse["data: ".len()..sse.len()-2];
+        let v = Json::parse(data_json).unwrap();
+        let usage = v.get("usage").expect("final chunk must carry usage");
+        assert_eq!(usage.get("prompt_tokens").and_then(|x| x.as_i64()), Some(12));
+        assert_eq!(usage.get("completion_tokens").and_then(|x| x.as_i64()), Some(34));
+        assert_eq!(usage.get("total_tokens").and_then(|x| x.as_i64()), Some(46));
+        let choices = v.get("choices").unwrap().as_array().unwrap();
+        assert_eq!(choices[0].get("finish_reason").and_then(|x| x.as_str()), Some("stop"));
     }
 
     #[test]
@@ -683,6 +732,7 @@ mod tests {
         let chunk = StreamChunk {
             id: "x".to_string(), model: "atlas".to_string(),
             delta: String::new(), done: true, finish_reason: Some("stop"),
+            usage: None,
         };
         assert_eq!(chunk.to_sse(), "data: [DONE]\n\n");
     }
@@ -715,5 +765,7 @@ mod tests {
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.max_tokens, 2048);
         assert!(cfg.weights_dir.is_none());
+        assert!(cfg.api_key.is_none());
+        assert_eq!(cfg.max_inflight, 2);
     }
 }
