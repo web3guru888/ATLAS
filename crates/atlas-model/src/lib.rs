@@ -3818,13 +3818,15 @@ mod tests {
 
 
     // ── GPU Inference Tests ──────────────────────────────────────────────────
-    // Run: cargo test -p atlas-model -- --ignored --nocapture --test-threads=1
+    // Lightweight GPU tests (tiny synthetic models, no weights on disk) run by
+    // default and self-skip when no CUDA device is present.
+    // Heavy model-loading tests/benchmarks stay #[ignore]d — run them with:
+    //   cargo test -p atlas-model -- --ignored --nocapture --test-threads=1
 
     /// Regression test: GPU rmsnorm must not deadlock on small d.
     /// d=64 = 2 warps. Old __shfl_down_sync(0xffffffff,...) with only 2 active
     /// threads out of 32 caused a GPU-level deadlock. Fixed by smem[0] broadcast.
     #[test]
-    #[ignore]
     fn gpu_rmsnorm_small_d_no_deadlock() {
         if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
         use atlas_tensor::GpuVec;
@@ -3846,7 +3848,6 @@ mod tests {
 
     /// GPU forward pass on tiny synthetic model - checks output is finite.
     #[test]
-    #[ignore]
     fn gpu_forward_tiny_model_explicit() {
         if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
         let cfg = ModelConfig::tiny();
@@ -3865,7 +3866,6 @@ mod tests {
 
     /// GPU vs CPU parity on tiny model.
     #[test]
-    #[ignore]
     fn gpu_cpu_parity_tiny_model() {
         if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
         let cfg = ModelConfig::tiny();
@@ -3885,7 +3885,6 @@ mod tests {
     /// Directly calls GpuMatrix::upload_bf16 + sgemm_vec (N=1 GEMV path) and
     /// compares against CPU matmul. Validates the sgemv_bf16_kernel.
     #[test]
-    #[ignore]
     fn gpu_bf16_gemv_parity() {
         if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
         use atlas_tensor::GpuVec;

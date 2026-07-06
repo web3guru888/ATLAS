@@ -847,9 +847,9 @@ mod tests {
     }
 
     // ── OLMo-3 integration test (requires tokenizer.json on disk) ────────
+    // Runs by default; self-skips when tokenizer.json is not on disk.
 
     #[test]
-    #[ignore] // Run with: cargo test -p atlas-tokenize -- --ignored --nocapture
     fn olmo3_encode_reference() {
         // Try standard model location, or /tmp for CI
         let paths = [
@@ -857,9 +857,10 @@ mod tests {
                     std::env::var("HOME").unwrap_or_else(|_| "/home/robindey".into())),
             "/tmp/olmo3_tokenizer.json".to_string(),
         ];
-        let tok = paths.iter()
-            .find_map(|p| Tokenizer::from_file(p).ok())
-            .expect("OLMo-3 tokenizer.json not found — copy to /tmp/olmo3_tokenizer.json");
+        let tok = match paths.iter().find_map(|p| Tokenizer::from_file(p).ok()) {
+            Some(t) => t,
+            None => { eprintln!("  SKIP: OLMo-3 tokenizer.json not found"); return; }
+        };
 
         eprintln!("  OLMo-3 vocab size: {}", tok.vocab_size());
         assert_eq!(tok.vocab_size(), 100278, "unexpected vocab size");
@@ -892,7 +893,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn smollm2_encode_reference() {
         let paths = [
             format!("{}/models/smollm2-1b7/tokenizer.json",
