@@ -58,7 +58,7 @@ homepage    = "https://atlasagi.org"
 description = "ATLAS: Active-inference Training with Learned Adaptive Stigmergy"
 keywords    = ["llm", "training", "stigmergy", "causal-inference", "astra"]
 categories  = ["science", "machine-learning"]
-rust-version = "1.75"
+rust-version = "1.80"
 
 [profile.release]
 opt-level   = 3

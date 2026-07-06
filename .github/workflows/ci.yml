@@ -16,8 +16,11 @@ jobs:
     name: Test — Rust ${{ matrix.rust }} on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false   # let stable finish even if the MSRV job fails
       matrix:
-        rust: ["1.75", stable]
+        # MSRV 1.80: Cargo.lock v4 needs cargo >=1.78, build.rs uses
+        # cargo::rustc-check-cfg (1.80). Verified on 1.80 (build+test clean).
+        rust: ["1.80", stable]
         os: [ubuntu-latest]
     steps:
       - name: Checkout
@@ -40,16 +43,14 @@ jobs:
             ${{ runner.os }}-cargo-${{ matrix.rust }}-
             ${{ runner.os }}-cargo-
 
-      - name: Build (CPU path, skip CUDA kernels)
+      # atlas-tensor's build.rs probes for nvcc; runners have none, so the
+      # build silently falls back to the pure-Rust CPU path. GPU tests
+      # self-skip at runtime via atlas_tensor::cuda_available().
+      - name: Build (CPU path, no nvcc on runner)
         run: cargo build --workspace
-        env:
-          # atlas-tensor build.rs checks for CUDA_PATH; if absent, skips CUDA
-          CUDA_PATH: ""
 
-      - name: Test (CPU path, GPU tests auto-skipped via #[ignore])
-        run: cargo test --workspace
-        env:
-          CUDA_PATH: ""
+      - name: Test (CPU path, GPU tests self-skip at runtime)
+        run: cargo test --workspace""
 
   # ── Rustfmt check (advisory) ──────────────────────────────────────────────
   fmt:
@@ -82,8 +83,6 @@ jobs:
           key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
       - run: cargo clippy --workspace -- -D warnings
         continue-on-error: true   # lint is advisory for now
-        env:
-          CUDA_PATH: ""
 
   # ── GPU tests (self-hosted runner, disabled until available) ─────────────
   gpu-test:
@@ -120,8 +119,6 @@ jobs:
       - name: Run atlas bench
         run: |
           cargo run --bin atlas -- bench 2>&1 | tee benchmark-results.txt
-        env:
-          CUDA_PATH: ""
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:

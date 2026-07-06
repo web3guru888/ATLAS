@@ -428,7 +428,7 @@ cargo build --release -p atlas-cli
 ```
 
 **Prerequisites:**
-- Rust 1.75+ (`rustup update stable`)
+- Rust 1.80+ (`rustup update stable`)
 - CUDA 12.x + nvcc (optional; falls back to CPU if absent)
 - GPU with sm_75+ (Tesla T4 / A100+) for CUDA training path
 
