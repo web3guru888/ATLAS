@@ -10,8 +10,9 @@
 [![License: CC BY 4.0](https://img.shields.io/badge/Docs-CC%20BY%204.0-lightgrey.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
-[![Release](https://img.shields.io/badge/release-v4.1.0-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-600%2F600%20passing-brightgreen.svg)](#status)
+[![Release](https://img.shields.io/badge/release-v4.2.0-success.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-627%2F627%20passing-brightgreen.svg)](#status)
+[![CI](https://img.shields.io/badge/CI-green-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-22-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
 [![CUDA](https://img.shields.io/badge/CUDA-sm__80%20A100-76b900.svg)](#gpu-inference)
@@ -36,6 +37,17 @@ It fuses four architectural innovations:
 | **GraphPalace** | Stigmergic memory | Pheromone-guided curriculum, O(1/√T) convergence |
 | **TRM-CausalValidator** | Recursive validator | 7M params, 0.1% compute, Quality Gate 6 |
 | **ZK Schnorr proofs** | Provenance chain | LLM output → live API, cryptographically verifiable |
+
+**v4.2.0** — HF-Reference Inference Fidelity + OpenRouter Launch Prep (2026-07-06):
+- 🎯 **Three silent inference-quality bugs found & fixed** by differential testing against HuggingFace transformers ground truth (same weights, CPU f32):
+  1. **YaRN RoPE correction range** — boundaries conflated 1/f with wavelength (extra 2π) and ramped linearly in wavelength; HF computes the range in dimension-index space (log formula) with a dim-index-linear ramp. 25/64 RoPE dims had wrong frequencies (~1.6 rad angle error by position 100). `attention_factor` now applied **squared** at score level (HF scales cos/sin, touching both q and k).
+  2. **Per-layer-type RoPE** — `rope_scaling` (YaRN) applies **only to the 8 full-attention layers**; the 24 sliding-window layers use standard RoPE at the same theta (HF `configuration_olmo3.py`). ATLAS now keeps dual CPU+GPU RoPE tables selected per layer.
+  3. **QK-norm scope** — `Olmo3RMSNorm(n_heads*head_dim)` normalizes the **full concatenated Q/K projection** (one RMS statistic across all heads), not per-head. Per-head normalization rescaled head magnitudes and crushed long-range retrieval: the model could not read its own prompt beyond ~128 tokens.
+- 📈 **Verified**: needle-retrieval passes 68→1,784 tokens (was FAIL at 156+), output byte-identical to HF reference; MMLU diverse-100 22%→**54%** (direct-answer protocol); new 300-position CPU/GPU logit-parity test (exact match)
+- 🚦 **CI green** (first time since April): MSRV 1.75→1.80, lockfile v4; **627/627 tests**
+- 🌐 **OpenRouter provider endpoints**: `GET /openrouter/models` (full provider schema), `GET /privacy`, SSE `: keep-alive` every 10s during prefill/think, early-429 concurrency discipline, bearer-key auth — live behind a Cloudflare tunnel on dedicated A100 silicon
+- ⚡ **GPU training path**: SFT optimizer step on GPU (fixed `step_gpu` clip-norm + weight-decay parity, Issue #20); `GpuVec::dup` D2D copies (H2D traffic −59%)
+- 🛡️ **No more silent GPU garbage**: sticky kernel-error flag + end-of-token integrity check + `gpu_poisoned` CPU fallback; stale host-shadow fallback audit (Issue #21)
 
 **v4.1.0** — Full GPU Attention Path + 61 tok/s BF16 (Issue #18):
    - Vendor-fork mistral.rs SQLite philosophy: ATLAS owns every kernel
