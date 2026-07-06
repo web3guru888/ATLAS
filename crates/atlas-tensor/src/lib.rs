@@ -90,7 +90,41 @@ mod ffi {
         /// Both x and out_idx must be device pointers.
         /// GPU argmax: writes index as f32 to out_f32 (index < 2^24 is exact).
         pub fn atlas_gpu_argmax(x: *const f32, out_f32: *mut f32, n: c_int);
+        pub fn atlas_take_kernel_error() -> c_int;
     }
+}
+
+/// Rust-side sticky error flag for GPU operations that fail outside a CUDA
+/// kernel launch (e.g. a D2H memcpy error in `GpuVec::download`).
+#[cfg(atlas_cuda)]
+static RUST_GPU_ERROR: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(atlas_cuda)]
+pub(crate) fn note_rust_gpu_error(code: i32) {
+    let _ = RUST_GPU_ERROR.compare_exchange(
+        0, code,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Return and clear the sticky GPU error flag (0 = no error since last call).
+///
+/// Covers (a) failed async kernel launches recorded by the C wrappers
+/// (`atlas_note_launch_err`) and (b) failed device↔host copies recorded on
+/// the Rust side. Inference callers check this at end-of-token: a non-zero
+/// value means the token's output is untrustworthy (a kernel silently did
+/// not run — e.g. launch failure under VRAM pressure) and the CPU path must
+/// recompute it. Always 0 on CPU-only builds.
+pub fn take_kernel_error() -> i32 {
+    #[cfg(atlas_cuda)]
+    {
+        let c = unsafe { ffi::atlas_take_kernel_error() };
+        let r = RUST_GPU_ERROR.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if c != 0 { c } else { r }
+    }
+    #[cfg(not(atlas_cuda))]
+    0
 }
 
 /// Drain all pending GPU work (cudaDeviceSynchronize).
@@ -218,9 +252,14 @@ mod gpu {
         }
         pub fn download(&self) -> Vec<f32> {
             let mut out = vec![0.0f32; self.len];
-            unsafe {
+            let err = unsafe {
                 cudaMemcpy(out.as_mut_ptr() as *mut c_void, self.ptr as *const c_void,
-                           self.len * 4, CUDA_MEMCPY_D2H);
+                           self.len * 4, CUDA_MEMCPY_D2H)
+            };
+            if err != 0 {
+                // Do NOT silently return zeros — record the failure so
+                // take_kernel_error() lets the caller recompute on CPU.
+                crate::note_rust_gpu_error(err);
             }
             out
         }
@@ -379,6 +418,10 @@ impl GpuMatrix {
         if let Some(ref a_buf) = self.buf {
             if let Some(b_buf) = gpu::GpuBuf::upload(rhs) {
                 if let Some(c_buf) = gpu::GpuBuf::alloc(m * n) {
+                    // Isolate this launch so the post-launch check below is
+                    // specific to it (any prior error was someone else's to
+                    // handle — sgemm's contract is bool success).
+                    let _ = take_kernel_error();
                     match a_buf {
                         gpu::GpuBufKind::F32(f32_buf) => unsafe {
                             ffi::atlas_matmul_f32(
@@ -393,7 +436,15 @@ impl GpuMatrix {
                             );
                         },
                     }
-                    out.copy_from_slice(&c_buf.download());
+                    let result = c_buf.download();
+                    if take_kernel_error() != 0 {
+                        // Kernel launch or copy failed (e.g. VRAM pressure):
+                        // `result` is uninitialized garbage. Report failure so
+                        // the caller runs its CPU fallback instead of
+                        // silently corrupting the forward pass.
+                        return false;
+                    }
+                    out.copy_from_slice(&result);
                     return true;
                 }
             }

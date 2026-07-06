@@ -612,6 +612,16 @@ struct Attention {
     /// GPU-cached QK-norm weights (uploaded once at model load).
     q_norm_gpu: Option<atlas_tensor::GpuVec>,
     k_norm_gpu: Option<atlas_tensor::GpuVec>,
+    /// Number of leading positions whose K/V are present in the CPU cache.
+    /// The full-GPU path advances only the GPU cache; CPU attention paths
+    /// call `sync_cpu_cache_from_gpu` to close the gap lazily.
+    cpu_synced_upto: usize,
+    /// True when the GPU KV cache may be missing entries for this sequence
+    /// (a CPU fallback happened and the backfill upload could not be
+    /// confirmed). While set, the full-GPU attention path is disabled so
+    /// attention always runs over the complete CPU cache instead of a
+    /// silently truncated GPU one. Cleared by `reset_cache()`.
+    gpu_kv_stale: bool,
     /// OLMo-2 QK-norm weights (empty = disabled)
     q_norm: Vec<f32>,
     k_norm: Vec<f32>,
@@ -638,6 +648,8 @@ impl Attention {
             gpu_kv:     None, // initialized after model loading via init_gpu_kv()
             q_norm_gpu: None,
             k_norm_gpu: None,
+            cpu_synced_upto: 0,
+            gpu_kv_stale: false,
             q_norm:     Vec::new(),
             k_norm:     Vec::new(),
             window_size: None, // set by OlmoModel::new() for SWA layers (Fix A)
@@ -646,6 +658,10 @@ impl Attention {
 
     /// Single-token forward at position `pos`. x: [d_model] → out: [d_model].
     fn forward_token(&mut self, x: &[f32], pos: usize, rope: &RopeCache) -> Vec<f32> {
+        // Mixed GPU/CPU execution: make sure the CPU cache holds the full
+        // history before attention reads it (no-op in steady CPU operation).
+        self.sync_cpu_cache_from_gpu(pos);
+
         let d  = self.n_heads * self.head_dim;
         let kv = self.n_kv_heads * self.head_dim;
 
@@ -680,11 +696,14 @@ impl Attention {
             rope.apply(&mut k[h*self.head_dim..(h+1)*self.head_dim], pos);
         }
 
-        // Write KV into cache
+        // Write KV into cache, and keep the GPU cache in lock-step so the
+        // full-GPU path stays correct after this CPU-side write.
         for h in 0..self.n_kv_heads {
             self.kv_cache.write_key(pos, h, &k[h*self.head_dim..(h+1)*self.head_dim]);
             self.kv_cache.write_val(pos, h, &v[h*self.head_dim..(h+1)*self.head_dim]);
         }
+        if pos == self.cpu_synced_upto { self.cpu_synced_upto = pos + 1; }
+        self.backfill_kv_to_gpu(pos, &k, &v);
 
         // GQA: group_size = n_heads / n_kv_heads
         let group = self.n_heads / self.n_kv_heads;
@@ -734,6 +753,10 @@ impl Attention {
         pos: usize,
         rope: &RopeCache,
     ) -> Option<atlas_tensor::GpuVec> {
+        // This path computes attention on the CPU over kv_cache — make sure
+        // the CPU cache holds history written by the full-GPU path.
+        self.sync_cpu_cache_from_gpu(pos);
+
         let d   = self.n_heads * self.head_dim;
         let kv  = self.n_kv_heads * self.head_dim;
 
@@ -770,11 +793,13 @@ impl Attention {
             rope.apply(&mut k[h*self.head_dim..(h+1)*self.head_dim], pos);
         }
 
-        // KV cache write
+        // KV cache write (CPU), plus GPU-cache lock-step backfill.
         for h in 0..self.n_kv_heads {
             self.kv_cache.write_key(pos, h, &k[h*self.head_dim..(h+1)*self.head_dim]);
             self.kv_cache.write_val(pos, h, &v[h*self.head_dim..(h+1)*self.head_dim]);
         }
+        if pos == self.cpu_synced_upto { self.cpu_synced_upto = pos + 1; }
+        self.backfill_kv_to_gpu(pos, &k, &v);
 
         // Attention scores + weighted value sum (CPU).
         // Fix A (SWA): positions outside sliding window get -∞ → zero weight after softmax.
@@ -806,6 +831,51 @@ impl Attention {
         // Output projection (GPU)
         let out_gpu = atlas_tensor::GpuVec::from_slice(&out_cpu);
         self.wo.forward_vec(&out_gpu)
+    }
+
+    /// Lazily rebuild the CPU KV cache from the GPU cache for positions
+    /// `[cpu_synced_upto, upto)`.
+    ///
+    /// The full-GPU attention path writes K/V only to VRAM. If execution
+    /// later falls back to a CPU attention path mid-sequence (e.g. transient
+    /// VRAM exhaustion), the CPU cache would silently lack the earlier
+    /// context — observed 2026-07-06 as garbage generation when a second
+    /// model ran beside the resident API server. This sync makes any such
+    /// fallback exact, at zero steady-state cost: nothing is downloaded
+    /// until a CPU path actually needs history (then one bulk D2H per
+    /// layer, and the incremental counter prevents repeats).
+    fn sync_cpu_cache_from_gpu(&mut self, upto: usize) {
+        if self.cpu_synced_upto >= upto { return; }
+        if let Some(gpu_kv) = &self.gpu_kv {
+            let kv_dim = self.n_kv_heads * self.head_dim;
+            let keys = gpu_kv.keys.download();
+            let vals = gpu_kv.values.download();
+            for t in self.cpu_synced_upto..upto {
+                for h in 0..self.n_kv_heads {
+                    let s = t * kv_dim + h * self.head_dim;
+                    self.kv_cache.write_key(t, h, &keys[s..s + self.head_dim]);
+                    self.kv_cache.write_val(t, h, &vals[s..s + self.head_dim]);
+                }
+            }
+        }
+        self.cpu_synced_upto = upto;
+    }
+
+    /// Backfill one position's K/V (computed on CPU) into the GPU cache so the
+    /// full-GPU path stays usable after a CPU fallback. If the upload cannot
+    /// be confirmed, mark the GPU cache stale — `forward_token_gpu_full`
+    /// refuses to run until the next `reset_cache()`.
+    fn backfill_kv_to_gpu(&mut self, pos: usize, k: &[f32], v: &[f32]) {
+        if self.gpu_kv.is_none() { return; }
+        let k_g = atlas_tensor::GpuVec::from_slice(k);
+        let v_g = atlas_tensor::GpuVec::from_slice(v);
+        if k_g.is_on_gpu() && v_g.is_on_gpu() {
+            if let Some(gpu_kv) = self.gpu_kv.as_mut() {
+                gpu_kv.write(pos, &k_g, &v_g);
+            }
+        } else {
+            self.gpu_kv_stale = true;
+        }
     }
 
     /// Initialize GPU KV cache and QK-norm GPU weights. Call once after weights are loaded.
@@ -840,6 +910,11 @@ impl Attention {
         pos: usize,
         rope_tables: &atlas_tensor::GpuRopeTables,
     ) -> Option<atlas_tensor::GpuVec> {
+        // GPU cache may be missing entries after an unconfirmed backfill —
+        // refuse the full-GPU path (caller falls back to CPU attention over
+        // the complete CPU cache).
+        if self.gpu_kv_stale { return None; }
+
         // ① QKV projections — stay in VRAM
         let mut q_gpu = self.wq.forward_vec(x)?;
         let mut k_gpu = self.wk.forward_vec(x)?;
@@ -857,7 +932,11 @@ impl Attention {
         rope_tables.apply_to(&mut q_gpu, self.n_heads, self.head_dim, pos);
         rope_tables.apply_to(&mut k_gpu, self.n_kv_heads, self.head_dim, pos);
 
-        // ④ Write K, V into GPU KV cache
+        // ④ Write K, V into GPU KV cache. The CPU cache is NOT written here
+        // (that costs two pipeline-stalling D2H copies per layer per token,
+        // measured -11%% tok/s on OLMo-3-7B); instead CPU attention paths
+        // lazily rebuild their history from this GPU cache on first use —
+        // see sync_cpu_cache_from_gpu.
         let gpu_kv = self.gpu_kv.as_mut()?;
         gpu_kv.write(pos, &k_gpu, &v_gpu);
 
@@ -877,6 +956,9 @@ impl Attention {
         if let Some(gpu_kv) = &mut self.gpu_kv {
             gpu_kv.reset();  // also a no-op for the same reason
         }
+        // New sequence rebuilds both caches from pos 0 — GPU cache usable again.
+        self.gpu_kv_stale = false;
+        self.cpu_synced_upto = 0;
     }
 }
 
@@ -1053,6 +1135,15 @@ impl TransformerBlock {
                 let mut normed = ffn_out;
                 normed.rmsnorm_inplace(ffn_norm_w, self.eps);
                 x.add_inplace(&normed);
+            } else {
+                // GPU FFN failed (e.g. transient VRAM exhaustion). The FFN is
+                // stateless — fall back to CPU rather than silently dropping
+                // its contribution, which corrupts every downstream token.
+                let mut x_cpu = x.download();
+                let mut ffn_cpu = self.ffn.forward(&x_cpu);
+                rmsnorm_inplace(&mut ffn_cpu, &self.ffn_norm, self.eps);
+                for (a, b) in x_cpu.iter_mut().zip(ffn_cpu.iter()) { *a += b; }
+                *x = GpuVec::from_slice(&x_cpu);
             }
         } else {
             // ── Llama pre-norm ─────────────────────────────────────────────────
@@ -1086,6 +1177,15 @@ impl TransformerBlock {
             x_norm2.rmsnorm_inplace(ffn_norm_w, self.eps);
             if let Some(ffn_out) = self.ffn.forward_gpu(&x_norm2) {
                 x.add_inplace(&ffn_out);
+            } else {
+                // GPU FFN failed — stateless, so CPU fallback (see post-norm
+                // branch): never silently skip the FFN contribution.
+                let mut x_cpu = x.download();
+                let mut xn = x_cpu.clone();
+                rmsnorm_inplace(&mut xn, &self.ffn_norm, self.eps);
+                let ffn_cpu = self.ffn.forward(&xn);
+                for (a, b) in x_cpu.iter_mut().zip(ffn_cpu.iter()) { *a += b; }
+                *x = GpuVec::from_slice(&x_cpu);
             }
         }
     }
@@ -1136,6 +1236,15 @@ impl TransformerBlock {
                 let mut normed = ffn_out;
                 normed.rmsnorm_inplace(ffn_norm_w, self.eps);
                 x.add_inplace(&normed);
+            } else {
+                // GPU FFN failed (e.g. transient VRAM exhaustion). The FFN is
+                // stateless — fall back to CPU rather than silently dropping
+                // its contribution, which corrupts every downstream token.
+                let mut x_cpu = x.download();
+                let mut ffn_cpu = self.ffn.forward(&x_cpu);
+                rmsnorm_inplace(&mut ffn_cpu, &self.ffn_norm, self.eps);
+                for (a, b) in x_cpu.iter_mut().zip(ffn_cpu.iter()) { *a += b; }
+                *x = GpuVec::from_slice(&x_cpu);
             }
         } else {
             // ── Llama pre-norm path (default) ─────────────────────────────────
@@ -1167,6 +1276,15 @@ impl TransformerBlock {
             x_norm2.rmsnorm_inplace(ffn_norm_w, self.eps);
             if let Some(ffn_out) = self.ffn.forward_gpu(&x_norm2) {
                 x.add_inplace(&ffn_out);
+            } else {
+                // GPU FFN failed — stateless, so CPU fallback (see post-norm
+                // branch): never silently skip the FFN contribution.
+                let mut x_cpu = x.download();
+                let mut xn = x_cpu.clone();
+                rmsnorm_inplace(&mut xn, &self.ffn_norm, self.eps);
+                let ffn_cpu = self.ffn.forward(&xn);
+                for (a, b) in x_cpu.iter_mut().zip(ffn_cpu.iter()) { *a += b; }
+                *x = GpuVec::from_slice(&x_cpu);
             }
         }
     }
@@ -1331,6 +1449,11 @@ pub struct OlmoModel {
     pub extra_stop_tokens: Vec<u32>,
     /// Stateful PRNG for temperature sampling (re-seeded each `generate()` call).
     rng:     Rng,
+    /// Set when a GPU kernel launch/copy failed mid-sequence (typically VRAM
+    /// pressure): the GPU path is disabled until the next `reset()` so every
+    /// remaining token is computed on the (always-consistent) CPU path
+    /// instead of emitting silent garbage. See `forward_one_gpu`.
+    gpu_poisoned: bool,
 }
 
 impl OlmoModel {
@@ -1365,7 +1488,7 @@ impl OlmoModel {
             cfg.vocab_size,
         );
         let eos_token_id = cfg.eos_token_id;
-        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy() }
+        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy(), gpu_poisoned: false }
     }
 
     /// Upload precomputed RoPE tables and allocate GPU KV caches.
@@ -1405,6 +1528,8 @@ impl OlmoModel {
     pub fn reset(&mut self) {
         self.pos = 0;
         for l in &mut self.layers { l.attn.reset_cache(); }
+        // New sequence — give the GPU path another chance.
+        self.gpu_poisoned = false;
     }
 
     /// Forward pass for one new token. Returns logits [vocab_size].
@@ -1477,8 +1602,42 @@ impl OlmoModel {
     /// regression (15.4 → 8.7 tok/s measured on A100-SXM4-40GB).  When no hook
     /// is needed, always call this method for zero per-layer overhead.
     pub fn forward_one_gpu(&mut self, token: u32) -> Option<Vec<f32>> {
+        if !atlas_tensor::cuda_available() || self.gpu_poisoned { return None; }
+
+        // Clear any stale error so the end-of-token integrity check below
+        // reflects THIS token only.
+        let _ = atlas_tensor::take_kernel_error();
+
+        let result = self.forward_one_gpu_inner(token);
+        let kernel_err = atlas_tensor::take_kernel_error();
+
+        if let (Some(logits), 0) = (&result, kernel_err) {
+            debug_assert_eq!(logits.len(), self.config.vocab_size);
+            return result;
+        }
+
+        // A kernel launch or device copy failed mid-token (typical trigger:
+        // VRAM pressure — cudaErrorLaunchOutOfResources/MemoryAllocation).
+        // Without this check the pipeline "succeeded" over uninitialized
+        // buffers and generated silent garbage. Roll back the position so
+        // the caller's CPU recompute of this token writes the correct slot;
+        // the CPU KV cache is complete (write-through mirroring), so the
+        // fallback is numerically exact. GPU stays disabled until reset().
+        self.pos -= 1;
+        self.gpu_poisoned = true;
+        eprintln!(
+            "[atlas-model] GPU failure at pos {} (kernel_err={kernel_err}) — \
+             CPU fallback for the rest of this sequence",
+            self.pos
+        );
+        None
+    }
+
+    /// GPU forward body — factored out so `forward_one_gpu` can wrap it with
+    /// the end-of-token kernel-error integrity check. Increments `self.pos`
+    /// unconditionally at entry (wrapper rolls back on failure).
+    fn forward_one_gpu_inner(&mut self, token: u32) -> Option<Vec<f32>> {
         use atlas_tensor::GpuVec;
-        if !atlas_tensor::cuda_available() { return None; }
 
         let pos = self.pos;
         self.pos += 1;
@@ -1542,7 +1701,8 @@ impl OlmoModel {
         F: FnMut(usize, &[f32]) -> Option<f32>,
     {
         use atlas_tensor::GpuVec;
-        if !atlas_tensor::cuda_available() { return None; }
+        if !atlas_tensor::cuda_available() || self.gpu_poisoned { return None; }
+        let _ = atlas_tensor::take_kernel_error();
 
         let pos = self.pos;
         self.pos += 1;
@@ -1565,11 +1725,32 @@ impl OlmoModel {
         let norm_w = GpuVec::from_slice(&self.norm);
         x.rmsnorm_inplace(&norm_w, self.config.rms_norm_eps);
 
-        // LM head projection (GPU)
-        let logits_gpu = self.lm_head.forward_vec(&x)?;
+        // LM head projection (GPU) — on failure, roll back the position so
+        // the caller's CPU recompute writes the correct KV slot.
+        let logits_gpu = match self.lm_head.forward_vec(&x) {
+            Some(l) => l,
+            None => {
+                self.pos -= 1;
+                self.gpu_poisoned = true;
+                return None;
+            }
+        };
 
         // D2H: download logits (one PCIe transfer per token)
-        Some(logits_gpu.download())
+        let logits = logits_gpu.download();
+
+        // Same end-of-token integrity check as forward_one_gpu.
+        if atlas_tensor::take_kernel_error() != 0 {
+            self.pos -= 1;
+            self.gpu_poisoned = true;
+            eprintln!(
+                "[atlas-model] GPU failure at pos {} (hooked path) — \
+                 CPU fallback for the rest of this sequence",
+                self.pos
+            );
+            return None;
+        }
+        Some(logits)
     }
 
     /// Forward pass for a sequence. Returns logits for every token position.

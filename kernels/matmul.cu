@@ -43,6 +43,38 @@
 #include <stdint.h>
 #include <stdio.h>
 
+/* ── Async launch-error tracking (inference hot path) ─────────────────────
+ *
+ * The inference wrappers below launch kernels asynchronously (no sync) for
+ * throughput. Under VRAM pressure a launch can fail (e.g.
+ * cudaErrorLaunchOutOfResources / cudaErrorMemoryAllocation); with no error
+ * check the output buffer simply keeps its UNINITIALIZED contents and the
+ * pipeline "succeeds" — observed 2026-07-06 as silent garbage generation
+ * when a second model ran beside the resident API server.
+ *
+ * Every async wrapper now records cudaGetLastError() (cheap, non-blocking,
+ * no sync) into a sticky flag. Rust checks atlas_take_kernel_error() at
+ * end-of-token and falls back to the CPU path when a launch failed. */
+static int g_atlas_kernel_error = 0;
+
+static inline void atlas_note_launch_err(const char* where) {
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        if (g_atlas_kernel_error == 0) g_atlas_kernel_error = (int)e;
+        fprintf(stderr, "[atlas-tensor] kernel launch failed in %s: %s (%d)\n",
+                where, cudaGetErrorString(e), (int)e);
+    }
+}
+
+/* Return and clear the sticky launch-error flag (0 = no error). */
+extern "C" int atlas_take_kernel_error(void) {
+    int e = g_atlas_kernel_error;
+    g_atlas_kernel_error = 0;
+    return e;
+}
+
+
+
 #define TILE 32
 #define MIN(a,b) ((a)<(b)?(a):(b))
 
@@ -482,6 +514,7 @@ void atlas_matmul_f32(
         dim3 block(32, GEMV_ROWS_PER_BLOCK);
         dim3 grid((M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
         sgemv_f32_kernel<<<grid, block>>>(A, B, C, M, K);
+    atlas_note_launch_err("atlas_matmul_f32/sgemv");
         /* No cudaDeviceSynchronize() — stream-0 serialises automatically. */
         return;
     }
@@ -520,6 +553,7 @@ void atlas_matmul_f32(
     dim3 block(TILE, TILE);
     dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
     matmul_tiled_kernel<<<grid, block>>>(A, B, C, M, N, K);
+    atlas_note_launch_err("atlas_matmul_f32/tiled");
 }
 
 /* ── Element-wise ops (async — no sync needed between kernel calls) ─────── */
@@ -528,22 +562,26 @@ void atlas_vec_add_f32(const float* a, const float* b, float* out, int n) {
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
     vec_add_kernel<<<blocks, threads>>>(a, b, out, n);
+    atlas_note_launch_err("atlas_vec_add_f32");
 }
 
 void atlas_scale_f32(const float* x, float s, float* out, int n) {
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
     scale_kernel<<<blocks, threads>>>(x, s, out, n);
+    atlas_note_launch_err("atlas_scale_f32");
 }
 
 void atlas_relu_f32(const float* x, float* out, int n) {
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
     relu_kernel<<<blocks, threads>>>(x, out, n);
+    atlas_note_launch_err("atlas_relu_f32");
 }
 
 void atlas_softmax_f32(const float* x, float* out, int rows, int cols) {
     softmax_kernel<<<rows, 32>>>(x, out, rows, cols);
+    atlas_note_launch_err("atlas_softmax_f32");
 }
 
 /* ── Training ops (AdamW, quantize) — left synchronous for safety ────────── */
@@ -662,6 +700,7 @@ void atlas_rmsnorm_f32(
     int n_warps = (threads + 31) / 32;
     int smem    = n_warps * (int)sizeof(float);
     rmsnorm_kernel<<<1, threads, smem>>>(x, w, out, n, eps);
+    atlas_note_launch_err("atlas_rmsnorm_f32");
 }
 
 void atlas_rope_apply_f32(float* x, int pos, int head_dim, float theta_base) {
@@ -669,18 +708,21 @@ void atlas_rope_apply_f32(float* x, int pos, int head_dim, float theta_base) {
     int threads = MIN(256, half);
     int blocks  = (half + threads - 1) / threads;
     rope_apply_kernel<<<blocks, threads>>>(x, pos, head_dim, theta_base);
+    atlas_note_launch_err("atlas_rope_apply_f32");
 }
 
 void atlas_silu_mul_f32(const float* gate, const float* up, float* out, int n) {
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
     silu_mul_kernel<<<blocks, threads>>>(gate, up, out, n);
+    atlas_note_launch_err("atlas_silu_mul_f32");
 }
 
 void atlas_vram_copy_f32(const float* src, float* dst, int n) {
     int threads = 256;
     int blocks  = (n + threads - 1) / threads;
     copy_kernel<<<blocks, threads>>>(src, dst, n);
+    atlas_note_launch_err("atlas_vram_copy_f32");
     /* vram_copy is used in KV-cache writes between forward passes —
      * async is safe (subsequent kernels depend on stream ordering). */
 }
@@ -702,12 +744,14 @@ void atlas_sgemm_bf16_f32(
         dim3 block(32, GEMV_ROWS_PER_BLOCK);
         dim3 grid((M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
         sgemv_bf16_kernel<<<grid, block>>>(A_bf16, B, C, M, K);
+    atlas_note_launch_err("atlas_sgemm_bf16/sgemv");
     } else {
         /* BF16 GEMM (prefill): tiled kernel with on-the-fly BF16→F32 conversion.
          * Future: replace with cublasGemmEx BF16×BF16→F32 for tensor-core speed. */
         dim3 block(TILE, TILE);
         dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE);
         sgemm_bf16_kernel<<<grid, block>>>(A_bf16, B, C, M, N, K);
+    atlas_note_launch_err("atlas_sgemm_bf16/tiled");
     }
     /* Async: downstream kernels on stream-0 wait automatically. */
 }
@@ -767,6 +811,7 @@ void atlas_qk_norm_inplace(
     int threads  = (head_dim < 128) ? head_dim : 128;
     int smem     = ((threads + 31) / 32) * sizeof(float);
     qk_norm_inplace_kernel<<<n_heads, threads, smem>>>(x, w, n_heads, head_dim, eps);
+    atlas_note_launch_err("atlas_qk_norm_inplace");
 }
 
 /* ── GPU Decode Attention ───────────────────────────────────────────────── */
@@ -964,6 +1009,7 @@ void atlas_rope_precomputed(
     int threads = (half < 64) ? half : 64;
     rope_precomputed_kernel<<<n_heads, threads>>>(
         x, cos_tab, sin_tab, n_heads, head_dim, pos, half, max_seq);
+    atlas_note_launch_err("atlas_rope_precomputed");
 }
 
 void atlas_kv_cache_write(
@@ -976,6 +1022,7 @@ void atlas_kv_cache_write(
     int blocks  = (total + threads - 1) / threads;
     kv_cache_write_kernel<<<blocks, threads>>>(
         k_cache, v_cache, new_k, new_v, pos, n_kv_heads, head_dim);
+    atlas_note_launch_err("atlas_kv_cache_write");
 }
 
 void atlas_decode_attention(
@@ -990,6 +1037,7 @@ void atlas_decode_attention(
     decode_attention_kernel<<<n_heads, ATTN_THREADS, smem_bytes>>>(
         q, k_cache, v_cache, out,
         n_heads, n_kv_heads, head_dim, pos, scale, window_size);
+    atlas_note_launch_err("atlas_decode_attention");
 }
 
 
@@ -1061,7 +1109,9 @@ void atlas_gpu_argmax(const float* x, float* out_f32, int n) {
     cudaMalloc((void**)&d_block_vals, n_blocks * sizeof(float));
     cudaMalloc((void**)&d_block_idxs, n_blocks * sizeof(int));
     argmax_first_pass_kernel<<<n_blocks, ARGMAX_THREADS>>>(x, d_block_vals, d_block_idxs, n);
+    atlas_note_launch_err("atlas_gpu_argmax/pass1");
     argmax_second_pass_kernel<<<1, ARGMAX_THREADS>>>(d_block_vals, d_block_idxs, out_f32, n_blocks);
+    atlas_note_launch_err("atlas_gpu_argmax/pass2");
     cudaFree(d_block_vals);
     cudaFree(d_block_idxs);
 }
