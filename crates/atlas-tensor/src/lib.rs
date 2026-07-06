@@ -598,8 +598,13 @@ impl GpuVec {
                 return;
             }
         }
-        // CPU fallback
-        for (a, b) in self.cpu.iter_mut().zip(other.cpu.iter()) { *a += *b; }
+        // CPU fallback — never trust the host shadows of GPU-resident
+        // operands: once a vec lives in VRAM its `cpu` field is stale zeros.
+        // download() returns the authoritative contents either way.
+        let av = self.download();
+        let bv = other.download();
+        let sum: Vec<f32> = av.iter().zip(bv.iter()).map(|(x, y)| x + y).collect();
+        *self = GpuVec::from_slice(&sum);
     }
 
     /// In-place RMSNorm: self = rmsnorm(self, w, eps).
@@ -618,12 +623,14 @@ impl GpuVec {
                 return;
             }
         }
-        // CPU fallback
-        let ss: f32 = self.cpu.iter().map(|&v| v * v).sum::<f32>() / self.len as f32;
+        // CPU fallback — download authoritative contents (host shadows of
+        // GPU-resident vecs are stale; norm weights ARE typically resident).
+        let xv = self.download();
+        let wv = w.download();
+        let ss: f32 = xv.iter().map(|&v| v * v).sum::<f32>() / self.len as f32;
         let rms_inv = 1.0 / (ss + eps).sqrt();
-        for (xi, wi) in self.cpu.iter_mut().zip(w.cpu.iter()) {
-            *xi = *xi * rms_inv * wi;
-        }
+        let out: Vec<f32> = xv.iter().zip(wv.iter()).map(|(x, w)| x * rms_inv * w).collect();
+        *self = GpuVec::from_slice(&out);
     }
 
     /// Raw GPU pointer (for use in FFI calls). None on CPU-only builds.
@@ -681,15 +688,15 @@ pub fn silu_mul_gpu(gate: &GpuVec, up: &GpuVec) -> GpuVec {
             return GpuVec { buf: Some(out_buf), cpu: vec![0.0f32; n], len: n };
         }
     }
-    // CPU fallback
-    let cpu: Vec<f32> = gate.cpu.iter().zip(up.cpu.iter())
+    // CPU fallback — download authoritative contents (host shadows of
+    // GPU-resident vecs are stale zeros). from_slice retries the upload so
+    // downstream GPU ops can continue when the failure was transient.
+    let gv = gate.download();
+    let uv = up.download();
+    let cpu: Vec<f32> = gv.iter().zip(uv.iter())
         .map(|(&g, &u)| { let sg = g / (1.0 + (-g).exp()); sg * u })
         .collect();
-    GpuVec {
-        #[cfg(atlas_cuda)] buf: None,
-        cpu,
-        len: n,
-    }
+    GpuVec::from_slice(&cpu)
 }
 
 /// Call the GPU AdamW step kernel for one parameter group.
@@ -738,12 +745,14 @@ pub fn qk_norm_inplace_gpu(x: &mut GpuVec, w: &GpuVec, n_heads: usize, head_dim:
         }
         return;
     }
-    // CPU fallback: per-head RMSNorm
+    // CPU fallback: per-head RMSNorm. `x` is host-resident here (otherwise
+    // the GPU path above ran), but `w` may live in VRAM — download it.
+    let wv = w.download();
     let n = n_heads * head_dim;
     for h in 0..n_heads {
         let s = h * head_dim;
         let xe = &mut x.cpu[s..s + head_dim];
-        let we = &w.cpu[s..s + head_dim];
+        let we = &wv[s..s + head_dim];
         let rms_inv = (xe.iter().map(|&v| v * v).sum::<f32>() / head_dim as f32 + eps)
             .sqrt()
             .recip();
@@ -774,6 +783,12 @@ impl GpuRopeTables {
         if !cuda_available() { return None; }
         let cos = GpuVec::from_slice(cos_flat);
         let sin = GpuVec::from_slice(sin_flat);
+        if !cos.is_on_gpu() || !sin.is_on_gpu() {
+            // Upload failed (VRAM pressure): returning Some would make
+            // apply_to() silently skip RoPE for every token. Report failure
+            // so the model uses the CPU-attention path instead.
+            return None;
+        }
         Some(Self { cos, sin, max_seq, half_dim })
     }
 
