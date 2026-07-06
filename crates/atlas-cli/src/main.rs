@@ -342,10 +342,12 @@ fn cmd_train(args: &[String]) -> i32 {
     let batch_sz = opt_usize(args, "--batch", 8);
     let lr       = opt_f64(args, "--lr", 0.01) as f32;
     let output   = opt(args, "--output").unwrap_or("./atlas-ckpt");
+    // GPU optimizer: auto-detect CUDA, allow forcing the CPU path with --cpu.
+    let use_gpu  = !flag(args, "--cpu") && atlas_tensor::cuda_available();
 
     println!("┌─ ATLAS train ─────────────────────────────────────────────────");
     println!("│  corpus={corpus_path}  epochs={epochs}  batch={batch_sz}  lr={lr:.2e}");
-    println!("│  output={output}");
+    println!("│  output={output}  optimizer={}", if use_gpu { "AdamW[CUDA]" } else { "AdamW[CPU]" });
     println!("└───────────────────────────────────────────────────────────────");
 
     let gate_cfg = GateConfig::default();
@@ -363,6 +365,7 @@ fn cmd_train(args: &[String]) -> i32 {
         batch_size: batch_sz,
         lr,
         max_epochs: epochs,
+        use_gpu,
         ..Default::default()
     };
 

@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 atlas-core     = { path = "../atlas-core" }
+atlas-tensor   = { path = "../atlas-tensor" }
 atlas-model    = { path = "../atlas-model" }
 atlas-tokenize = { path = "../atlas-tokenize" }
 atlas-astra    = { path = "../atlas-astra" }

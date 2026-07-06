@@ -55,6 +55,10 @@ pub struct SftConfig {
     pub seed: u64,
     /// Gradient accumulation steps. Effective batch = batch_size * accum_steps. Default: 1.
     pub accum_steps: usize,
+    /// Run AdamW parameter updates on the GPU (`atlas_adamw_step` CUDA kernel).
+    /// Safe to enable unconditionally: falls back to the CPU path at runtime
+    /// when no CUDA device is present. Default: false.
+    pub use_gpu: bool,
 }
 
 impl Default for SftConfig {
@@ -70,6 +74,7 @@ impl Default for SftConfig {
             weight_decay: 0.01,
             seed: 42,
             accum_steps: 1,
+            use_gpu: false,
         }
     }
 }
@@ -375,6 +380,19 @@ impl SftTrainer {
         }
     }
 
+    /// Run one AdamW update — on the GPU when `config.use_gpu` is set.
+    ///
+    /// [`AdamW::step_gpu`] returns `Ok(false)` when CUDA is unavailable at
+    /// runtime, in which case this transparently falls back to the CPU
+    /// [`AdamW::step`]. A hard CUDA error is propagated: the optimizer state
+    /// must be treated as suspect and the training step failed.
+    fn optimizer_step(&mut self, grads: &[Vec<f32>]) -> Result<()> {
+        if self.config.use_gpu && self.optimizer.step_gpu(grads)? {
+            return Ok(());
+        }
+        self.optimizer.step(grads)
+    }
+
     /// Compute loss for a single (input, target) pair **without** updating weights.
     pub fn compute_loss(&self, input_token: u32, target_token: u32) -> Result<f32> {
         let mut tape = GradTape::new();
@@ -424,7 +442,7 @@ impl SftTrainer {
         let grad_norm = atlas_optim::global_grad_norm(&grads);
 
         // ── Optimizer step ───────────────────────────────────
-        self.optimizer.step(&grads)?;
+        self.optimizer_step(&grads)?;
 
         // ── Sync weights back to model ───────────────────────
         self.model.embed = self.optimizer.params[0].param.clone();
@@ -517,7 +535,7 @@ impl SftTrainer {
                     let grad_norm = atlas_optim::clip_grad_norm(grads, 1.0);
                     self.global_step += 1;
                     self.scheduler.apply(&mut self.optimizer, self.global_step);
-                    self.optimizer.step(grads)?;
+                    self.optimizer_step(grads)?;
                     self.model.embed = self.optimizer.params[0].param.clone();
                     self.model.w1    = self.optimizer.params[1].param.clone();
                     self.model.w2    = self.optimizer.params[2].param.clone();
@@ -540,7 +558,7 @@ impl SftTrainer {
                 let grad_norm = atlas_optim::clip_grad_norm(grads, 1.0);
                 self.global_step += 1;
                 self.scheduler.apply(&mut self.optimizer, self.global_step);
-                self.optimizer.step(grads)?;
+                self.optimizer_step(grads)?;
                 self.model.embed = self.optimizer.params[0].param.clone();
                 self.model.w1    = self.optimizer.params[1].param.clone();
                 self.model.w2    = self.optimizer.params[2].param.clone();
@@ -1113,5 +1131,52 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(path);
+    }
+
+    // ── GPU/CPU optimizer parity ────────────────────────────────────────────
+    // Runs by default; self-skips when no CUDA device is present.
+
+    #[test]
+    fn sft_gpu_cpu_optimizer_parity() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+
+        let base = SftConfig {
+            vocab_size: 50,
+            hidden_dim: 16,
+            lr: 0.05,
+            warmup_steps: 0,
+            seed: 7,
+            ..Default::default()
+        };
+        let mut cpu = SftTrainer::new(SftConfig { use_gpu: false, ..base.clone() });
+        let mut gpu = SftTrainer::new(SftConfig { use_gpu: true,  ..base });
+
+        let text = "stigmergic pheromone gradients converge";
+        let cpu_steps = cpu.train_on_text(text).expect("cpu training failed");
+        let gpu_steps = gpu.train_on_text(text).expect("gpu training failed");
+        assert_eq!(cpu_steps.len(), gpu_steps.len());
+        assert!(!cpu_steps.is_empty());
+
+        // Same seed + same data ⇒ the GPU AdamW kernel must track the CPU
+        // implementation. f32 op-ordering differs slightly, so allow a small
+        // absolute tolerance on the final weights.
+        for (name, a, b) in [
+            ("embed", &cpu.model.embed, &gpu.model.embed),
+            ("w1", &cpu.model.w1, &gpu.model.w1),
+            ("w2", &cpu.model.w2, &gpu.model.w2),
+        ] {
+            let max_err = a.iter().zip(b.iter())
+                .map(|(&x, &y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("  gpu/cpu parity {name}: max_err={max_err:.2e}");
+            assert!(max_err < 1e-4, "{name} diverged: max_err={max_err:.2e}");
+        }
+
+        // Losses along the way must agree too (forward is CPU in both cases,
+        // so any drift comes from the optimizer path).
+        for (c, g) in cpu_steps.iter().zip(gpu_steps.iter()) {
+            assert!((c.loss - g.loss).abs() < 1e-3,
+                "loss drift at step {}: cpu={:.6} gpu={:.6}", c.step, c.loss, g.loss);
+        }
     }
 }

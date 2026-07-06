@@ -209,23 +209,61 @@ impl AdamW {
         let bc1 = 1.0 / (1.0 - self.cfg.beta1.powf(t));
         let bc2 = 1.0 / (1.0 - self.cfg.beta2.powf(t));
 
+        // Global-norm gradient clipping — must match the CPU `step()` exactly,
+        // otherwise the two paths silently train different models (caught by
+        // atlas-corpus::sft_gpu_cpu_optimizer_parity).
+        let clip_scale = if self.cfg.clip_norm > 0.0 {
+            let sq_sum: f32 = grads.iter()
+                .flat_map(|g| g.iter())
+                .map(|x| x * x)
+                .sum();
+            let global_norm = sq_sum.sqrt();
+            if global_norm > self.cfg.clip_norm {
+                self.cfg.clip_norm / global_norm
+            } else {
+                1.0
+            }
+        } else {
+            1.0
+        };
+
+        // Pre-scaled gradient staging buffer (only allocated when clipping).
+        let mut scaled: Vec<f32> = Vec::new();
+
         for (ps, grad) in self.params.iter_mut().zip(grads.iter()) {
             let n = ps.param.len();
             if n == 0 { continue; }
+            if grad.len() != n {
+                return Err(AtlasError::ShapeMismatch {
+                    expected: vec![n],
+                    got:      vec![grad.len()],
+                });
+            }
             // Ensure moment buffers are initialized
             if ps.m.len() != n { ps.m = vec![0.0f32; n]; }
             if ps.v.len() != n { ps.v = vec![0.0f32; n]; }
+
+            let grad_ptr = if clip_scale != 1.0 {
+                scaled.clear();
+                scaled.extend(grad.iter().map(|&g| g * clip_scale));
+                scaled.as_ptr()
+            } else {
+                grad.as_ptr()
+            };
+
+            // Per-param decay flag — the CPU path only decays when ps.decay.
+            let wd = if ps.decay { self.cfg.weight_decay } else { 0.0 };
 
             let did_gpu = atlas_tensor::adamw_step_gpu(
                 ps.param.as_mut_ptr(),
                 ps.m.as_mut_ptr(),
                 ps.v.as_mut_ptr(),
-                grad.as_ptr(),
+                grad_ptr,
                 self.cfg.lr,
                 self.cfg.beta1,
                 self.cfg.beta2,
                 self.cfg.eps,
-                self.cfg.weight_decay,
+                wd,
                 bc1, bc2,
                 n,
             )?;
