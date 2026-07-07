@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
 [![Release](https://img.shields.io/badge/release-v4.2.0-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-627%2F627%20passing-brightgreen.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-631%2F631%20passing-brightgreen.svg)](#status)
 [![CI](https://img.shields.io/badge/CI-green-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-22-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
@@ -44,7 +44,9 @@ It fuses four architectural innovations:
   2. **Per-layer-type RoPE** — `rope_scaling` (YaRN) applies **only to the 8 full-attention layers**; the 24 sliding-window layers use standard RoPE at the same theta (HF `configuration_olmo3.py`). ATLAS now keeps dual CPU+GPU RoPE tables selected per layer.
   3. **QK-norm scope** — `Olmo3RMSNorm(n_heads*head_dim)` normalizes the **full concatenated Q/K projection** (one RMS statistic across all heads), not per-head. Per-head normalization rescaled head magnitudes and crushed long-range retrieval: the model could not read its own prompt beyond ~128 tokens.
 - 📈 **Verified**: needle-retrieval passes 68→1,784 tokens (was FAIL at 156+), output byte-identical to HF reference; MMLU diverse-100 22%→**54%** (direct-answer protocol); new 300-position CPU/GPU logit-parity test (exact match)
-- 🚦 **CI green** (first time since April): MSRV 1.75→1.80, lockfile v4; **627/627 tests**
+- 🚦 **CI green** (first time since April): MSRV 1.75→1.80, lockfile v4; **631/631 tests**
+	- 🧠 **32B AWQ inference on a single A100-40GB** — OLMo-3-32B-Think at W4A32: **GSM8K-25 100%, MMLU-40 82%, Code-5 5/5**, 14.6 tok/s decode, 27.2 GB VRAM. Custom `gemv_w4_kernel` + streaming shard loader + `OlmoModel::new_uninit`. Purely additive — 7B BF16 path untouched and re-verified. See [model card](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-32B-Think-v4).
+	- 🔗 **HF Space LIVE** at [huggingface.co/spaces/openhubresearch/ATLAS](https://huggingface.co/spaces/openhubresearch/ATLAS) — serving 32B reasoning model through ATLAS stack on dedicated A100 silicon
 - 🌐 **OpenRouter provider endpoints**: `GET /openrouter/models` (full provider schema), `GET /privacy`, SSE `: keep-alive` every 10s during prefill/think, early-429 concurrency discipline, bearer-key auth — live behind a Cloudflare tunnel on dedicated A100 silicon
 - ⚡ **GPU training path**: SFT optimizer step on GPU (fixed `step_gpu` clip-norm + weight-decay parity, Issue #20); `GpuVec::dup` D2D copies (H2D traffic −59%)
 - 🛡️ **No more silent GPU garbage**: sticky kernel-error flag + end-of-token integrity check + `gpu_poisoned` CPU fallback; stale host-shadow fallback audit (Issue #21)
@@ -216,6 +218,7 @@ ATLAS v4.0.0 delivers a **fully GPU-resident forward pass** — hidden states st
 | SmolLM2-1.7B | 1.7B | **12.6** | ~6.5 GB | f32, 2.4× over CPU |
 | TinyLlama-1.1B | 1.1B | **20.9** | ~8.4 GB | f32 |
 | OLMo-3-7B-Think | 7B | **61.7** | ~14 GB | **BF16 W16A32** (v4.1.0); full GPU attention, zero intra-layer PCIe, cuBLAS TF32 |
+| OLMo-3-32B-Think | 32B | **14.6** | ~27.2 GB | **W4A32 AWQ** (v4.2.0); custom GEMV kernel, streaming W4 shard loader, single A100-40GB |
 
 ### CUDA Kernel Suite
 
@@ -231,6 +234,7 @@ ATLAS v4.0.0 delivers a **fully GPU-resident forward pass** — hidden states st
 | `kv_cache_write_kernel` | VRAM-to-VRAM KV cache write at position pos (v4.1.0) |
 | `atlas_gpu_argmax` | Two-pass parallel GPU argmax — no 400KB D2H logit download (v4.1.0) |
 | `sgemm_vec` | Zero-copy matrix×vector; `GpuVec` activation buffer |
+| `gemv_w4_kernel` | W4A32 GEMV — warp-per-row with inline dequant, int4 AWQ serving (v4.2.0) |
 
 **CUDA portability**: all kernels use `rsqrtf()` (not `__rsqrtf()`) for cross-platform compatibility.
 
@@ -446,18 +450,18 @@ cargo build --release -p atlas-cli
 
 ---
 
-## Status — v4.1.0
+## Status — v4.2.0
 
-**600/600 tests passing** · **22 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **61.7 tok/s OLMo-3-7B-Think (BF16)**
+**631/631 tests passing** · **22 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **61.7 tok/s OLMo-3-7B-Think (BF16)** · **14.6 tok/s OLMo-3-32B-Think (W4A32)**
 
-> 🏔 **v4.1.0 is the current release.** Full GPU attention path: zero intra-layer PCIe transfers during decode. `StigmergicHook` trait wired into every forward pass — per-layer pheromone deposits into GraphPalace. cuBLAS TF32 tensor cores + async GPU allocator. CPU and GPU KV cache reset made NO-OP (eliminates 605ms overhead/call). **OLMo-3-7B-Think: 15.4 → 61.7 tok/s** (4× speedup) on A100-SXM4-40GB BF16. 600/600 tests. Closes #18.
+> 🏔 **v4.2.0 is the current release.** 32B AWQ W4 inference on a single A100-40GB: `gemv_w4_kernel` + streaming shard loader fits within 27.2 GB VRAM. Three silent inference-quality bugs fixed by differential testing against HuggingFace transformers. OpenRouter provider endpoints + bearer-key auth live behind Cloudflare tunnel. HF Space serving 32B reasoning model. 631/631 tests. Closes #22 (batched prefill scoped, implementation TBD).
 
 ### What Works
 
 - ✅ **Discovery is real** — `atlas discover --cycles 3` hits NASA POWER, WHO GHO, World Bank, ArXiv live APIs; causal inference via PC algorithm; Bayesian quality gates
 - ✅ **Memory is real** — 5-type pheromone system (exploitation/exploration/success/traversal/recency), MMAS ceiling, A\* semantic pathfinding (α·C_sem + β·C_phe + γ·C_str), Active Inference agents; `atlas palace --hot` shows pheromone trails
 - ✅ **Training is real** — SFT with GradTape + AdamW + LoRA (rank=8) + gradient accumulation + safetensors checkpoint; DeepSupervisionTrainer (N_sup=4..16, loss trace, latent carry)
-- ✅ **GPU inference is real** — SmolLM2-135M at 37.7 tok/s on A100-SXM4-40GB; OLMo-3-7B-Think at **61.7 tok/s** (BF16 GPU, W16A32, 14 GB VRAM, v4.1.0); full GPU attention path, zero intra-layer PCIe, cuBLAS TF32 tensor cores; SWA + YaRN RoPE; post-norm + QK-norm architecture
+- ✅ **GPU inference is real** — SmolLM2-135M at 37.7 tok/s on A100-SXM4-40GB; OLMo-3-7B-Think at **61.7 tok/s** (BF16 GPU, W16A32, 14 GB); OLMo-3-32B-Think at **14.6 tok/s** (W4A32 AWQ, 27.2 GB, single A100-40GB, v4.2.0); full GPU attention path, zero intra-layer PCIe, cuBLAS TF32 tensor cores; SWA + YaRN RoPE; post-norm + QK-norm architecture
 - ✅ **API is real** — `atlas api serve` exposes `/v1/chat/completions` + `/v1/completions` + `/v1/models`; SSE streaming; CORS; OLMo-3 sampling defaults; think budget; 47 tests
 - ✅ **Provenance is real** — Schnorr proofs + Groth16 stub (HMAC-SHA256, BLS12-381-compatible interface) + ProvenanceChain; `atlas prove` generates verifiable proofs
 - ✅ **Safety is real** — Horn-clause constitution (8 principles, 4 domains, Young 2026 NP-hardness validated); 5-state FSM (`BOOT→NOMINAL→DEGRADED→SAFE_MODE→EMERGENCY_STOP`); CircuitBreaker; append-only audit log
@@ -488,6 +492,7 @@ cargo build --release -p atlas-cli
 | **v4.0.8** | **Anti-repetition defaults + think budget. Fixed degenerate think loops. API defaults from olmo3() preset. `<think>` force-close after 200 tokens.** | **565** |
 | **v4.0.9** | Think suppression (logit masking at step 0) + max_tokens 512 + filler cleanup + model auto-detect. Clean direct answers. | 579 |
 | **v4.1.0** | **Full GPU attention path (zero intra-layer PCIe) + StigmergicHook + cuBLAS TF32 tensor cores + async GPU alloc. OLMo-3-7B: 15.4→61.7 tok/s (4×). atlas-infer crate. Closes #18.** | **600** |
+| **v4.2.0** | **HF-reference inference fidelity (3 silent bugs fixed) + 32B AWQ W4 inference on single A100-40GB (GSM8K 100%, MMLU 82%, Code 5/5). OpenRouter endpoints. CI green.** | **631** |
 
 ### Crate Status
 
@@ -516,7 +521,7 @@ cargo build --release -p atlas-cli
 | atlas-bridge | 6 | **8** | ✅ ZK-attested Rings↔ETH interface, Sepolia chain_id=11155111 |
 | atlas-infer | 3 | **20** | ✅ `StigmergicHook` trait (per-layer pheromone deposits); `InferEngine` GPU/CPU dispatch; `PheromoneDeposit` aggregation; `generate_streaming` + `generate` with hooks; hooked GPU forward path (v4.1.0) |
 | atlas-cli | 7 | **30** | ✅ discover / corpus / train / eval / prove / palace / mcp / api / bench / status |
-| **TOTAL** | | **600** | **✅ All passing — v4.1.0** |
+| **TOTAL** | | **631** | **✅ All passing — v4.2.0** |
 
 ### Quick Start
 
@@ -585,7 +590,8 @@ cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
 | Benchmark | Metric | Description |
 |-----------|--------|-------------|
 | `gpu_inference_smollm2` | **37.7 tok/s** | SmolLM2-135M GPU inference (f32), A100-SXM4-40GB |
-| `gpu_benchmark_olmo3_7b_think_bf16` | **15.4 tok/s** | OLMo-3-7B-Think BF16 GPU inference (W16A32), A100-SXM4-40GB, v4.0.7 |
+| `gpu_benchmark_olmo3_7b_think_bf16` | **61.7 tok/s** | OLMo-3-7B-Think BF16 GPU inference (W16A32, v4.1.0), full GPU attention, cuBLAS TF32 |
+| `gpu_benchmark_olmo3_32b_think_w4` | **14.6 tok/s** | OLMo-3-32B-Think AWQ W4 GPU inference (W4A32, v4.2.0), single A100-40GB, custom GEMV kernel |
 | `palace_search_1000` | ~50–200 µs/op | TF-IDF semantic search across 1000 drawers |
 | `astar_100_nodes` | ~20–100 µs/op | Pheromone-guided A* pathfinding (100-node KG) |
 | `pheromone_deposit_decay_1000` | ~5–20 µs/op | 10 deposits + full decay cycle per iteration |
@@ -603,6 +609,9 @@ cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
 
 - **37.7 tok/s** — GPU inference throughput (SmolLM2-135M on A100-SXM4-40GB, v4.0.0)
 - **61.7 tok/s** — GPU inference throughput (OLMo-3-7B-Think, BF16 W16A32, A100-SXM4-40GB, v4.1.0; was 15.4 tok/s = **4× speedup** via cuBLAS TF32 + full GPU attention path + async alloc)
+- **14.6 tok/s** — GPU inference throughput (OLMo-3-32B-Think, W4A32 AWQ, A100-SXM4-40GB, v4.2.0; custom `gemv_w4_kernel`, streaming shard loader — full 32B reasoning model on a single 40GB GPU)
+- **27.2 GB** — VRAM footprint for 32B W4 at 16K context (19.6 GB weights, 13.8 GB headroom)
+- **100% GSM8K · 82% MMLU · 5/5 Code** — 32B W4 quality on standard benchmarks (v4.2.0)
 - **2.4×** — GPU speedup over CPU inference (SmolLM2-1.7B: 12.6 vs 5.2 tok/s)
 - **507 MiB** — VRAM for pre-pinned SmolLM2-135M weights
 - **d = 10.6** — Cohen's d for palace-memory vs. no-memory (ASTRA experiments)
@@ -637,7 +646,9 @@ ATLAS v4.0 implements the **Champagnat n-Morphic Framework** (Issue #6), grounde
 
 ATLAS models are published to Hugging Face under the [`openhubresearch`](https://huggingface.co/openhubresearch) organization.
 
-**First release**: `openhubresearch/ATLAS-OLMo-3-7B-Think-v4` — OLMo-3-7B-Think run through the ATLAS v4.1.0 n-morphic framework with BF16 inference (**61.7 tok/s** A100-SXM4-40GB, W16A32, 600/600 tests, full GPU attention path, StigmergicHook wired, think suppression + anti-repetition defaults).
+**Latest release**: [`openhubresearch/ATLAS-OLMo-3-32B-Think-v4`](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-32B-Think-v4) — OLMo-3-32B-Think served through the ATLAS v4.2.0 stack with AWQ 4-bit inference (**GSM8K-25 100%, MMLU-40 82%, Code-5 5/5**, 14.6 tok/s, 27.2 GB VRAM, single A100-40GB, custom `gemv_w4_kernel`, streaming shard loader, 631/631 tests).
+
+**First release**: [`openhubresearch/ATLAS-OLMo-3-7B-Think-v4`](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-7B-Think-v4) — OLMo-3-7B-Think run through the ATLAS v4.1.0 n-morphic framework with BF16 inference (**61.7 tok/s** A100-SXM4-40GB, W16A32, 600/600 tests, full GPU attention path, StigmergicHook wired, think suppression + anti-repetition defaults).
 
 ```yaml
 ---
@@ -668,12 +679,12 @@ The **[ATLAS Observatory](https://huggingface.co/spaces/openhubresearch/ATLAS)**
 | Tab | What it does |
 |-----|-------------|
 | 🏛️ **Palace** | 3D force-directed graph of the memory palace with pheromone flow particles, bloom lighting, and semantic fly-to navigation |
-| ⚒️ **Forge** | Live chat with OLMo-3-7B-Think via SSE streaming, collapsible `<think>` blocks, token confidence visualization, real-time OODA loop display |
+| ⚒️ **Forge** | Live chat with OLMo-3-32B-Think (AWQ 4-bit) via SSE streaming, collapsible `<think>` blocks, token confidence visualization, real-time OODA loop display |
 | ⚔️ **Arena** | k=1, 2, 4 morphic population competition with branching events, fitness landscapes, and +38% diversity measurement |
 | 📚 **Library** | Interactive K↔L↔1/ρ sliders, λ decay charts, Fleming–Viot diagrams, and the full crate dependency tree |
 | 🔧 **Workshop** | 12 MCP tool cards with live execution, tree/graph result viewers, operation log, and local-first architecture |
 
-**Tech stack**: 13,659 lines · Three.js + 3d-force-graph · OLMo-3-7B-Think (14GB BF16) · Palace REST API · GPU-accelerated on A10G/L4.
+**Tech stack**: 13,659 lines · Three.js + 3d-force-graph · OLMo-3-32B-Think (AWQ 4-bit, 27.2 GB VRAM) · Palace REST API · GPU-accelerated on A100-SXM4-40GB.
 
 🔭 **Try it**: [huggingface.co/spaces/openhubresearch/ATLAS](https://huggingface.co/spaces/openhubresearch/ATLAS) · Website: [atlasagi.org](https://atlasagi.org)
 
@@ -700,7 +711,9 @@ See [NOTICE](NOTICE) for attribution to incorporated components.
   institution = {OpenHub Research, Thailand},
   url         = {https://github.com/web3guru888/ATLAS},
   note        = {Pure Rust LLM training framework. Zero external crate dependencies.
-                 v4.1.0: 22 crates, 600 tests, Champagnat n-morphic framework,
+                 v4.2.0: 22 crates, 631 tests, Champagnat n-morphic framework,
+                 32B AWQ W4 inference on single A100-40GB — GSM8K 100%, MMLU 82%, Code 5/5.
+                 HF-reference inference fidelity: 3 silent bugs fixed by differential testing.
                  Full GPU attention path — OLMo-3-7B-Think 61.7 tok/s on A100-SXM4-40GB (BF16, 4× speedup).
                  StigmergicHook trait: per-layer pheromone deposits into GraphPalace.
                  cuBLAS TF32 tensor cores, async GPU allocator, zero intra-layer PCIe.}
