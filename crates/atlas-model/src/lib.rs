@@ -271,6 +271,32 @@ impl ModelConfig {
         }
     }
 
+    /// OLMo-3-32B-Think / OLMo-3.1-32B (AllenAI) — W4 quantized serving.
+    /// Architecture: Olmo3ForCausalLM, same family as the 7B (post-norm +
+    /// whole-vector QK-norm), but GQA: 40 Q heads / 8 KV heads, head_dim 128.
+    /// hidden=5120, layers=64 (48 sliding + 16 full), ffn=27648, vocab=100278.
+    /// SWA + YaRN are auto-populated by load_model_from_dir() from config.json.
+    pub fn olmo3_32b() -> Self {
+        Self {
+            vocab_size:    100278,
+            d_model:       5120,
+            n_layers:      64,
+            n_heads:       40,
+            n_kv_heads:    8,
+            ffn_hidden:    27648,
+            // Model supports 65,536 (YaRN factor 8 over 8,192 original).
+            // 16,384 costs ~8.6 GB f32 KV (64 layers × 8 KV heads) beside
+            // ~19 GB W4 weights + 1 GB BF16 lm_head on the A100-40GB.
+            max_seq_len:   16_384,
+            rope_theta:    500_000.0,
+            rms_norm_eps:  1e-6,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
+        }
+    }
+
     /// Head dimension (d_model / n_heads).
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_heads
@@ -460,12 +486,51 @@ impl RopeCache {
 
 // ── Linear layer ──────────────────────────────────────────────────────────
 
+/// CPU-side copy of W4 (int4 group-quantized) weights.
+///
+/// Layout = compressed-tensors "pack-quantized" (symmetric, group scales):
+/// col j of row r lives in `packed[r*(in/8) + j/8]`, little-endian nibble
+/// `j%8`; stored nibble = q + 8 with q ∈ [-8, 7];
+/// w[r][j] = (nibble − 8) × scale[r*(in/group) + j/group].
+struct W4Cpu {
+    packed:      Vec<u32>,
+    /// BF16 bit patterns (converted to f32 on the fly in the CPU path).
+    scales_bf16: Vec<u16>,
+    group:       usize,
+}
+
+impl W4Cpu {
+    /// Dequantize-and-dot one row against `x` (CPU fallback / test path).
+    fn row_dot(&self, row: usize, in_dim: usize, x: &[f32]) -> f32 {
+        let words = in_dim / 8;
+        let groups = in_dim / self.group;
+        let p_row = &self.packed[row * words .. (row + 1) * words];
+        let s_row = &self.scales_bf16[row * groups .. (row + 1) * groups];
+        let mut acc = 0.0f32;
+        for (w, &bits) in p_row.iter().enumerate() {
+            let col0 = w * 8;
+            let scale = f32::from_bits((s_row[col0 / self.group] as u32) << 16);
+            let mut part = 0.0f32;
+            for i in 0..8 {
+                let q = ((bits >> (4 * i)) & 0xF) as i32 - 8;
+                part += q as f32 * x[col0 + i];
+            }
+            acc += scale * part;
+        }
+        acc
+    }
+}
+
 /// A weight matrix (no bias). Row-major: weight[out_i * in_dim + in_j].
 struct Linear {
     weight:  Vec<f32>,
     gpu_mat: atlas_tensor::GpuMatrix,
     in_dim:  usize,
     out_dim: usize,
+    /// CPU copy of W4 weights. Present only when the layer is quantized AND
+    /// the GPU upload was unavailable (CPU-only builds/tests) — on GPU the
+    /// packed copy is dropped to save host RAM (~18 GB for a 32B model).
+    w4_cpu:  Option<W4Cpu>,
 }
 
 impl Linear {
@@ -475,14 +540,44 @@ impl Linear {
         let weight: Vec<f32> = pseudo_randn(in_dim * out_dim, seed)
             .into_iter().map(|v| v * scale).collect();
         let gpu_mat = atlas_tensor::GpuMatrix::upload(&weight, out_dim, in_dim);
-        Self { weight, gpu_mat, in_dim, out_dim }
+        Self { weight, gpu_mat, in_dim, out_dim, w4_cpu: None }
+    }
+
+    /// Placeholder with no weight storage at all (neither CPU nor GPU).
+    /// Used by `OlmoModel::new_uninit` so constructing a 32B-parameter model
+    /// shell does not allocate ~128 GB of random f32 weights before loading.
+    /// Must be overwritten by the loader before any forward pass.
+    fn placeholder(in_dim: usize, out_dim: usize) -> Self {
+        Self {
+            weight: Vec::new(),
+            gpu_mat: atlas_tensor::GpuMatrix::empty(out_dim, in_dim),
+            in_dim, out_dim,
+            w4_cpu: None,
+        }
+    }
+
+    /// Load from W4 (int4 group-quantized) tensors, compressed-tensors
+    /// pack-quantized layout. Uploads packed weights + BF16 scales to VRAM;
+    /// keeps a CPU copy only when the GPU is unavailable.
+    fn from_w4(packed: Vec<u32>, scales_bf16: Vec<u16>, in_dim: usize, out_dim: usize, group: usize) -> Self {
+        assert_eq!(in_dim % 8, 0, "W4 requires in_dim % 8 == 0");
+        assert_eq!(group % 8, 0,  "W4 requires group % 8 == 0");
+        assert_eq!(packed.len(), out_dim * (in_dim / 8));
+        assert_eq!(scales_bf16.len(), out_dim * (in_dim / group));
+        let gpu_mat = atlas_tensor::GpuMatrix::upload_w4(&packed, &scales_bf16, out_dim, in_dim, group);
+        let w4_cpu = if gpu_mat.is_on_gpu() {
+            None // GPU-resident: drop the host copy (saves ~18 GB on 32B)
+        } else {
+            Some(W4Cpu { packed, scales_bf16, group })
+        };
+        Self { weight: Vec::new(), gpu_mat, in_dim, out_dim, w4_cpu }
     }
 
     /// Load from f32 slice (used by safetensors loader).
     fn from_data(weight: Vec<f32>, in_dim: usize, out_dim: usize) -> Self {
         assert_eq!(weight.len(), in_dim * out_dim);
         let gpu_mat = atlas_tensor::GpuMatrix::upload(&weight, out_dim, in_dim);
-        Self { weight, gpu_mat, in_dim, out_dim }
+        Self { weight, gpu_mat, in_dim, out_dim, w4_cpu: None }
     }
 
     /// Load from BF16 source weights.
@@ -498,7 +593,7 @@ impl Linear {
         let gpu_mat = atlas_tensor::GpuMatrix::upload_bf16(&weight_bf16, out_dim, in_dim);
         // weight_bf16 is no longer needed after upload — drop it to reclaim RAM
         drop(weight_bf16);
-        Self { weight: weight_f32, gpu_mat, in_dim, out_dim }
+        Self { weight: weight_f32, gpu_mat, in_dim, out_dim, w4_cpu: None }
     }
 
     /// Returns true if this layer's weights are stored as BF16 in GPU VRAM.
@@ -512,7 +607,20 @@ impl Linear {
         if self.gpu_mat.sgemm(x, self.in_dim, 1, y) {
             return;
         }
-        // CPU fallback
+        // CPU fallback — W4 (dequantize on the fly) or dense f32.
+        if let Some(w4) = &self.w4_cpu {
+            for o in 0..self.out_dim {
+                y[o] = w4.row_dot(o, self.in_dim, x);
+            }
+            return;
+        }
+        assert!(
+            !self.weight.is_empty(),
+            "Linear({}×{}): no CPU weights available for fallback \
+             (W4 GPU-resident layer hit a failed kernel launch, or a \
+             placeholder layer was never loaded)",
+            self.out_dim, self.in_dim
+        );
         for o in 0..self.out_dim {
             let row = &self.weight[o * self.in_dim .. (o+1) * self.in_dim];
             y[o] = row.iter().zip(x.iter()).map(|(&w, &xi)| w * xi).sum();
@@ -653,14 +761,24 @@ struct Attention {
 
 impl Attention {
     fn new(cfg: &ModelConfig, layer: usize) -> Self {
+        Self::new_impl(cfg, layer, true)
+    }
+
+    /// `init = false`: placeholder projections (no weight allocation) —
+    /// used when the caller will overwrite every Linear from a checkpoint.
+    fn new_impl(cfg: &ModelConfig, layer: usize, init: bool) -> Self {
         let head_dim = cfg.d_model / cfg.n_heads;
         let kv_dim   = head_dim * cfg.n_kv_heads;
         let seed_base = 1000 + layer as u64 * 10;
+        let mk = |in_dim: usize, out_dim: usize, seed: u64| {
+            if init { Linear::new(in_dim, out_dim, seed) }
+            else    { Linear::placeholder(in_dim, out_dim) }
+        };
         Self {
-            wq: Linear::new(cfg.d_model, cfg.d_model, seed_base),
-            wk: Linear::new(cfg.d_model, kv_dim,      seed_base + 1),
-            wv: Linear::new(cfg.d_model, kv_dim,      seed_base + 2),
-            wo: Linear::new(cfg.d_model, cfg.d_model, seed_base + 3),
+            wq: mk(cfg.d_model, cfg.d_model, seed_base),
+            wk: mk(cfg.d_model, kv_dim,      seed_base + 1),
+            wv: mk(cfg.d_model, kv_dim,      seed_base + 2),
+            wo: mk(cfg.d_model, cfg.d_model, seed_base + 3),
             n_heads:    cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim,
@@ -985,11 +1103,20 @@ struct FeedForward {
 
 impl FeedForward {
     fn new(cfg: &ModelConfig, layer: usize) -> Self {
+        Self::new_impl(cfg, layer, true)
+    }
+
+    /// `init = false`: placeholder weights (see `Attention::new_impl`).
+    fn new_impl(cfg: &ModelConfig, layer: usize, init: bool) -> Self {
         let seed = 2000 + layer as u64 * 10;
+        let mk = |in_dim: usize, out_dim: usize, seed: u64| {
+            if init { Linear::new(in_dim, out_dim, seed) }
+            else    { Linear::placeholder(in_dim, out_dim) }
+        };
         Self {
-            w_gate: Linear::new(cfg.d_model, cfg.ffn_hidden, seed),
-            w_up:   Linear::new(cfg.d_model, cfg.ffn_hidden, seed + 1),
-            w_down: Linear::new(cfg.ffn_hidden, cfg.d_model, seed + 2),
+            w_gate: mk(cfg.d_model, cfg.ffn_hidden, seed),
+            w_up:   mk(cfg.d_model, cfg.ffn_hidden, seed + 1),
+            w_down: mk(cfg.ffn_hidden, cfg.d_model, seed + 2),
         }
     }
 
@@ -1039,9 +1166,14 @@ struct TransformerBlock {
 
 impl TransformerBlock {
     fn new(cfg: &ModelConfig, layer: usize) -> Self {
+        Self::new_impl(cfg, layer, true)
+    }
+
+    /// `init = false`: placeholder weights (see `Attention::new_impl`).
+    fn new_impl(cfg: &ModelConfig, layer: usize, init: bool) -> Self {
         Self {
-            attn:          Attention::new(cfg, layer),
-            ffn:           FeedForward::new(cfg, layer),
+            attn:          Attention::new_impl(cfg, layer, init),
+            ffn:           FeedForward::new_impl(cfg, layer, init),
             attn_norm:     vec![1.0f32; cfg.d_model],
             ffn_norm:      vec![1.0f32; cfg.d_model],
             attn_norm_gpu: None,
@@ -1486,15 +1618,32 @@ pub struct OlmoModel {
 impl OlmoModel {
     /// Create a new randomly-initialized model.
     pub fn new(cfg: ModelConfig) -> Self {
+        Self::new_impl(cfg, true)
+    }
+
+    /// Create a model shell WITHOUT weight initialization: every Linear and
+    /// the embedding are empty placeholders that the checkpoint loader must
+    /// overwrite. Required for very large models — `new()` would allocate
+    /// (and pseudo-randomly fill) `params × 4` bytes of host RAM, which is
+    /// ~128 GB for OLMo-3-32B.
+    pub fn new_uninit(cfg: ModelConfig) -> Self {
+        Self::new_impl(cfg, false)
+    }
+
+    fn new_impl(cfg: ModelConfig, init: bool) -> Self {
         let head_dim = cfg.d_model / cfg.n_heads;
         // Fix B: build RopeCache with YaRN scaling if configured.
         // YaRN applies only to full-attention layers (HF Olmo3 reference);
         // sliding-window layers always use standard RoPE at the same theta.
         let rope = RopeCache::new(head_dim, cfg.max_seq_len, cfg.rope_theta, &cfg.rope_scaling);
         let rope_local = RopeCache::new(head_dim, cfg.max_seq_len, cfg.rope_theta, &RopeScaling::None);
-        let embed = Embedding::new(cfg.vocab_size, cfg.d_model, 0);
+        let embed = if init {
+            Embedding::new(cfg.vocab_size, cfg.d_model, 0)
+        } else {
+            Embedding::from_data(Vec::new(), 0, cfg.d_model)
+        };
         let mut layers: Vec<_> = (0..cfg.n_layers)
-            .map(|i| TransformerBlock::new(&cfg, i))
+            .map(|i| TransformerBlock::new_impl(&cfg, i, init))
             .collect();
         // Fix B: multiply attention scale by YaRN attn_factor² (1.0 for standard
         // RoPE). Applies ONLY to full-attention layers — sliding layers use
@@ -1518,11 +1667,15 @@ impl OlmoModel {
         }
         let norm = vec![1.0f32; cfg.d_model];
         // Weight tying: lm_head shares embed weights (copy for simplicity)
-        let lm_head = Linear::from_data(
-            embed.weight.clone(),
-            cfg.d_model,
-            cfg.vocab_size,
-        );
+        let lm_head = if init {
+            Linear::from_data(
+                embed.weight.clone(),
+                cfg.d_model,
+                cfg.vocab_size,
+            )
+        } else {
+            Linear::placeholder(cfg.d_model, cfg.vocab_size)
+        };
         let eos_token_id = cfg.eos_token_id;
         Self { config: cfg, embed, layers, norm, lm_head, rope, rope_local, rope_gpu: None, rope_local_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy(), gpu_poisoned: false }
     }
@@ -2488,6 +2641,24 @@ impl SafetensorsFile {
         Ok(vals)
     }
 
+    /// Get tensor data as raw little-endian u32 words (no conversion).
+    /// Used for packed int4 weights (dtype "I32" in compressed-tensors
+    /// checkpoints — the bit pattern is what matters, not the sign).
+    pub fn get_u32(&self, name: &str) -> Result<Vec<u32>> {
+        let desc = self.tensors.iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| AtlasError::Io(format!("tensor '{name}' not found")))?;
+        if desc.dtype != "I32" && desc.dtype != "U32" {
+            return Err(AtlasError::Parse(format!(
+                "tensor '{name}' dtype is '{}', not I32/U32", desc.dtype)));
+        }
+        let raw = &self.data[desc.offsets[0]..desc.offsets[1]];
+        let vals: Vec<u32> = raw.chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        Ok(vals)
+    }
+
     /// Get tensor data as f32. Handles F32 and BF16 → f32 conversion.
     pub fn get_f32(&self, name: &str) -> Result<Vec<f32>> {
         let desc = self.tensors.iter()
@@ -2755,6 +2926,12 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
     let mut shard_files: Vec<String> = shard_set.into_iter().collect();
     shard_files.sort();
 
+    // W4 checkpoints (compressed-tensors "pack-quantized", e.g. AWQ-recipe
+    // OLMo-3-32B) store Linears as `*.weight_packed` + `*.weight_scale`.
+    if index_json.contains("weight_packed") {
+        return load_model_from_dir_w4(dir, cfg, &shard_files, &index_json);
+    }
+
     eprintln!("[load_model_from_dir] loading {} shards from {dir}", shard_files.len());
 
     // Load all tensors from all shards into a flat map.
@@ -2848,6 +3025,173 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
             }
         }
     }
+    // Pre-upload norm weights + GPU KV cache + GPU RoPE tables (one-time cost).
+    for layer in &mut model.layers {
+        layer.cache_norm_weights();
+    }
+    model.init_gpu_resources();
+    Ok(model)
+}
+
+/// Route a completed W4 Linear (packed + scales) into the model by its HF
+/// tensor prefix (e.g. `model.layers.3.self_attn.q_proj`).
+/// Returns Ok(true) if placed, Ok(false) if the prefix is not a known Linear.
+fn place_w4_linear(
+    model: &mut OlmoModel, cfg: &ModelConfig,
+    prefix: &str, packed: Vec<u32>, scales: Vec<u16>,
+) -> Result<bool> {
+    let rest = if let Some(r) = prefix.strip_prefix("model.layers.") { r }
+               else if let Some(r) = prefix.strip_prefix("layers.") { r }
+               else { return Ok(false) };
+    let dot = match rest.find('.') { Some(d) => d, None => return Ok(false) };
+    let layer_i: usize = match rest[..dot].parse() { Ok(i) => i, Err(_) => return Ok(false) };
+    if layer_i >= cfg.n_layers {
+        return Err(AtlasError::Parse(format!(
+            "W4 tensor '{prefix}': layer {layer_i} out of range (n_layers={})", cfg.n_layers)));
+    }
+    let local = &rest[dot + 1..];
+    let kd = cfg.n_kv_heads * cfg.head_dim();
+    let (in_dim, out_dim) = match local {
+        "self_attn.q_proj" => (cfg.d_model, cfg.d_model),
+        "self_attn.k_proj" => (cfg.d_model, kd),
+        "self_attn.v_proj" => (cfg.d_model, kd),
+        "self_attn.o_proj" => (cfg.d_model, cfg.d_model),
+        "mlp.gate_proj"    => (cfg.d_model, cfg.ffn_hidden),
+        "mlp.up_proj"      => (cfg.d_model, cfg.ffn_hidden),
+        "mlp.down_proj"    => (cfg.ffn_hidden, cfg.d_model),
+        _ => return Ok(false),
+    };
+    if packed.len() * 8 != in_dim * out_dim {
+        return Err(AtlasError::Parse(format!(
+            "W4 tensor '{prefix}': packed len {} × 8 ≠ {in_dim}×{out_dim}", packed.len())));
+    }
+    if scales.is_empty() || (in_dim * out_dim) % scales.len() != 0 {
+        return Err(AtlasError::Parse(format!(
+            "W4 tensor '{prefix}': scale count {} does not divide {in_dim}×{out_dim}", scales.len())));
+    }
+    let group = (in_dim * out_dim) / scales.len();
+    let lin = Linear::from_w4(packed, scales, in_dim, out_dim, group);
+    let layer = &mut model.layers[layer_i];
+    match local {
+        "self_attn.q_proj" => layer.attn.wq = lin,
+        "self_attn.k_proj" => layer.attn.wk = lin,
+        "self_attn.v_proj" => layer.attn.wv = lin,
+        "self_attn.o_proj" => layer.attn.wo = lin,
+        "mlp.gate_proj"    => layer.ffn.w_gate = lin,
+        "mlp.up_proj"      => layer.ffn.w_up = lin,
+        "mlp.down_proj"    => layer.ffn.w_down = lin,
+        _ => unreachable!(),
+    }
+    Ok(true)
+}
+
+/// Load a sharded W4 checkpoint (compressed-tensors "pack-quantized" format:
+/// weight-only int4, symmetric, per-group scales — the llm-compressor AWQ
+/// recipe output; e.g. OLMo-3-32B-Think-AWQ-4bit).
+///
+/// Streaming, shard-by-shard: each quantized Linear is uploaded to VRAM as
+/// soon as both its `weight_packed` and `weight_scale` tensors have been
+/// seen, and host copies are dropped immediately. Peak host RAM stays around
+/// one shard + the unquantized (embedding / lm_head / norm) tensors instead
+/// of `4 bytes × params` (~128 GB for 32B).
+fn load_model_from_dir_w4(
+    dir: &str, cfg: ModelConfig, shard_files: &[String], index_json: &str,
+) -> Result<OlmoModel> {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    eprintln!("[load_model_from_dir_w4] W4 checkpoint: {} shards from {dir}", shard_files.len());
+    let mut model = OlmoModel::new_uninit(cfg.clone());
+
+    // Architecture pre-detection from the index (iteration-order-independent;
+    // must be known before any norm tensor is routed).
+    let is_post_norm = index_json.contains("post_feedforward_layernorm");
+    if is_post_norm {
+        for layer in &mut model.layers { layer.post_norm = true; }
+    }
+    let has_separate_lm_head = index_json.contains("lm_head.weight");
+
+    // Halves of quantized Linears whose packed/scale tensors span shards.
+    let mut pending_packed: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut pending_scales: HashMap<String, Vec<u16>> = HashMap::new();
+    let mut n_w4 = 0usize;
+
+    for shard_name in shard_files {
+        let shard_path = Path::new(dir).join(shard_name);
+        eprintln!("[load_model_from_dir_w4]   shard: {shard_name}");
+        let st = SafetensorsFile::open(shard_path.to_str().unwrap_or(shard_name))?;
+        for desc in &st.tensors {
+            let name = desc.name.clone();
+            if let Some(pfx) = name.strip_suffix(".weight_packed") {
+                let packed = st.get_u32(&name)?;
+                if let Some(scales) = pending_scales.remove(pfx) {
+                    if place_w4_linear(&mut model, &cfg, pfx, packed, scales)? { n_w4 += 1; }
+                } else {
+                    pending_packed.insert(pfx.to_string(), packed);
+                }
+            } else if let Some(pfx) = name.strip_suffix(".weight_scale") {
+                let scales = st.get_bf16(&name)?;
+                if let Some(packed) = pending_packed.remove(pfx) {
+                    if place_w4_linear(&mut model, &cfg, pfx, packed, scales)? { n_w4 += 1; }
+                } else {
+                    pending_scales.insert(pfx.to_string(), scales);
+                }
+            } else if name.ends_with(".weight_shape") {
+                // Redundant with the dims derived from ModelConfig — ignored.
+            } else if name == "model.embed_tokens.weight" || name == "tok_embeddings.weight" {
+                let data = st.get_f32(&name)?;
+                let vocab = data.len() / cfg.d_model;
+                model.embed = Embedding::from_data(data.clone(), vocab, cfg.d_model);
+                if !has_separate_lm_head {
+                    model.lm_head = make_linear_bf16_aware(
+                        data, desc.dtype == "BF16", cfg.d_model, vocab);
+                }
+            } else if name == "model.norm.weight" || name == "norm.weight" {
+                model.norm = st.get_f32(&name)?;
+            } else if name == "lm_head.weight" {
+                model.lm_head = make_linear_bf16_aware(
+                    st.get_f32(&name)?, desc.dtype == "BF16", cfg.d_model, cfg.vocab_size);
+            } else {
+                // Per-layer norm vectors (small, always dense).
+                for layer_i in 0..cfg.n_layers {
+                    let pfx  = format!("model.layers.{layer_i}.");
+                    let pfx2 = format!("layers.{layer_i}.");
+                    let local = if name.starts_with(&pfx) { &name[pfx.len()..] }
+                                else if name.starts_with(&pfx2) { &name[pfx2.len()..] }
+                                else { continue };
+                    let data = st.get_f32(&name)?;
+                    let layer = &mut model.layers[layer_i];
+                    match local {
+                        "input_layernorm.weight"          => layer.attn_norm = data,
+                        "post_attention_layernorm.weight" => {
+                            if layer.post_norm { layer.attn_norm = data; }
+                            else               { layer.ffn_norm  = data; }
+                        }
+                        "post_feedforward_layernorm.weight" => layer.ffn_norm = data,
+                        "self_attn.q_norm.weight"           => layer.attn.q_norm = data,
+                        "self_attn.k_norm.weight"           => layer.attn.k_norm = data,
+                        _ => {}
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let expected_w4 = cfg.n_layers * 7;
+    if n_w4 != expected_w4 || !pending_packed.is_empty() || !pending_scales.is_empty() {
+        return Err(AtlasError::Parse(format!(
+            "W4 load incomplete: placed {n_w4}/{expected_w4} quantized Linears \
+             ({} packed / {} scales unmatched)",
+            pending_packed.len(), pending_scales.len())));
+    }
+    let n_gpu = model.layers.iter()
+        .flat_map(|l| [&l.attn.wq, &l.attn.wk, &l.attn.wv, &l.attn.wo,
+                       &l.ffn.w_gate, &l.ffn.w_up, &l.ffn.w_down])
+        .filter(|lin| lin.gpu_mat.is_w4())
+        .count();
+    eprintln!("[load_model_from_dir_w4] {n_w4} W4 Linears loaded ({n_gpu} GPU-resident)");
+
     // Pre-upload norm weights + GPU KV cache + GPU RoPE tables (one-time cost).
     for layer in &mut model.layers {
         layer.cache_norm_weights();
@@ -3023,6 +3367,87 @@ fn pseudo_randn(n: usize, seed: u64) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pack an i8 matrix (values in [-8,7]) into the compressed-tensors
+    /// pack-quantized u32 layout (test helper mirroring `pack_to_int32`).
+    fn w4_pack(q: &[i8], rows: usize, cols: usize) -> Vec<u32> {
+        assert_eq!(q.len(), rows * cols);
+        assert_eq!(cols % 8, 0);
+        let mut out = vec![0u32; rows * cols / 8];
+        for r in 0..rows {
+            for c in 0..cols {
+                let nibble = (q[r * cols + c] + 8) as u32 & 0xF;
+                out[r * (cols / 8) + c / 8] |= nibble << (4 * (c % 8));
+            }
+        }
+        out
+    }
+
+    fn f32_to_bf16(v: f32) -> u16 { (v.to_bits() >> 16) as u16 }
+
+    /// Ground truth captured from `compressed_tensors.compressors.pack_to_int32`
+    /// (v0.17.1): pack([[-8..-1],[0..7]]) == [0x76543210, 0xfedcba98].
+    /// Guards the layout assumption shared by the CUDA kernel and CPU path.
+    #[test]
+    fn w4_pack_layout_matches_compressed_tensors() {
+        let row0: Vec<i8> = (-8..0).collect();
+        let row1: Vec<i8> = (0..8).collect();
+        let q: Vec<i8> = row0.iter().chain(row1.iter()).cloned().collect();
+        let packed = w4_pack(&q, 2, 8);
+        assert_eq!(packed, vec![0x7654_3210, 0xfedc_ba98]);
+    }
+
+    /// W4 Linear forward (CPU dequant path) must match the dense f32
+    /// reference computed from explicitly dequantized weights.
+    #[test]
+    fn w4_linear_forward_matches_dense_reference() {
+        let (in_dim, out_dim, group) = (64usize, 16usize, 32usize);
+        // Deterministic pseudo-random int4 weights and per-group scales.
+        let q: Vec<i8> = (0..in_dim * out_dim)
+            .map(|i| ((i * 2654435761usize) >> 7) as i8 % 8)
+            .map(|v| v.clamp(-8, 7))
+            .collect();
+        let scales: Vec<f32> = (0..out_dim * in_dim / group)
+            .map(|i| {
+                // Round through BF16 so CPU reference == BF16-stored scale.
+                let s = 0.005 + 0.001 * (i % 13) as f32;
+                f32::from_bits((f32_to_bf16(s) as u32) << 16)
+            })
+            .collect();
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i as f32) * 0.37).sin()).collect();
+
+        // Dense reference.
+        let mut want = vec![0.0f32; out_dim];
+        for o in 0..out_dim {
+            let mut acc = 0.0f32;
+            for c in 0..in_dim {
+                let s = scales[o * (in_dim / group) + c / group];
+                acc += q[o * in_dim + c] as f32 * s * x[c];
+            }
+            want[o] = acc;
+        }
+
+        let packed = w4_pack(&q, out_dim, in_dim);
+        let scales_bf16: Vec<u16> = scales.iter().map(|&s| f32_to_bf16(s)).collect();
+        let lin = Linear::from_w4(packed, scales_bf16, in_dim, out_dim, group);
+        let mut got = vec![0.0f32; out_dim];
+        lin.forward(&x, &mut got);
+
+        for o in 0..out_dim {
+            assert!((got[o] - want[o]).abs() < 1e-4,
+                "row {o}: got {} want {}", got[o], want[o]);
+        }
+    }
+
+    /// `new_uninit` must not allocate weight storage (placeholder Linears).
+    #[test]
+    fn new_uninit_has_no_weight_storage() {
+        let m = OlmoModel::new_uninit(ModelConfig::tiny());
+        assert!(m.layers[0].attn.wq.weight.is_empty());
+        assert!(m.layers[0].ffn.w_gate.weight.is_empty());
+        assert!(m.lm_head.weight.is_empty());
+        assert!(m.embed.weight.is_empty());
+    }
 
     #[test]
     fn rmsnorm_unit_weight() {

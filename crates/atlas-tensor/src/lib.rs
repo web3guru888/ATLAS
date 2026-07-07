@@ -47,6 +47,14 @@ mod ffi {
             a_bf16: *const u16, b: *const f32, c: *mut f32,
             m: c_int, n: c_int, k: c_int,
         );
+        /// W4A32 group-quantized GEMV (weight-only int4, symmetric).
+        /// packed[M, K/8] uint32 (compressed-tensors pack-quantized layout),
+        /// scales[M, K/G] BF16 bit patterns, x[K] F32 → y[M] F32.
+        pub fn atlas_gemv_w4_f32(
+            packed: *const u32, scales: *const u16,
+            x: *const f32, y: *mut f32,
+            m: c_int, k: c_int, g: c_int,
+        );
         /// Explicitly drain all pending GPU work (cudaDeviceSynchronize).
         /// Rarely needed — use only when CPU must read GPU output without going
         /// through GpuVec::download() (which syncs implicitly via cudaMemcpy D2H).
@@ -320,16 +328,68 @@ mod gpu {
         }
     }
 
-    /// Discriminated union: either an f32 or a BF16 GPU weight buffer.
-    /// `GpuMatrix` holds `Option<GpuBufKind>` so it can store either precision.
+    /// Raw u32 GPU buffer — used for packed int4 weights (8 nibbles / u32).
+    pub struct GpuBufU32 {
+        pub ptr: *mut u32,
+        pub len: usize,
+    }
+    unsafe impl Send for GpuBufU32 {}
+    unsafe impl Sync for GpuBufU32 {}
+    impl std::fmt::Debug for GpuBufU32 {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GpuBufU32 {{ ptr: {:?}, len: {} }}", self.ptr, self.len)
+        }
+    }
+    impl GpuBufU32 {
+        pub fn alloc(len: usize) -> Option<Self> {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let err = unsafe { cudaMalloc(&mut ptr, len * 4) }; // 4 bytes per u32
+            if err != 0 { return None; }
+            Some(Self { ptr: ptr as *mut u32, len })
+        }
+        pub fn upload(data: &[u32]) -> Option<Self> {
+            let buf = Self::alloc(data.len())?;
+            let err = unsafe {
+                cudaMemcpy(
+                    buf.ptr as *mut c_void,
+                    data.as_ptr() as *const c_void,
+                    data.len() * 4,
+                    CUDA_MEMCPY_H2D,
+                )
+            };
+            if err != 0 { return None; }
+            Some(buf)
+        }
+    }
+    impl Drop for GpuBufU32 {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                unsafe { cudaFree(self.ptr as *mut c_void); }
+            }
+        }
+    }
+
+    /// Discriminated union: f32, BF16, or W4 (int4 group-quantized) weights.
+    /// `GpuMatrix` holds `Option<GpuBufKind>` so it can store any precision.
     pub enum GpuBufKind {
         /// Full f32 weights in VRAM (4 bytes/element).
         F32(GpuBuf),
         /// BF16 weights in VRAM (2 bytes/element).  W16A32: activations stay f32.
         BF16(GpuBufBf16),
+        /// Weight-only int4 (compressed-tensors pack-quantized, symmetric,
+        /// group scales).  W4A32: ~0.56 bytes/element incl. scales.
+        W4 {
+            /// [rows × cols/8] packed nibbles as u32 (little-endian nibbles).
+            packed: GpuBufU32,
+            /// [rows × cols/group] per-group scales, BF16 bit patterns.
+            scales: GpuBufBf16,
+            /// Quantization group size along the input (cols) dimension.
+            group: usize,
+        },
     }
     impl GpuBufKind {
         pub fn is_bf16(&self) -> bool { matches!(self, GpuBufKind::BF16(_)) }
+        pub fn is_w4(&self)   -> bool { matches!(self, GpuBufKind::W4 { .. }) }
     }
 }
 
@@ -386,6 +446,43 @@ impl GpuMatrix {
         }
     }
 
+    /// Upload a W4 (int4 group-quantized) matrix to GPU VRAM.
+    ///
+    /// `packed`: [rows × cols/8] u32 words, compressed-tensors pack-quantized
+    /// layout (col j → word j/8, little-endian nibble j%8, nibble = q+8).
+    /// `scales_bf16`: [rows × cols/group] BF16 bit patterns.
+    /// W4A32: dequantization happens inline in the CUDA kernel.
+    /// Falls back gracefully (CPU-only matrix) if CUDA is not available.
+    pub fn upload_w4(packed: &[u32], scales_bf16: &[u16], rows: usize, cols: usize, group: usize) -> Self {
+        debug_assert_eq!(cols % 8, 0);
+        debug_assert_eq!(group % 8, 0);
+        debug_assert_eq!(packed.len(), rows * (cols / 8));
+        debug_assert_eq!(scales_bf16.len(), rows * (cols / group));
+        Self {
+            #[cfg(atlas_cuda)]
+            buf: if cuda_available() {
+                match (gpu::GpuBufU32::upload(packed), gpu::GpuBufBf16::upload(scales_bf16)) {
+                    (Some(p), Some(s)) => Some(gpu::GpuBufKind::W4 { packed: p, scales: s, group }),
+                    _ => None,
+                }
+            } else { None },
+            rows,
+            cols,
+        }
+    }
+
+    /// Create a placeholder matrix with no storage (neither GPU nor CPU).
+    /// Used by `OlmoModel::new_uninit` so that constructing a large model
+    /// before loading real weights does not allocate hundreds of GB.
+    pub fn empty(rows: usize, cols: usize) -> Self {
+        Self {
+            #[cfg(atlas_cuda)]
+            buf: None,
+            rows,
+            cols,
+        }
+    }
+
     /// Whether the matrix is resident in GPU VRAM (any precision).
     pub fn is_on_gpu(&self) -> bool {
         #[cfg(atlas_cuda)]
@@ -398,6 +495,14 @@ impl GpuMatrix {
     pub fn is_bf16(&self) -> bool {
         #[cfg(atlas_cuda)]
         { self.buf.as_ref().map_or(false, |b| b.is_bf16()) }
+        #[cfg(not(atlas_cuda))]
+        { false }
+    }
+
+    /// Whether the matrix uses W4 (int4 group-quantized) precision in VRAM.
+    pub fn is_w4(&self) -> bool {
+        #[cfg(atlas_cuda)]
+        { self.buf.as_ref().map_or(false, |b| b.is_w4()) }
         #[cfg(not(atlas_cuda))]
         { false }
     }
@@ -416,6 +521,8 @@ impl GpuMatrix {
         debug_assert_eq!(out.len(), m * n);
         #[cfg(atlas_cuda)]
         if let Some(ref a_buf) = self.buf {
+            // W4 kernel is GEMV-only: batch (n>1) callers must use another path.
+            if a_buf.is_w4() && n != 1 { return false; }
             if let Some(b_buf) = gpu::GpuBuf::upload(rhs) {
                 if let Some(c_buf) = gpu::GpuBuf::alloc(m * n) {
                     // Isolate this launch so the post-launch check below is
@@ -433,6 +540,12 @@ impl GpuMatrix {
                             ffi::atlas_sgemm_bf16_f32(
                                 bf16_buf.ptr, b_buf.ptr, c_buf.ptr,
                                 m as i32, n as i32, k as i32,
+                            );
+                        },
+                        gpu::GpuBufKind::W4 { packed, scales, group } => unsafe {
+                            ffi::atlas_gemv_w4_f32(
+                                packed.ptr, scales.ptr, b_buf.ptr, c_buf.ptr,
+                                m as i32, k as i32, *group as i32,
                             );
                         },
                     }
@@ -463,6 +576,8 @@ impl GpuMatrix {
         let m = self.rows;
         #[cfg(atlas_cuda)]
         if let (Some(ref a_buf), Some(ref x_buf)) = (&self.buf, &x.buf) {
+            // W4 kernel is GEMV-only: batch (n>1) callers must use another path.
+            if a_buf.is_w4() && n != 1 { return None; }
             let out_buf = gpu::GpuBuf::alloc(m * n)?;
             match a_buf {
                 gpu::GpuBufKind::F32(f32_buf) => unsafe {
@@ -475,6 +590,12 @@ impl GpuMatrix {
                     ffi::atlas_sgemm_bf16_f32(
                         bf16_buf.ptr, x_buf.ptr, out_buf.ptr,
                         m as i32, n as i32, self.cols as i32,
+                    );
+                },
+                gpu::GpuBufKind::W4 { packed, scales, group } => unsafe {
+                    ffi::atlas_gemv_w4_f32(
+                        packed.ptr, scales.ptr, x_buf.ptr, out_buf.ptr,
+                        m as i32, self.cols as i32, *group as i32,
                     );
                 },
             }
@@ -492,8 +613,9 @@ impl std::fmt::Debug for GpuMatrix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         #[cfg(atlas_cuda)]
         let dtype = match &self.buf {
-            Some(gpu::GpuBufKind::F32(_))  => "f32",
-            Some(gpu::GpuBufKind::BF16(_)) => "bf16",
+            Some(gpu::GpuBufKind::F32(_))   => "f32",
+            Some(gpu::GpuBufKind::BF16(_))  => "bf16",
+            Some(gpu::GpuBufKind::W4 {..})  => "w4",
             None => "cpu",
         };
         #[cfg(not(atlas_cuda))]

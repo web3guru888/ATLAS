@@ -451,6 +451,47 @@ __global__ void sgemm_bf16_kernel(
         C[row * N + col] = acc;
 }
 
+/* ─── W4A32 group-quantized GEMV (weight-only int4, symmetric) ──────────── */
+/*                                                                            */
+/* Layout = compressed-tensors "pack-quantized" (verified vs pack_to_int32): */
+/*   packed[M][K/8] uint32 — col j of row r lives in word j/8, nibble j%8    */
+/*                  (little-endian nibbles); stored nibble = q + 8, q∈[-8,7] */
+/*   scales[M][K/G] BF16   — per-group scale along K (OLMo-3-32B W4: G=32)   */
+/*   w[r][j] = (nibble - 8) * scale[r][j/G]                                  */
+/* Requires K % 8 == 0 and G % 8 == 0 (a group never splits a packed word). */
+__global__ void gemv_w4_kernel(
+    const uint32_t* __restrict__ packed,
+    const uint16_t* __restrict__ scales,
+    const float*    __restrict__ x,
+    float*          __restrict__ y,
+    int M, int K, int G
+) {
+    int row = blockIdx.x * GEMV_ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= M) return;
+
+    const int words = K >> 3;                     /* K/8 packed words per row */
+    const uint32_t* p_row = packed + (ptrdiff_t)row * words;
+    const uint16_t* s_row = scales + (ptrdiff_t)row * (K / G);
+
+    float acc = 0.0f;
+    for (int w = threadIdx.x; w < words; w += 32) {
+        uint32_t bits = p_row[w];
+        int col0 = w << 3;
+        float s = bf16u_to_f32(__ldg(s_row + col0 / G));
+        float part = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            int q = (int)((bits >> (4 * i)) & 0xFu) - 8;
+            part = __fmaf_rn((float)q, __ldg(x + col0 + i), part);
+        }
+        acc = __fmaf_rn(s, part, acc);
+    }
+    /* Warp reduction: sum all 32 lanes into lane 0 */
+    for (int d = 16; d > 0; d >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFFu, acc, d);
+    if (threadIdx.x == 0) y[row] = acc;
+}
+
 /* ─── VRAM→VRAM memcpy helper ────────────────────────────────────────────── */
 /* For KV cache writes that stay in VRAM */
 __global__ void copy_kernel(const float* src, float* dst, int n) {
@@ -753,6 +794,20 @@ void atlas_sgemm_bf16_f32(
         sgemm_bf16_kernel<<<grid, block>>>(A_bf16, B, C, M, N, K);
     atlas_note_launch_err("atlas_sgemm_bf16/tiled");
     }
+    /* Async: downstream kernels on stream-0 wait automatically. */
+}
+
+/* W4A32 GEMV: y[M] = W4[M×K] (int4 group-quantized) × x[K] (f32).
+ * Decode-path only (N=1). Layout documented at gemv_w4_kernel. */
+void atlas_gemv_w4_f32(
+    const uint32_t* packed, const uint16_t* scales,
+    const float* x, float* y,
+    int M, int K, int G
+) {
+    dim3 block(32, GEMV_ROWS_PER_BLOCK);
+    dim3 grid((M + GEMV_ROWS_PER_BLOCK - 1) / GEMV_ROWS_PER_BLOCK);
+    gemv_w4_kernel<<<grid, block>>>(packed, scales, x, y, M, K, G);
+    atlas_note_launch_err("atlas_gemv_w4_f32");
     /* Async: downstream kernels on stream-0 wait automatically. */
 }
 

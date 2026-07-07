@@ -284,6 +284,8 @@ pub fn model_config_from_id(id: &str) -> ModelConfig {
         ModelConfig::smollm2_135m()
     } else if id_lc.contains("1.7b") || id_lc.contains("1b7") {
         ModelConfig::smollm2_1b7()
+    } else if id_lc.contains("olmo") && id_lc.contains("32b") {
+        ModelConfig::olmo3_32b()
     } else if id_lc.contains("olmo") && id_lc.contains("7b") {
         ModelConfig::olmo3_actual_7b()
     } else if id_lc.contains("olmo") {
