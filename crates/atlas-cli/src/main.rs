@@ -817,10 +817,11 @@ fn cmd_infer(args: &[String]) -> i32 {
         "smollm2-135m"  => ModelConfig::smollm2_135m(),
         "olmo3-1b"      => ModelConfig::olmo3_1b(),
         "olmo3-7b"      => ModelConfig::olmo3_actual_7b(),
+        "olmo3-32b"     => ModelConfig::olmo3_32b(),
         "llama32-1b"    => ModelConfig::llama32_1b(),
         other => {
             eprintln!("atlas infer: unknown model '{other}'.");
-            eprintln!("  Available: smollm2-1.7b, smollm2-135m, olmo3-1b, olmo3-7b, llama32-1b");
+            eprintln!("  Available: smollm2-1.7b, smollm2-135m, olmo3-1b, olmo3-7b, olmo3-32b, llama32-1b");
             return 1;
         }
     };
@@ -1021,7 +1022,8 @@ fn cmd_api(args: &[String]) -> i32 {
             let model_id = opt(args, "--model").map(|s| s.to_string()).unwrap_or_else(|| {
                 if let Some(ref dir) = weights_dir {
                     let d = dir.to_lowercase();
-                    if d.contains("olmo") && d.contains("7b") { "olmo3-7b".to_string() }
+                    if d.contains("olmo") && d.contains("32b") { "olmo3-32b".to_string() }
+                    else if d.contains("olmo") && d.contains("7b") { "olmo3-7b".to_string() }
                     else if d.contains("olmo") { "olmo3-1b".to_string() }
                     else if d.contains("1.7b") || d.contains("1b7") { "smollm2-1.7b".to_string() }
                     else if d.contains("llama") { "llama32-1b".to_string() }

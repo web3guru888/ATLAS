@@ -47,6 +47,20 @@ mod ffi {
             a_bf16: *const u16, b: *const f32, c: *mut f32,
             m: c_int, n: c_int, k: c_int,
         );
+        /// W4A32 group-quantized GEMV (weight-only int4, symmetric).
+        /// packed[M, K/8] uint32 (compressed-tensors pack-quantized layout),
+        /// scales[M, K/G] BF16 bit patterns, x[K] F32 → y[M] F32.
+        pub fn atlas_gemv_w4_f32(
+            packed: *const u32, scales: *const u16,
+            x: *const f32, y: *mut f32,
+            m: c_int, k: c_int, g: c_int,
+        );
+        /// W4 → F32 dequantize into a VRAM scratch buffer (#22 Step 2).
+        /// packed[M, K/8] uint32, scales[M, K/G] BF16 bits → out[M, K] F32.
+        pub fn atlas_dequant_w4_f32(
+            packed: *const u32, scales: *const u16, out: *mut f32,
+            m: c_int, k: c_int, g: c_int,
+        );
         /// Explicitly drain all pending GPU work (cudaDeviceSynchronize).
         /// Rarely needed — use only when CPU must read GPU output without going
         /// through GpuVec::download() (which syncs implicitly via cudaMemcpy D2H).
@@ -320,16 +334,68 @@ mod gpu {
         }
     }
 
-    /// Discriminated union: either an f32 or a BF16 GPU weight buffer.
-    /// `GpuMatrix` holds `Option<GpuBufKind>` so it can store either precision.
+    /// Raw u32 GPU buffer — used for packed int4 weights (8 nibbles / u32).
+    pub struct GpuBufU32 {
+        pub ptr: *mut u32,
+        pub len: usize,
+    }
+    unsafe impl Send for GpuBufU32 {}
+    unsafe impl Sync for GpuBufU32 {}
+    impl std::fmt::Debug for GpuBufU32 {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "GpuBufU32 {{ ptr: {:?}, len: {} }}", self.ptr, self.len)
+        }
+    }
+    impl GpuBufU32 {
+        pub fn alloc(len: usize) -> Option<Self> {
+            let mut ptr: *mut c_void = std::ptr::null_mut();
+            let err = unsafe { cudaMalloc(&mut ptr, len * 4) }; // 4 bytes per u32
+            if err != 0 { return None; }
+            Some(Self { ptr: ptr as *mut u32, len })
+        }
+        pub fn upload(data: &[u32]) -> Option<Self> {
+            let buf = Self::alloc(data.len())?;
+            let err = unsafe {
+                cudaMemcpy(
+                    buf.ptr as *mut c_void,
+                    data.as_ptr() as *const c_void,
+                    data.len() * 4,
+                    CUDA_MEMCPY_H2D,
+                )
+            };
+            if err != 0 { return None; }
+            Some(buf)
+        }
+    }
+    impl Drop for GpuBufU32 {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                unsafe { cudaFree(self.ptr as *mut c_void); }
+            }
+        }
+    }
+
+    /// Discriminated union: f32, BF16, or W4 (int4 group-quantized) weights.
+    /// `GpuMatrix` holds `Option<GpuBufKind>` so it can store any precision.
     pub enum GpuBufKind {
         /// Full f32 weights in VRAM (4 bytes/element).
         F32(GpuBuf),
         /// BF16 weights in VRAM (2 bytes/element).  W16A32: activations stay f32.
         BF16(GpuBufBf16),
+        /// Weight-only int4 (compressed-tensors pack-quantized, symmetric,
+        /// group scales).  W4A32: ~0.56 bytes/element incl. scales.
+        W4 {
+            /// [rows × cols/8] packed nibbles as u32 (little-endian nibbles).
+            packed: GpuBufU32,
+            /// [rows × cols/group] per-group scales, BF16 bit patterns.
+            scales: GpuBufBf16,
+            /// Quantization group size along the input (cols) dimension.
+            group: usize,
+        },
     }
     impl GpuBufKind {
         pub fn is_bf16(&self) -> bool { matches!(self, GpuBufKind::BF16(_)) }
+        pub fn is_w4(&self)   -> bool { matches!(self, GpuBufKind::W4 { .. }) }
     }
 }
 
@@ -386,6 +452,43 @@ impl GpuMatrix {
         }
     }
 
+    /// Upload a W4 (int4 group-quantized) matrix to GPU VRAM.
+    ///
+    /// `packed`: [rows × cols/8] u32 words, compressed-tensors pack-quantized
+    /// layout (col j → word j/8, little-endian nibble j%8, nibble = q+8).
+    /// `scales_bf16`: [rows × cols/group] BF16 bit patterns.
+    /// W4A32: dequantization happens inline in the CUDA kernel.
+    /// Falls back gracefully (CPU-only matrix) if CUDA is not available.
+    pub fn upload_w4(packed: &[u32], scales_bf16: &[u16], rows: usize, cols: usize, group: usize) -> Self {
+        debug_assert_eq!(cols % 8, 0);
+        debug_assert_eq!(group % 8, 0);
+        debug_assert_eq!(packed.len(), rows * (cols / 8));
+        debug_assert_eq!(scales_bf16.len(), rows * (cols / group));
+        Self {
+            #[cfg(atlas_cuda)]
+            buf: if cuda_available() {
+                match (gpu::GpuBufU32::upload(packed), gpu::GpuBufBf16::upload(scales_bf16)) {
+                    (Some(p), Some(s)) => Some(gpu::GpuBufKind::W4 { packed: p, scales: s, group }),
+                    _ => None,
+                }
+            } else { None },
+            rows,
+            cols,
+        }
+    }
+
+    /// Create a placeholder matrix with no storage (neither GPU nor CPU).
+    /// Used by `OlmoModel::new_uninit` so that constructing a large model
+    /// before loading real weights does not allocate hundreds of GB.
+    pub fn empty(rows: usize, cols: usize) -> Self {
+        Self {
+            #[cfg(atlas_cuda)]
+            buf: None,
+            rows,
+            cols,
+        }
+    }
+
     /// Whether the matrix is resident in GPU VRAM (any precision).
     pub fn is_on_gpu(&self) -> bool {
         #[cfg(atlas_cuda)]
@@ -398,6 +501,14 @@ impl GpuMatrix {
     pub fn is_bf16(&self) -> bool {
         #[cfg(atlas_cuda)]
         { self.buf.as_ref().map_or(false, |b| b.is_bf16()) }
+        #[cfg(not(atlas_cuda))]
+        { false }
+    }
+
+    /// Whether the matrix uses W4 (int4 group-quantized) precision in VRAM.
+    pub fn is_w4(&self) -> bool {
+        #[cfg(atlas_cuda)]
+        { self.buf.as_ref().map_or(false, |b| b.is_w4()) }
         #[cfg(not(atlas_cuda))]
         { false }
     }
@@ -434,6 +545,27 @@ impl GpuMatrix {
                                 bf16_buf.ptr, b_buf.ptr, c_buf.ptr,
                                 m as i32, n as i32, k as i32,
                             );
+                        },
+                        gpu::GpuBufKind::W4 { packed, scales, group } => unsafe {
+                            if n == 1 {
+                                ffi::atlas_gemv_w4_f32(
+                                    packed.ptr, scales.ptr, b_buf.ptr, c_buf.ptr,
+                                    m as i32, k as i32, *group as i32,
+                                );
+                            } else {
+                                // #22 Step 2: dequant → f32 scratch → GEMM.
+                                let Some(guard) = w4_scratch_at_least(m * k)
+                                    else { return false; };
+                                let scratch = guard.as_ref().unwrap();
+                                ffi::atlas_dequant_w4_f32(
+                                    packed.ptr, scales.ptr, scratch.ptr,
+                                    m as i32, k as i32, *group as i32,
+                                );
+                                ffi::atlas_matmul_f32(
+                                    scratch.ptr, b_buf.ptr, c_buf.ptr,
+                                    m as i32, n as i32, k as i32,
+                                );
+                            }
                         },
                     }
                     let result = c_buf.download();
@@ -477,6 +609,26 @@ impl GpuMatrix {
                         m as i32, n as i32, self.cols as i32,
                     );
                 },
+                gpu::GpuBufKind::W4 { packed, scales, group } => unsafe {
+                    if n == 1 {
+                        ffi::atlas_gemv_w4_f32(
+                            packed.ptr, scales.ptr, x_buf.ptr, out_buf.ptr,
+                            m as i32, self.cols as i32, *group as i32,
+                        );
+                    } else {
+                        // #22 Step 2: dequant → f32 scratch → GEMM.
+                        let guard = w4_scratch_at_least(m * self.cols)?;
+                        let scratch = guard.as_ref().unwrap();
+                        ffi::atlas_dequant_w4_f32(
+                            packed.ptr, scales.ptr, scratch.ptr,
+                            m as i32, self.cols as i32, *group as i32,
+                        );
+                        ffi::atlas_matmul_f32(
+                            scratch.ptr, x_buf.ptr, out_buf.ptr,
+                            m as i32, n as i32, self.cols as i32,
+                        );
+                    }
+                },
             }
             return Some(GpuVec {
                 buf: Some(out_buf),
@@ -488,12 +640,49 @@ impl GpuMatrix {
     }
 }
 
+/// Reusable VRAM scratch for the W4 batch-GEMM path (#22 Step 2).
+///
+/// W4 weights are stored packed (int4). For batched activations (n > 1) the
+/// GEMV kernel would re-stream the packed weights once per token, so instead
+/// the whole Linear is dequantized into this f32 scratch once per call and
+/// the existing cuBLAS GEMM consumes it (weight traffic ≈ 8.6 B/element per
+/// chunk vs 0.56 B × n for GEMV — break-even n ≈ 15, ~17× less at n = 256).
+///
+/// Grow-only and process-global: the largest 32B Linear is 27,648 × 5,120
+/// f32 ≈ 566 MB, allocated once and reused for every layer / chunk.
+/// Reuse is safe without extra synchronization: all launches go to stream-0,
+/// so the next dequant cannot overtake a previous GEMM that reads the
+/// scratch. The Mutex only serializes CPU-side access to the allocation.
+#[cfg(atlas_cuda)]
+static W4_GEMM_SCRATCH: std::sync::Mutex<Option<gpu::GpuBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Lock the W4 dequant scratch, growing it to ≥ `len` f32 elements.
+/// Returns `None` if VRAM allocation fails (caller falls back to CPU).
+#[cfg(atlas_cuda)]
+fn w4_scratch_at_least(
+    len: usize,
+) -> Option<std::sync::MutexGuard<'static, Option<gpu::GpuBuf>>> {
+    let mut guard = match W4_GEMM_SCRATCH.lock() {
+        Ok(g) => g,
+        // The scratch holds no cross-call invariants — a panic elsewhere
+        // cannot corrupt it, so a poisoned lock is safe to take over.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.as_ref().map_or(true, |b| b.len < len) {
+        *guard = None; // free the old buffer before allocating the bigger one
+        *guard = Some(gpu::GpuBuf::alloc(len)?);
+    }
+    Some(guard)
+}
+
 impl std::fmt::Debug for GpuMatrix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         #[cfg(atlas_cuda)]
         let dtype = match &self.buf {
-            Some(gpu::GpuBufKind::F32(_))  => "f32",
-            Some(gpu::GpuBufKind::BF16(_)) => "bf16",
+            Some(gpu::GpuBufKind::F32(_))   => "f32",
+            Some(gpu::GpuBufKind::BF16(_))  => "bf16",
+            Some(gpu::GpuBufKind::W4 {..})  => "w4",
             None => "cpu",
         };
         #[cfg(not(atlas_cuda))]
@@ -849,6 +1038,84 @@ impl GpuKvCache {
         }
     }
 
+    /// Write K/V for `m` consecutive positions starting at `start` in ONE
+    /// device-to-device copy each (#22 chunked prefill — replaces `m`
+    /// per-position `write` calls, each of which cost two H2D uploads).
+    ///
+    /// `k`/`v`: [m × n_kv_heads × head_dim] position-major, GPU-resident —
+    /// exactly the cache's own layout, so the destination range
+    /// `[start × kv_dim, (start+m) × kv_dim)` is contiguous.
+    ///
+    /// Returns `false` when the copy could not be performed (CPU-only build
+    /// or non-resident buffers) — caller must treat the GPU cache as stale.
+    pub fn write_range(&mut self, start: usize, m: usize, k: &GpuVec, v: &GpuVec) -> bool {
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        debug_assert!(start + m <= self.max_seq);
+        debug_assert_eq!(k.len, m * kv_dim);
+        debug_assert_eq!(v.len, m * kv_dim);
+        #[cfg(atlas_cuda)]
+        if let (Some(kp), Some(vp), Some(nkp), Some(nvp)) = (
+            self.keys.gpu_ptr_mut(), self.values.gpu_ptr_mut(),
+            k.gpu_ptr(), v.gpu_ptr()
+        ) {
+            unsafe {
+                ffi::atlas_vram_copy_f32(nkp, kp.add(start * kv_dim), (m * kv_dim) as i32);
+                ffi::atlas_vram_copy_f32(nvp, vp.add(start * kv_dim), (m * kv_dim) as i32);
+            }
+            return true;
+        }
+        let _ = (start, m, k, v, kv_dim);
+        false
+    }
+
+    /// Chunked-prefill attention (#22): decode attention for `m` consecutive
+    /// query positions `start..start+m` with ONE Q upload and ONE output
+    /// buffer (the per-position kernel is launched `m` times at pointer
+    /// offsets — launches are cheap and async; the removed cost is the 2·m
+    /// alloc+PCIe round-trips of calling `decode_attention` per token).
+    ///
+    /// `q`: [m × n_heads × head_dim] position-major, GPU-resident, RoPE'd.
+    /// K/V for positions `< start + m` must already be in the cache
+    /// (see [`Self::write_range`]) — token `s` attends to `0..=start+s`.
+    ///
+    /// Returns [m × n_heads × head_dim] in VRAM, or None if resources are
+    /// unavailable (caller falls back to the CPU attention path).
+    pub fn decode_attention_prefill(
+        &self,
+        q: &GpuVec,
+        m: usize,
+        n_heads: usize,
+        start: usize,
+        scale: f32,
+        window_size: usize,
+    ) -> Option<GpuVec> {
+        let d = n_heads * self.head_dim;
+        debug_assert_eq!(q.len, m * d);
+        #[cfg(atlas_cuda)]
+        if let (Some(qp), Some(kp), Some(vp)) =
+            (q.gpu_ptr(), self.keys.gpu_ptr(), self.values.gpu_ptr())
+        {
+            if let Some(out_buf) = gpu::GpuBuf::alloc(m * d) {
+                for s in 0..m {
+                    unsafe {
+                        ffi::atlas_decode_attention(
+                            qp.add(s * d), kp, vp, out_buf.ptr.add(s * d),
+                            n_heads as i32, self.n_kv_heads as i32, self.head_dim as i32,
+                            (start + s) as i32, scale, window_size as i32,
+                        );
+                    }
+                }
+                return Some(GpuVec {
+                    buf: Some(out_buf),
+                    cpu: vec![0.0f32; m * d],
+                    len: m * d,
+                });
+            }
+        }
+        let _ = (q, m, n_heads, start, scale, window_size, d);
+        None
+    }
+
     /// Compute grouped-query decode attention. Returns output [n_heads × head_dim].
     ///
     /// `q`: [n_heads × head_dim] query vector (after RoPE).
@@ -1201,6 +1468,49 @@ impl Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #22 Step 2: W4 batched sgemm (dequant-to-scratch + GEMM) must match
+    /// the per-column W4 GEMV kernel. The GEMV path is HF-parity verified,
+    /// so agreement here is the correctness gate for the new dequant kernel
+    /// and the scratch plumbing. Tolerance covers cuBLAS TF32 vs f32 GEMV
+    /// low-bit drift (same contract as the f32 batch path).
+    #[test]
+    fn w4_sgemm_batch_matches_gemv_columns() {
+        if !cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let (m, k, g, n) = (32usize, 64usize, 32usize, 5usize);
+        // Deterministic synthetic W4: nibbles cycle through [-8, 6],
+        // per-group BF16 scales vary per row/group.
+        let words = k / 8;
+        let packed: Vec<u32> = (0..m * words).map(|i| {
+            let mut w = 0u32;
+            for j in 0..8 {
+                let nib = ((i * 7 + j * 3) % 15) as u32; // stored nibble 0..14
+                w |= nib << (4 * j);
+            }
+            w
+        }).collect();
+        let scales: Vec<u16> = (0..m * (k / g)).map(|i| {
+            let s = 0.01f32 + 0.003f32 * (i as f32);
+            (s.to_bits() >> 16) as u16 // f32 → BF16 bits (truncate)
+        }).collect();
+        let mat = GpuMatrix::upload_w4(&packed, &scales, m, k, g);
+        assert!(mat.is_w4(), "test requires the W4 GPU path");
+        // Activations in sgemm layout: [k × n], column j = token j.
+        let x: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let mut y_batch = vec![0.0f32; m * n];
+        assert!(mat.sgemm(&x, k, n, &mut y_batch),
+            "W4 batch sgemm must succeed on GPU (no fallback)");
+        for col in 0..n {
+            let xcol: Vec<f32> = (0..k).map(|r| x[r * n + col]).collect();
+            let mut ycol = vec![0.0f32; m];
+            assert!(mat.sgemm(&xcol, k, 1, &mut ycol), "W4 GEMV reference failed");
+            for row in 0..m {
+                let (a, b) = (y_batch[row * n + col], ycol[row]);
+                assert!((a - b).abs() <= 1e-3 * b.abs().max(1.0),
+                    "W4 batch/GEMV mismatch at ({row},{col}): {a} vs {b}");
+            }
+        }
+    }
 
     /// dup() must be an exact copy and must not alias the source buffer.
     /// Runs by default; exercises the device path when CUDA is present and

@@ -271,6 +271,32 @@ impl ModelConfig {
         }
     }
 
+    /// OLMo-3-32B-Think / OLMo-3.1-32B (AllenAI) — W4 quantized serving.
+    /// Architecture: Olmo3ForCausalLM, same family as the 7B (post-norm +
+    /// whole-vector QK-norm), but GQA: 40 Q heads / 8 KV heads, head_dim 128.
+    /// hidden=5120, layers=64 (48 sliding + 16 full), ffn=27648, vocab=100278.
+    /// SWA + YaRN are auto-populated by load_model_from_dir() from config.json.
+    pub fn olmo3_32b() -> Self {
+        Self {
+            vocab_size:    100278,
+            d_model:       5120,
+            n_layers:      64,
+            n_heads:       40,
+            n_kv_heads:    8,
+            ffn_hidden:    27648,
+            // Model supports 65,536 (YaRN factor 8 over 8,192 original).
+            // 16,384 costs ~8.6 GB f32 KV (64 layers × 8 KV heads) beside
+            // ~19 GB W4 weights + 1 GB BF16 lm_head on the A100-40GB.
+            max_seq_len:   16_384,
+            rope_theta:    500_000.0,
+            rms_norm_eps:  1e-6,
+            layer_types:   Vec::new(),
+            sliding_window: None,
+            rope_scaling:  RopeScaling::None,
+            eos_token_id:  None,
+        }
+    }
+
     /// Head dimension (d_model / n_heads).
     pub fn head_dim(&self) -> usize {
         self.d_model / self.n_heads
@@ -460,12 +486,51 @@ impl RopeCache {
 
 // ── Linear layer ──────────────────────────────────────────────────────────
 
+/// CPU-side copy of W4 (int4 group-quantized) weights.
+///
+/// Layout = compressed-tensors "pack-quantized" (symmetric, group scales):
+/// col j of row r lives in `packed[r*(in/8) + j/8]`, little-endian nibble
+/// `j%8`; stored nibble = q + 8 with q ∈ [-8, 7];
+/// w[r][j] = (nibble − 8) × scale[r*(in/group) + j/group].
+struct W4Cpu {
+    packed:      Vec<u32>,
+    /// BF16 bit patterns (converted to f32 on the fly in the CPU path).
+    scales_bf16: Vec<u16>,
+    group:       usize,
+}
+
+impl W4Cpu {
+    /// Dequantize-and-dot one row against `x` (CPU fallback / test path).
+    fn row_dot(&self, row: usize, in_dim: usize, x: &[f32]) -> f32 {
+        let words = in_dim / 8;
+        let groups = in_dim / self.group;
+        let p_row = &self.packed[row * words .. (row + 1) * words];
+        let s_row = &self.scales_bf16[row * groups .. (row + 1) * groups];
+        let mut acc = 0.0f32;
+        for (w, &bits) in p_row.iter().enumerate() {
+            let col0 = w * 8;
+            let scale = f32::from_bits((s_row[col0 / self.group] as u32) << 16);
+            let mut part = 0.0f32;
+            for i in 0..8 {
+                let q = ((bits >> (4 * i)) & 0xF) as i32 - 8;
+                part += q as f32 * x[col0 + i];
+            }
+            acc += scale * part;
+        }
+        acc
+    }
+}
+
 /// A weight matrix (no bias). Row-major: weight[out_i * in_dim + in_j].
 struct Linear {
     weight:  Vec<f32>,
     gpu_mat: atlas_tensor::GpuMatrix,
     in_dim:  usize,
     out_dim: usize,
+    /// CPU copy of W4 weights. Present only when the layer is quantized AND
+    /// the GPU upload was unavailable (CPU-only builds/tests) — on GPU the
+    /// packed copy is dropped to save host RAM (~18 GB for a 32B model).
+    w4_cpu:  Option<W4Cpu>,
 }
 
 impl Linear {
@@ -475,14 +540,44 @@ impl Linear {
         let weight: Vec<f32> = pseudo_randn(in_dim * out_dim, seed)
             .into_iter().map(|v| v * scale).collect();
         let gpu_mat = atlas_tensor::GpuMatrix::upload(&weight, out_dim, in_dim);
-        Self { weight, gpu_mat, in_dim, out_dim }
+        Self { weight, gpu_mat, in_dim, out_dim, w4_cpu: None }
+    }
+
+    /// Placeholder with no weight storage at all (neither CPU nor GPU).
+    /// Used by `OlmoModel::new_uninit` so constructing a 32B-parameter model
+    /// shell does not allocate ~128 GB of random f32 weights before loading.
+    /// Must be overwritten by the loader before any forward pass.
+    fn placeholder(in_dim: usize, out_dim: usize) -> Self {
+        Self {
+            weight: Vec::new(),
+            gpu_mat: atlas_tensor::GpuMatrix::empty(out_dim, in_dim),
+            in_dim, out_dim,
+            w4_cpu: None,
+        }
+    }
+
+    /// Load from W4 (int4 group-quantized) tensors, compressed-tensors
+    /// pack-quantized layout. Uploads packed weights + BF16 scales to VRAM;
+    /// keeps a CPU copy only when the GPU is unavailable.
+    fn from_w4(packed: Vec<u32>, scales_bf16: Vec<u16>, in_dim: usize, out_dim: usize, group: usize) -> Self {
+        assert_eq!(in_dim % 8, 0, "W4 requires in_dim % 8 == 0");
+        assert_eq!(group % 8, 0,  "W4 requires group % 8 == 0");
+        assert_eq!(packed.len(), out_dim * (in_dim / 8));
+        assert_eq!(scales_bf16.len(), out_dim * (in_dim / group));
+        let gpu_mat = atlas_tensor::GpuMatrix::upload_w4(&packed, &scales_bf16, out_dim, in_dim, group);
+        let w4_cpu = if gpu_mat.is_on_gpu() {
+            None // GPU-resident: drop the host copy (saves ~18 GB on 32B)
+        } else {
+            Some(W4Cpu { packed, scales_bf16, group })
+        };
+        Self { weight: Vec::new(), gpu_mat, in_dim, out_dim, w4_cpu }
     }
 
     /// Load from f32 slice (used by safetensors loader).
     fn from_data(weight: Vec<f32>, in_dim: usize, out_dim: usize) -> Self {
         assert_eq!(weight.len(), in_dim * out_dim);
         let gpu_mat = atlas_tensor::GpuMatrix::upload(&weight, out_dim, in_dim);
-        Self { weight, gpu_mat, in_dim, out_dim }
+        Self { weight, gpu_mat, in_dim, out_dim, w4_cpu: None }
     }
 
     /// Load from BF16 source weights.
@@ -498,7 +593,7 @@ impl Linear {
         let gpu_mat = atlas_tensor::GpuMatrix::upload_bf16(&weight_bf16, out_dim, in_dim);
         // weight_bf16 is no longer needed after upload — drop it to reclaim RAM
         drop(weight_bf16);
-        Self { weight: weight_f32, gpu_mat, in_dim, out_dim }
+        Self { weight: weight_f32, gpu_mat, in_dim, out_dim, w4_cpu: None }
     }
 
     /// Returns true if this layer's weights are stored as BF16 in GPU VRAM.
@@ -512,7 +607,20 @@ impl Linear {
         if self.gpu_mat.sgemm(x, self.in_dim, 1, y) {
             return;
         }
-        // CPU fallback
+        // CPU fallback — W4 (dequantize on the fly) or dense f32.
+        if let Some(w4) = &self.w4_cpu {
+            for o in 0..self.out_dim {
+                y[o] = w4.row_dot(o, self.in_dim, x);
+            }
+            return;
+        }
+        assert!(
+            !self.weight.is_empty(),
+            "Linear({}×{}): no CPU weights available for fallback \
+             (W4 GPU-resident layer hit a failed kernel launch, or a \
+             placeholder layer was never loaded)",
+            self.out_dim, self.in_dim
+        );
         for o in 0..self.out_dim {
             let row = &self.weight[o * self.in_dim .. (o+1) * self.in_dim];
             y[o] = row.iter().zip(x.iter()).map(|(&w, &xi)| w * xi).sum();
@@ -525,9 +633,45 @@ impl Linear {
         self.gpu_mat.sgemm_vec(x, 1)
     }
 
-    /// Batch forward: X[seq_len × in_dim] → Y[seq_len × out_dim].
-    /// Each token is dispatched via GPU SGEMM if available.
+    /// Batch forward: X[seq_len × in_dim] (token-major) → Y[seq_len × out_dim].
+    ///
+    /// #22 batched prefill: for `seq_len > 1` this issues ONE GEMM over the
+    /// whole chunk instead of `seq_len` GEMVs — the weight matrix streams
+    /// through the GPU once per chunk instead of once per token, which is
+    /// the entire prefill win. `GpuMatrix::sgemm` expects the activations as
+    /// `[in_dim × seq_len]` row-major (each *column* one token), so X is
+    /// transposed on the way in and Y back on the way out — O(seq·dim) CPU
+    /// copies, negligible next to the GEMM itself.
+    ///
+    /// Falls back to the per-token path when the batch GEMM is unavailable:
+    /// no CUDA, or a failed kernel launch / scratch allocation. (W4 batch is
+    /// handled inside atlas-tensor since #22 Step 2: dequant-to-scratch +
+    /// GEMM.) The fallback is exactly the pre-#22 behaviour, including its
+    /// CPU fallbacks — never silently wrong.
     fn forward_batch(&self, x: &[f32], seq_len: usize, y: &mut [f32]) {
+        assert_eq!(x.len(), seq_len * self.in_dim);
+        assert_eq!(y.len(), seq_len * self.out_dim);
+        if seq_len > 1 && self.gpu_mat.is_on_gpu() {
+            // Transpose X: [seq × in] token-major → [in × seq] for sgemm.
+            let mut xt = vec![0.0f32; x.len()];
+            for s in 0..seq_len {
+                let row = &x[s * self.in_dim .. (s+1) * self.in_dim];
+                for (i, &v) in row.iter().enumerate() {
+                    xt[i * seq_len + s] = v;
+                }
+            }
+            let mut yt = vec![0.0f32; y.len()];
+            if self.gpu_mat.sgemm(&xt, self.in_dim, seq_len, &mut yt) {
+                // Transpose Y back: [out × seq] → [seq × out] token-major.
+                for s in 0..seq_len {
+                    let row = &mut y[s * self.out_dim .. (s+1) * self.out_dim];
+                    for (o, v) in row.iter_mut().enumerate() {
+                        *v = yt[o * seq_len + s];
+                    }
+                }
+                return;
+            }
+        }
         for s in 0..seq_len {
             self.forward(
                 &x[s * self.in_dim .. (s+1) * self.in_dim],
@@ -653,14 +797,24 @@ struct Attention {
 
 impl Attention {
     fn new(cfg: &ModelConfig, layer: usize) -> Self {
+        Self::new_impl(cfg, layer, true)
+    }
+
+    /// `init = false`: placeholder projections (no weight allocation) —
+    /// used when the caller will overwrite every Linear from a checkpoint.
+    fn new_impl(cfg: &ModelConfig, layer: usize, init: bool) -> Self {
         let head_dim = cfg.d_model / cfg.n_heads;
         let kv_dim   = head_dim * cfg.n_kv_heads;
         let seed_base = 1000 + layer as u64 * 10;
+        let mk = |in_dim: usize, out_dim: usize, seed: u64| {
+            if init { Linear::new(in_dim, out_dim, seed) }
+            else    { Linear::placeholder(in_dim, out_dim) }
+        };
         Self {
-            wq: Linear::new(cfg.d_model, cfg.d_model, seed_base),
-            wk: Linear::new(cfg.d_model, kv_dim,      seed_base + 1),
-            wv: Linear::new(cfg.d_model, kv_dim,      seed_base + 2),
-            wo: Linear::new(cfg.d_model, cfg.d_model, seed_base + 3),
+            wq: mk(cfg.d_model, cfg.d_model, seed_base),
+            wk: mk(cfg.d_model, kv_dim,      seed_base + 1),
+            wv: mk(cfg.d_model, kv_dim,      seed_base + 2),
+            wo: mk(cfg.d_model, cfg.d_model, seed_base + 3),
             n_heads:    cfg.n_heads,
             n_kv_heads: cfg.n_kv_heads,
             head_dim,
@@ -760,6 +914,196 @@ impl Attention {
         // Output projection
         let mut result = vec![0.0f32; d];
         self.wo.forward(&out, &mut result);
+        result
+    }
+
+    /// Chunked-prefill attention (#22). `x`: [m × d_model] token-major for
+    /// positions `start..start+m` → returns [m × d_model].
+    ///
+    /// Structure (scoping doc §2 Step 1):
+    /// ① Q/K/V projections as ONE GEMM each over the m-token chunk
+    ///    (`Linear::forward_batch`) — this removes the m× re-streaming of
+    ///    the projection weights that made prefill run at decode speed.
+    /// ② Per token: QK-norm (full-projection RMS, identical to
+    ///    `forward_token`), RoPE at the absolute position, KV-cache write
+    ///    (CPU cache + GPU lock-step backfill, same as the CPU path).
+    /// ③ Attention per token over the KV cache — bit-identical math and
+    ///    sliding-window masking to `forward_token`. Causality holds for ANY
+    ///    chunk size: all chunk K/V are written in ② before any attention
+    ///    runs, and token `s` only reads cache[0..=start+s]; SWA masking uses
+    ///    absolute distances, so no chunk ≤ window clamp is required.
+    /// ④ Output projection as one GEMM.
+    fn forward_chunk(&mut self, x: &[f32], start: usize, m: usize, rope: &RopeCache) -> Vec<f32> {
+        // Attention below reads the CPU cache — make sure it holds any
+        // history the full-GPU decode path wrote only to VRAM.
+        self.sync_cpu_cache_from_gpu(start);
+
+        let d  = self.n_heads * self.head_dim;
+        let kv = self.n_kv_heads * self.head_dim;
+
+        // ① Batched QKV projections.
+        //
+        //    Fast path mirrors FeedForward::forward_chunk: ONE feature-major
+        //    transpose of x shared by all three projections, three
+        //    GPU-resident sgemm_vec GEMMs from a single upload, then
+        //    transpose-back for the per-token RoPE/QK-norm below. (The
+        //    token-major forward_batch fallback transposes x three times
+        //    and re-uploads it per projection.)
+        let mut q = vec![0.0f32; m * d];
+        let mut k = vec![0.0f32; m * kv];
+        let mut v = vec![0.0f32; m * kv];
+        let mut qkv_done = false;
+        if m > 1 && atlas_tensor::cuda_available() {
+            let d_in = self.wq.in_dim;
+            // Transpose in: [m × d_in] token-major → [d_in × m], once.
+            let mut xt = vec![0.0f32; m * d_in];
+            for s in 0..m {
+                let row = &x[s*d_in .. (s+1)*d_in];
+                for (i, &vx) in row.iter().enumerate() { xt[i*m + s] = vx; }
+            }
+            let x_gpu = atlas_tensor::GpuVec::from_slice(&xt);
+            if x_gpu.is_on_gpu() {
+                let _ = atlas_tensor::take_kernel_error();
+                if let (Some(qg), Some(kg), Some(vg)) = (
+                    self.wq.gpu_mat.sgemm_vec(&x_gpu, m),
+                    self.wk.gpu_mat.sgemm_vec(&x_gpu, m),
+                    self.wv.gpu_mat.sgemm_vec(&x_gpu, m),
+                ) {
+                    let q_fm = qg.download();
+                    let k_fm = kg.download();
+                    let v_fm = vg.download(); // sync points
+                    if atlas_tensor::take_kernel_error() == 0 {
+                        for s in 0..m {
+                            let row = &mut q[s*d .. (s+1)*d];
+                            for (o, vv) in row.iter_mut().enumerate() { *vv = q_fm[o*m + s]; }
+                            let row = &mut k[s*kv .. (s+1)*kv];
+                            for (o, vv) in row.iter_mut().enumerate() { *vv = k_fm[o*m + s]; }
+                            let row = &mut v[s*kv .. (s+1)*kv];
+                            for (o, vv) in row.iter_mut().enumerate() { *vv = v_fm[o*m + s]; }
+                        }
+                        qkv_done = true;
+                    }
+                }
+            }
+        }
+        if !qkv_done {
+            // Token-major fallback (exact; no-CUDA / kernel failure).
+            self.wq.forward_batch(x, m, &mut q);
+            self.wk.forward_batch(x, m, &mut k);
+            self.wv.forward_batch(x, m, &mut v);
+        }
+
+        // ② QK-norm + RoPE + KV-cache write, per token.
+        for s in 0..m {
+            let pos = start + s;
+            let q_s = &mut q[s*d .. (s+1)*d];
+            if !self.q_norm.is_empty() {
+                rmsnorm_inplace(q_s, &self.q_norm, 1e-6);
+            }
+            let k_s = &mut k[s*kv .. (s+1)*kv];
+            if !self.k_norm.is_empty() {
+                rmsnorm_inplace(k_s, &self.k_norm, 1e-6);
+            }
+            for h in 0..self.n_heads {
+                rope.apply(&mut q_s[h*self.head_dim..(h+1)*self.head_dim], pos);
+            }
+            for h in 0..self.n_kv_heads {
+                rope.apply(&mut k_s[h*self.head_dim..(h+1)*self.head_dim], pos);
+            }
+            let v_s = &v[s*kv .. (s+1)*kv];
+            for h in 0..self.n_kv_heads {
+                self.kv_cache.write_key(pos, h, &k_s[h*self.head_dim..(h+1)*self.head_dim]);
+                self.kv_cache.write_val(pos, h, &v_s[h*self.head_dim..(h+1)*self.head_dim]);
+            }
+            if pos == self.cpu_synced_upto { self.cpu_synced_upto = pos + 1; }
+        }
+
+        // GPU KV lock-step backfill for the WHOLE chunk: `k`/`v` are
+        // position-major [m × kv_dim] — exactly the cache's own layout —
+        // so this is one H2D upload + one contiguous D2D copy each,
+        // replacing 2·m per-token uploads (measured: per-token backfill
+        // allocs alone erased the chunking win on synthetic models).
+        // On failure the cache is marked stale, same as backfill_kv_to_gpu.
+        if self.gpu_kv.is_some() {
+            let k_gpu = atlas_tensor::GpuVec::from_slice(&k);
+            let v_gpu = atlas_tensor::GpuVec::from_slice(&v);
+            let ok = k_gpu.is_on_gpu() && v_gpu.is_on_gpu()
+                && self.gpu_kv.as_mut()
+                    .map_or(false, |kvc| kvc.write_range(start, m, &k_gpu, &v_gpu));
+            if !ok { self.gpu_kv_stale = true; }
+        }
+
+        // ③ Attention over the KV cache.
+        //
+        //    Fast path: GPU decode attention for all m positions with ONE
+        //    Q upload and ONE output download
+        //    (`GpuKvCache::decode_attention_prefill`) — zero weight traffic,
+        //    K/V already resident from the chunk backfill above. Without a
+        //    GPU attention path, chunk attention runs on the CPU and
+        //    dominates prefill at real context lengths (and on 7B/32B —
+        //    whose per-token prefill is full-GPU — it would be a large
+        //    regression).
+        //
+        //    Fallback (exact): the per-token CPU loop below over the
+        //    complete CPU cache — same math + SWA masking as forward_token.
+        //    Triggered by missing/stale GPU KV, failed Q upload, or a
+        //    kernel error surfaced after the (synchronizing) download.
+        let window = self.window_size.unwrap_or(0);
+        let mut out = vec![0.0f32; m * d];
+        let mut gpu_attn_done = false;
+        if self.gpu_kv.is_some() && !self.gpu_kv_stale && atlas_tensor::cuda_available() {
+            let _ = atlas_tensor::take_kernel_error();
+            let q_gpu = atlas_tensor::GpuVec::from_slice(&q);
+            if q_gpu.is_on_gpu() {
+                let attn = self.gpu_kv.as_ref().and_then(|kvc| {
+                    kvc.decode_attention_prefill(&q_gpu, m, self.n_heads, start,
+                                                 self.scale, window)
+                });
+                if let Some(o_gpu) = attn {
+                    let o_cpu = o_gpu.download(); // sync point
+                    if atlas_tensor::take_kernel_error() == 0 {
+                        out.copy_from_slice(&o_cpu);
+                        gpu_attn_done = true;
+                    }
+                }
+            }
+        }
+        if !gpu_attn_done {
+            let group = self.n_heads / self.n_kv_heads;
+            let mut scores: Vec<f32> = Vec::with_capacity(start + m);
+            for s in 0..m {
+                let pos = start + s;
+                scores.clear();
+                scores.resize(pos + 1, 0.0);
+                let q_s = &q[s*d .. (s+1)*d];
+                let o_s = &mut out[s*d .. (s+1)*d];
+                for h in 0..self.n_heads {
+                    let kv_h = h / group;
+                    let q_h = &q_s[h*self.head_dim..(h+1)*self.head_dim];
+                    for t in 0..=pos {
+                        let masked = self.window_size.map_or(false, |w| pos - t >= w);
+                        if masked {
+                            scores[t] = f32::NEG_INFINITY;
+                        } else {
+                            let k_t = self.kv_cache.key(t, kv_h);
+                            let score: f32 = q_h.iter().zip(k_t.iter()).map(|(&qi, &ki)| qi * ki).sum();
+                            scores[t] = score * self.scale;
+                        }
+                    }
+                    softmax_inplace(&mut scores[..pos+1]);
+                    let o_h = &mut o_s[h*self.head_dim..(h+1)*self.head_dim];
+                    for t in 0..=pos {
+                        let v_t = self.kv_cache.val(t, kv_h);
+                        let a = scores[t];
+                        for (oi, &vi) in o_h.iter_mut().zip(v_t.iter()) { *oi += a * vi; }
+                    }
+                }
+            }
+        }
+
+        // ④ Batched output projection.
+        let mut result = vec![0.0f32; m * d];
+        self.wo.forward_batch(&out, m, &mut result);
         result
     }
 
@@ -985,11 +1329,20 @@ struct FeedForward {
 
 impl FeedForward {
     fn new(cfg: &ModelConfig, layer: usize) -> Self {
+        Self::new_impl(cfg, layer, true)
+    }
+
+    /// `init = false`: placeholder weights (see `Attention::new_impl`).
+    fn new_impl(cfg: &ModelConfig, layer: usize, init: bool) -> Self {
         let seed = 2000 + layer as u64 * 10;
+        let mk = |in_dim: usize, out_dim: usize, seed: u64| {
+            if init { Linear::new(in_dim, out_dim, seed) }
+            else    { Linear::placeholder(in_dim, out_dim) }
+        };
         Self {
-            w_gate: Linear::new(cfg.d_model, cfg.ffn_hidden, seed),
-            w_up:   Linear::new(cfg.d_model, cfg.ffn_hidden, seed + 1),
-            w_down: Linear::new(cfg.ffn_hidden, cfg.d_model, seed + 2),
+            w_gate: mk(cfg.d_model, cfg.ffn_hidden, seed),
+            w_up:   mk(cfg.d_model, cfg.ffn_hidden, seed + 1),
+            w_down: mk(cfg.ffn_hidden, cfg.d_model, seed + 2),
         }
     }
 
@@ -1017,6 +1370,68 @@ impl FeedForward {
         self.w_down.forward(&hidden, &mut out);
         out
     }
+
+    /// Chunked SwiGLU FFN (#22): gate/up/down each as ONE GEMM over the
+    /// m-token chunk. x: [m × d_model] token-major → [m × d_model].
+    ///
+    /// Fast path: the whole pipeline runs GPU-resident in FEATURE-major
+    /// layout — `sgemm_vec` consumes/produces [k × m] matrices, and the
+    /// SwiGLU fuse is elementwise (layout-agnostic), so gate → silu·up →
+    /// down chains in VRAM with ONE activation upload and ONE download,
+    /// and only two [m × d]-sized CPU transposes at the boundaries.
+    /// Profiling (512-tok prefill, 0.8B synthetic): the token-major
+    /// `forward_batch` version spent 2.3 s of a 3.4 s prefill here — the
+    /// 18 MB/layer of intermediate PCIe + 2M scalar silu() calls + the
+    /// cache-hostile [ffn × m] transposes dominated everything.
+    ///
+    /// Fallback (no CUDA, failed upload/kernel): token-major
+    /// `forward_batch` per projection + CPU silu — exact pre-existing
+    /// behaviour.
+    fn forward_chunk(&self, x: &[f32], m: usize) -> Vec<f32> {
+        let d_in  = self.w_gate.in_dim;
+        let d_out = self.w_down.out_dim;
+        if m > 1 && atlas_tensor::cuda_available() {
+            // Transpose in: [m × d_in] token-major → [d_in × m] feature-major.
+            let mut xt = vec![0.0f32; x.len()];
+            for s in 0..m {
+                let row = &x[s*d_in .. (s+1)*d_in];
+                for (i, &v) in row.iter().enumerate() { xt[i*m + s] = v; }
+            }
+            let x_gpu = atlas_tensor::GpuVec::from_slice(&xt);
+            if x_gpu.is_on_gpu() {
+                let _ = atlas_tensor::take_kernel_error();
+                let fused = self.w_gate.gpu_mat.sgemm_vec(&x_gpu, m)
+                    .zip(self.w_up.gpu_mat.sgemm_vec(&x_gpu, m))
+                    .map(|(gate, up)| atlas_tensor::silu_mul_gpu(&gate, &up))
+                    .and_then(|hidden| self.w_down.gpu_mat.sgemm_vec(&hidden, m));
+                if let Some(out_fm_gpu) = fused {
+                    let out_fm = out_fm_gpu.download(); // sync point
+                    if atlas_tensor::take_kernel_error() == 0 {
+                        // Transpose out: [d_out × m] → [m × d_out].
+                        let mut out = vec![0.0f32; m * d_out];
+                        for s in 0..m {
+                            let row = &mut out[s*d_out .. (s+1)*d_out];
+                            for (o, v) in row.iter_mut().enumerate() { *v = out_fm[o*m + s]; }
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
+        // Token-major fallback (exact; covers no-CUDA / kernel failure).
+        let h = self.w_gate.out_dim;
+        let mut gate = vec![0.0f32; m * h];
+        let mut up   = vec![0.0f32; m * h];
+        self.w_gate.forward_batch(x, m, &mut gate);
+        self.w_up.forward_batch(x, m, &mut up);
+        // SwiGLU fuse (elementwise — token layout irrelevant)
+        let hidden: Vec<f32> = gate.iter().zip(up.iter())
+            .map(|(&g, &u)| silu(g) * u)
+            .collect();
+        let mut out = vec![0.0f32; m * d_out];
+        self.w_down.forward_batch(&hidden, m, &mut out);
+        out
+    }
 }
 
 // ── Transformer Block ─────────────────────────────────────────────────────
@@ -1039,9 +1454,14 @@ struct TransformerBlock {
 
 impl TransformerBlock {
     fn new(cfg: &ModelConfig, layer: usize) -> Self {
+        Self::new_impl(cfg, layer, true)
+    }
+
+    /// `init = false`: placeholder weights (see `Attention::new_impl`).
+    fn new_impl(cfg: &ModelConfig, layer: usize, init: bool) -> Self {
         Self {
-            attn:          Attention::new(cfg, layer),
-            ffn:           FeedForward::new(cfg, layer),
+            attn:          Attention::new_impl(cfg, layer, init),
+            ffn:           FeedForward::new_impl(cfg, layer, init),
             attn_norm:     vec![1.0f32; cfg.d_model],
             ffn_norm:      vec![1.0f32; cfg.d_model],
             attn_norm_gpu: None,
@@ -1096,6 +1516,48 @@ impl TransformerBlock {
             let mut x_norm2 = x.clone();
             rmsnorm_inplace(&mut x_norm2, &self.ffn_norm, self.eps);
             let ffn_out = self.ffn.forward(&x_norm2);
+            for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) { *xi += fi; }
+        }
+    }
+
+    /// Chunked-prefill transformer block (#22): attention QKV/out-proj and
+    /// FFN gate/up/down run as one GEMM each over the m-token chunk; norms
+    /// and residual adds run per token on the CPU (O(m·d) — negligible).
+    /// Norm/residual ordering is identical to `forward_token_cpu` for both
+    /// the OLMo-2/3 post-norm and Llama pre-norm variants.
+    ///
+    /// x: [m × d_model] token-major for positions `start..start+m`,
+    /// modified in place.
+    fn forward_chunk(&mut self, x: &mut [f32], start: usize, m: usize, rope: &RopeCache) {
+        let d = self.d_model;
+        if self.post_norm {
+            // OLMo-2/3 post-norm: norm the sub-layer OUTPUT, then residual add.
+            let mut attn_out = self.attn.forward_chunk(x, start, m, rope);
+            for s in 0..m {
+                let row = &mut attn_out[s*d..(s+1)*d];
+                rmsnorm_inplace(row, &self.attn_norm, self.eps);
+                for (xi, &ni) in x[s*d..(s+1)*d].iter_mut().zip(row.iter()) { *xi += ni; }
+            }
+            let mut ffn_out = self.ffn.forward_chunk(x, m);
+            for s in 0..m {
+                let row = &mut ffn_out[s*d..(s+1)*d];
+                rmsnorm_inplace(row, &self.ffn_norm, self.eps);
+                for (xi, &ni) in x[s*d..(s+1)*d].iter_mut().zip(row.iter()) { *xi += ni; }
+            }
+        } else {
+            // Llama pre-norm: norm before attention and FFN.
+            let mut x_norm = x.to_vec();
+            for s in 0..m {
+                rmsnorm_inplace(&mut x_norm[s*d..(s+1)*d], &self.attn_norm, self.eps);
+            }
+            let attn_out = self.attn.forward_chunk(&x_norm, start, m, rope);
+            for (xi, &ai) in x.iter_mut().zip(attn_out.iter()) { *xi += ai; }
+
+            let mut x_norm2 = x.to_vec();
+            for s in 0..m {
+                rmsnorm_inplace(&mut x_norm2[s*d..(s+1)*d], &self.ffn_norm, self.eps);
+            }
+            let ffn_out = self.ffn.forward_chunk(&x_norm2, m);
             for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) { *xi += fi; }
         }
     }
@@ -1481,20 +1943,53 @@ pub struct OlmoModel {
     /// remaining token is computed on the (always-consistent) CPU path
     /// instead of emitting silent garbage. See `forward_one_gpu`.
     gpu_poisoned: bool,
+    /// Prefill chunk size in tokens (#22 batched prefill). Prompt processing
+    /// iterates the prompt in chunks of this many tokens via
+    /// [`Self::prefill_chunk`]; [`GenEvent::Prefill`] progress is reported
+    /// once per chunk. Default 256 (override with env `ATLAS_PREFILL_CHUNK`);
+    /// set to 1 via [`Self::set_prefill_chunk_tokens`] to restore the legacy
+    /// per-token cadence.
+    prefill_chunk_tokens: usize,
+}
+
+/// Prefill chunk size default: env `ATLAS_PREFILL_CHUNK` (≥ 1) or 256 (#22).
+fn prefill_chunk_tokens_from_env() -> usize {
+    std::env::var("ATLAS_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(256)
 }
 
 impl OlmoModel {
     /// Create a new randomly-initialized model.
     pub fn new(cfg: ModelConfig) -> Self {
+        Self::new_impl(cfg, true)
+    }
+
+    /// Create a model shell WITHOUT weight initialization: every Linear and
+    /// the embedding are empty placeholders that the checkpoint loader must
+    /// overwrite. Required for very large models — `new()` would allocate
+    /// (and pseudo-randomly fill) `params × 4` bytes of host RAM, which is
+    /// ~128 GB for OLMo-3-32B.
+    pub fn new_uninit(cfg: ModelConfig) -> Self {
+        Self::new_impl(cfg, false)
+    }
+
+    fn new_impl(cfg: ModelConfig, init: bool) -> Self {
         let head_dim = cfg.d_model / cfg.n_heads;
         // Fix B: build RopeCache with YaRN scaling if configured.
         // YaRN applies only to full-attention layers (HF Olmo3 reference);
         // sliding-window layers always use standard RoPE at the same theta.
         let rope = RopeCache::new(head_dim, cfg.max_seq_len, cfg.rope_theta, &cfg.rope_scaling);
         let rope_local = RopeCache::new(head_dim, cfg.max_seq_len, cfg.rope_theta, &RopeScaling::None);
-        let embed = Embedding::new(cfg.vocab_size, cfg.d_model, 0);
+        let embed = if init {
+            Embedding::new(cfg.vocab_size, cfg.d_model, 0)
+        } else {
+            Embedding::from_data(Vec::new(), 0, cfg.d_model)
+        };
         let mut layers: Vec<_> = (0..cfg.n_layers)
-            .map(|i| TransformerBlock::new(&cfg, i))
+            .map(|i| TransformerBlock::new_impl(&cfg, i, init))
             .collect();
         // Fix B: multiply attention scale by YaRN attn_factor² (1.0 for standard
         // RoPE). Applies ONLY to full-attention layers — sliding layers use
@@ -1518,13 +2013,17 @@ impl OlmoModel {
         }
         let norm = vec![1.0f32; cfg.d_model];
         // Weight tying: lm_head shares embed weights (copy for simplicity)
-        let lm_head = Linear::from_data(
-            embed.weight.clone(),
-            cfg.d_model,
-            cfg.vocab_size,
-        );
+        let lm_head = if init {
+            Linear::from_data(
+                embed.weight.clone(),
+                cfg.d_model,
+                cfg.vocab_size,
+            )
+        } else {
+            Linear::placeholder(cfg.d_model, cfg.vocab_size)
+        };
         let eos_token_id = cfg.eos_token_id;
-        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_local, rope_gpu: None, rope_local_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy(), gpu_poisoned: false }
+        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_local, rope_gpu: None, rope_local_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy(), gpu_poisoned: false, prefill_chunk_tokens: prefill_chunk_tokens_from_env() }
     }
 
     /// Upload precomputed RoPE tables and allocate GPU KV caches.
@@ -1573,6 +2072,75 @@ impl OlmoModel {
         for l in &mut self.layers { l.attn.reset_cache(); }
         // New sequence — give the GPU path another chance.
         self.gpu_poisoned = false;
+    }
+
+    /// Override the prefill chunk size (tokens per [`Self::prefill_chunk`]
+    /// call). Values < 1 are clamped to 1 (per-token cadence).
+    pub fn set_prefill_chunk_tokens(&mut self, n: usize) {
+        self.prefill_chunk_tokens = n.max(1);
+    }
+
+    /// Process a chunk of prompt tokens; returns logits for the LAST token
+    /// in the chunk.
+    ///
+    /// #22 batched prefill: for chunks of ≥ 2 tokens this runs the
+    /// chunked-GEMM path — per layer, QKV / out-proj / FFN each execute as
+    /// ONE GEMM over the whole chunk ([`TransformerBlock::forward_chunk`]),
+    /// so the model weights stream through the GPU once per chunk instead of
+    /// once per token. Attention itself stays per-token over the KV cache
+    /// (exact causality + SWA masking for any chunk size). The LM head runs
+    /// only for the final chunk token — the legacy loop computed and
+    /// discarded a full-vocab projection for every prompt token.
+    ///
+    /// Chunk size 1 keeps the exact legacy per-token contract (full-GPU
+    /// decode path with per-token CPU fallback and `gpu_poisoned` handling).
+    /// The chunked path needs no poison/rollback machinery: every GEMM
+    /// falls back per token (and ultimately to CPU) inside
+    /// [`Linear::forward_batch`], the CPU KV cache is written directly, and
+    /// GPU KV backfill failures degrade via the existing `gpu_kv_stale`
+    /// flag — never silently wrong.
+    ///
+    /// W4 weights (32B) still take the per-token GEMV inside
+    /// `forward_batch` until the atlas-tensor batch path lands (#22 Step 2)
+    /// — same speed as before, not slower; BF16/F32 models get the full
+    /// GEMM win immediately.
+    pub fn prefill_chunk(&mut self, tokens: &[u32]) -> Vec<f32> {
+        let m = tokens.len();
+        if m == 0 { return Vec::new(); }
+        if m == 1 {
+            // Legacy per-token contract — bit-exact pre-#22 behaviour.
+            return if let Some(gl) = self.forward_one_gpu(tokens[0]) {
+                gl
+            } else {
+                self.forward_one(tokens[0])
+            };
+        }
+
+        let start = self.pos;
+        let d = self.config.d_model;
+
+        // Embed the whole chunk: [m × d_model] token-major.
+        let mut x = self.embed.forward(tokens);
+
+        // Per-layer chunked forward. Same borrow-split pattern as
+        // `forward_one_hooked`: rope caches don't overlap layer data.
+        let rope_full:  *const RopeCache = &self.rope;
+        let rope_local: *const RopeCache = &self.rope_local;
+        for layer in self.layers.iter_mut() {
+            // Sliding-window layers use unscaled RoPE; full layers use YaRN.
+            let rope = unsafe {
+                if layer.attn.window_size.is_some() { &*rope_local } else { &*rope_full }
+            };
+            layer.forward_chunk(&mut x, start, m, rope);
+        }
+        self.pos = start + m;
+
+        // Final norm + LM head for the LAST token only.
+        let mut last = x[(m-1)*d .. m*d].to_vec();
+        rmsnorm_inplace(&mut last, &self.norm, self.config.rms_norm_eps);
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.lm_head.forward(&last, &mut logits);
+        logits
     }
 
     /// Forward pass for one new token. Returns logits [vocab_size].
@@ -1865,13 +2433,10 @@ impl OlmoModel {
         let mut new_tokens: Vec<u32> = Vec::new();
         let mut last_logits = vec![0.0f32; self.config.vocab_size];
 
-        // Process prompt
-        for &tok in prompt {
-            last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
-                gl
-            } else {
-                self.forward_one(tok)
-            };
+        // Process prompt in chunks (#22 batched prefill).
+        let chunk = self.prefill_chunk_tokens.max(1);
+        for toks in prompt.chunks(chunk) {
+            last_logits = self.prefill_chunk(toks);
         }
 
         // Token history for repetition / frequency / presence penalties
@@ -2151,15 +2716,15 @@ impl OlmoModel {
         let mut new_tokens: Vec<u32> = Vec::new();
         let mut last_logits = vec![0.0f32; self.config.vocab_size];
 
-        // Process prompt, reporting progress after each token.
+        // Process prompt in chunks, reporting progress after each chunk
+        // (#22 batched prefill; chunk size 1 = legacy per-token cadence).
         let total = prompt.len();
-        for (i, &tok) in prompt.iter().enumerate() {
-            last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
-                gl
-            } else {
-                self.forward_one(tok)
-            };
-            if !on_event(GenEvent::Prefill { done: i + 1, total }) {
+        let chunk = self.prefill_chunk_tokens.max(1);
+        let mut done = 0usize;
+        for toks in prompt.chunks(chunk) {
+            last_logits = self.prefill_chunk(toks);
+            done += toks.len();
+            if !on_event(GenEvent::Prefill { done, total }) {
                 return new_tokens; // client gone — abort before decode
             }
         }
@@ -2488,6 +3053,24 @@ impl SafetensorsFile {
         Ok(vals)
     }
 
+    /// Get tensor data as raw little-endian u32 words (no conversion).
+    /// Used for packed int4 weights (dtype "I32" in compressed-tensors
+    /// checkpoints — the bit pattern is what matters, not the sign).
+    pub fn get_u32(&self, name: &str) -> Result<Vec<u32>> {
+        let desc = self.tensors.iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| AtlasError::Io(format!("tensor '{name}' not found")))?;
+        if desc.dtype != "I32" && desc.dtype != "U32" {
+            return Err(AtlasError::Parse(format!(
+                "tensor '{name}' dtype is '{}', not I32/U32", desc.dtype)));
+        }
+        let raw = &self.data[desc.offsets[0]..desc.offsets[1]];
+        let vals: Vec<u32> = raw.chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        Ok(vals)
+    }
+
     /// Get tensor data as f32. Handles F32 and BF16 → f32 conversion.
     pub fn get_f32(&self, name: &str) -> Result<Vec<f32>> {
         let desc = self.tensors.iter()
@@ -2755,6 +3338,12 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
     let mut shard_files: Vec<String> = shard_set.into_iter().collect();
     shard_files.sort();
 
+    // W4 checkpoints (compressed-tensors "pack-quantized", e.g. AWQ-recipe
+    // OLMo-3-32B) store Linears as `*.weight_packed` + `*.weight_scale`.
+    if index_json.contains("weight_packed") {
+        return load_model_from_dir_w4(dir, cfg, &shard_files, &index_json);
+    }
+
     eprintln!("[load_model_from_dir] loading {} shards from {dir}", shard_files.len());
 
     // Load all tensors from all shards into a flat map.
@@ -2848,6 +3437,173 @@ pub fn load_model_from_dir(dir: &str, cfg: ModelConfig) -> Result<OlmoModel> {
             }
         }
     }
+    // Pre-upload norm weights + GPU KV cache + GPU RoPE tables (one-time cost).
+    for layer in &mut model.layers {
+        layer.cache_norm_weights();
+    }
+    model.init_gpu_resources();
+    Ok(model)
+}
+
+/// Route a completed W4 Linear (packed + scales) into the model by its HF
+/// tensor prefix (e.g. `model.layers.3.self_attn.q_proj`).
+/// Returns Ok(true) if placed, Ok(false) if the prefix is not a known Linear.
+fn place_w4_linear(
+    model: &mut OlmoModel, cfg: &ModelConfig,
+    prefix: &str, packed: Vec<u32>, scales: Vec<u16>,
+) -> Result<bool> {
+    let rest = if let Some(r) = prefix.strip_prefix("model.layers.") { r }
+               else if let Some(r) = prefix.strip_prefix("layers.") { r }
+               else { return Ok(false) };
+    let dot = match rest.find('.') { Some(d) => d, None => return Ok(false) };
+    let layer_i: usize = match rest[..dot].parse() { Ok(i) => i, Err(_) => return Ok(false) };
+    if layer_i >= cfg.n_layers {
+        return Err(AtlasError::Parse(format!(
+            "W4 tensor '{prefix}': layer {layer_i} out of range (n_layers={})", cfg.n_layers)));
+    }
+    let local = &rest[dot + 1..];
+    let kd = cfg.n_kv_heads * cfg.head_dim();
+    let (in_dim, out_dim) = match local {
+        "self_attn.q_proj" => (cfg.d_model, cfg.d_model),
+        "self_attn.k_proj" => (cfg.d_model, kd),
+        "self_attn.v_proj" => (cfg.d_model, kd),
+        "self_attn.o_proj" => (cfg.d_model, cfg.d_model),
+        "mlp.gate_proj"    => (cfg.d_model, cfg.ffn_hidden),
+        "mlp.up_proj"      => (cfg.d_model, cfg.ffn_hidden),
+        "mlp.down_proj"    => (cfg.ffn_hidden, cfg.d_model),
+        _ => return Ok(false),
+    };
+    if packed.len() * 8 != in_dim * out_dim {
+        return Err(AtlasError::Parse(format!(
+            "W4 tensor '{prefix}': packed len {} × 8 ≠ {in_dim}×{out_dim}", packed.len())));
+    }
+    if scales.is_empty() || (in_dim * out_dim) % scales.len() != 0 {
+        return Err(AtlasError::Parse(format!(
+            "W4 tensor '{prefix}': scale count {} does not divide {in_dim}×{out_dim}", scales.len())));
+    }
+    let group = (in_dim * out_dim) / scales.len();
+    let lin = Linear::from_w4(packed, scales, in_dim, out_dim, group);
+    let layer = &mut model.layers[layer_i];
+    match local {
+        "self_attn.q_proj" => layer.attn.wq = lin,
+        "self_attn.k_proj" => layer.attn.wk = lin,
+        "self_attn.v_proj" => layer.attn.wv = lin,
+        "self_attn.o_proj" => layer.attn.wo = lin,
+        "mlp.gate_proj"    => layer.ffn.w_gate = lin,
+        "mlp.up_proj"      => layer.ffn.w_up = lin,
+        "mlp.down_proj"    => layer.ffn.w_down = lin,
+        _ => unreachable!(),
+    }
+    Ok(true)
+}
+
+/// Load a sharded W4 checkpoint (compressed-tensors "pack-quantized" format:
+/// weight-only int4, symmetric, per-group scales — the llm-compressor AWQ
+/// recipe output; e.g. OLMo-3-32B-Think-AWQ-4bit).
+///
+/// Streaming, shard-by-shard: each quantized Linear is uploaded to VRAM as
+/// soon as both its `weight_packed` and `weight_scale` tensors have been
+/// seen, and host copies are dropped immediately. Peak host RAM stays around
+/// one shard + the unquantized (embedding / lm_head / norm) tensors instead
+/// of `4 bytes × params` (~128 GB for 32B).
+fn load_model_from_dir_w4(
+    dir: &str, cfg: ModelConfig, shard_files: &[String], index_json: &str,
+) -> Result<OlmoModel> {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    eprintln!("[load_model_from_dir_w4] W4 checkpoint: {} shards from {dir}", shard_files.len());
+    let mut model = OlmoModel::new_uninit(cfg.clone());
+
+    // Architecture pre-detection from the index (iteration-order-independent;
+    // must be known before any norm tensor is routed).
+    let is_post_norm = index_json.contains("post_feedforward_layernorm");
+    if is_post_norm {
+        for layer in &mut model.layers { layer.post_norm = true; }
+    }
+    let has_separate_lm_head = index_json.contains("lm_head.weight");
+
+    // Halves of quantized Linears whose packed/scale tensors span shards.
+    let mut pending_packed: HashMap<String, Vec<u32>> = HashMap::new();
+    let mut pending_scales: HashMap<String, Vec<u16>> = HashMap::new();
+    let mut n_w4 = 0usize;
+
+    for shard_name in shard_files {
+        let shard_path = Path::new(dir).join(shard_name);
+        eprintln!("[load_model_from_dir_w4]   shard: {shard_name}");
+        let st = SafetensorsFile::open(shard_path.to_str().unwrap_or(shard_name))?;
+        for desc in &st.tensors {
+            let name = desc.name.clone();
+            if let Some(pfx) = name.strip_suffix(".weight_packed") {
+                let packed = st.get_u32(&name)?;
+                if let Some(scales) = pending_scales.remove(pfx) {
+                    if place_w4_linear(&mut model, &cfg, pfx, packed, scales)? { n_w4 += 1; }
+                } else {
+                    pending_packed.insert(pfx.to_string(), packed);
+                }
+            } else if let Some(pfx) = name.strip_suffix(".weight_scale") {
+                let scales = st.get_bf16(&name)?;
+                if let Some(packed) = pending_packed.remove(pfx) {
+                    if place_w4_linear(&mut model, &cfg, pfx, packed, scales)? { n_w4 += 1; }
+                } else {
+                    pending_scales.insert(pfx.to_string(), scales);
+                }
+            } else if name.ends_with(".weight_shape") {
+                // Redundant with the dims derived from ModelConfig — ignored.
+            } else if name == "model.embed_tokens.weight" || name == "tok_embeddings.weight" {
+                let data = st.get_f32(&name)?;
+                let vocab = data.len() / cfg.d_model;
+                model.embed = Embedding::from_data(data.clone(), vocab, cfg.d_model);
+                if !has_separate_lm_head {
+                    model.lm_head = make_linear_bf16_aware(
+                        data, desc.dtype == "BF16", cfg.d_model, vocab);
+                }
+            } else if name == "model.norm.weight" || name == "norm.weight" {
+                model.norm = st.get_f32(&name)?;
+            } else if name == "lm_head.weight" {
+                model.lm_head = make_linear_bf16_aware(
+                    st.get_f32(&name)?, desc.dtype == "BF16", cfg.d_model, cfg.vocab_size);
+            } else {
+                // Per-layer norm vectors (small, always dense).
+                for layer_i in 0..cfg.n_layers {
+                    let pfx  = format!("model.layers.{layer_i}.");
+                    let pfx2 = format!("layers.{layer_i}.");
+                    let local = if name.starts_with(&pfx) { &name[pfx.len()..] }
+                                else if name.starts_with(&pfx2) { &name[pfx2.len()..] }
+                                else { continue };
+                    let data = st.get_f32(&name)?;
+                    let layer = &mut model.layers[layer_i];
+                    match local {
+                        "input_layernorm.weight"          => layer.attn_norm = data,
+                        "post_attention_layernorm.weight" => {
+                            if layer.post_norm { layer.attn_norm = data; }
+                            else               { layer.ffn_norm  = data; }
+                        }
+                        "post_feedforward_layernorm.weight" => layer.ffn_norm = data,
+                        "self_attn.q_norm.weight"           => layer.attn.q_norm = data,
+                        "self_attn.k_norm.weight"           => layer.attn.k_norm = data,
+                        _ => {}
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let expected_w4 = cfg.n_layers * 7;
+    if n_w4 != expected_w4 || !pending_packed.is_empty() || !pending_scales.is_empty() {
+        return Err(AtlasError::Parse(format!(
+            "W4 load incomplete: placed {n_w4}/{expected_w4} quantized Linears \
+             ({} packed / {} scales unmatched)",
+            pending_packed.len(), pending_scales.len())));
+    }
+    let n_gpu = model.layers.iter()
+        .flat_map(|l| [&l.attn.wq, &l.attn.wk, &l.attn.wv, &l.attn.wo,
+                       &l.ffn.w_gate, &l.ffn.w_up, &l.ffn.w_down])
+        .filter(|lin| lin.gpu_mat.is_w4())
+        .count();
+    eprintln!("[load_model_from_dir_w4] {n_w4} W4 Linears loaded ({n_gpu} GPU-resident)");
+
     // Pre-upload norm weights + GPU KV cache + GPU RoPE tables (one-time cost).
     for layer in &mut model.layers {
         layer.cache_norm_weights();
@@ -3023,6 +3779,87 @@ fn pseudo_randn(n: usize, seed: u64) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pack an i8 matrix (values in [-8,7]) into the compressed-tensors
+    /// pack-quantized u32 layout (test helper mirroring `pack_to_int32`).
+    fn w4_pack(q: &[i8], rows: usize, cols: usize) -> Vec<u32> {
+        assert_eq!(q.len(), rows * cols);
+        assert_eq!(cols % 8, 0);
+        let mut out = vec![0u32; rows * cols / 8];
+        for r in 0..rows {
+            for c in 0..cols {
+                let nibble = (q[r * cols + c] + 8) as u32 & 0xF;
+                out[r * (cols / 8) + c / 8] |= nibble << (4 * (c % 8));
+            }
+        }
+        out
+    }
+
+    fn f32_to_bf16(v: f32) -> u16 { (v.to_bits() >> 16) as u16 }
+
+    /// Ground truth captured from `compressed_tensors.compressors.pack_to_int32`
+    /// (v0.17.1): pack([[-8..-1],[0..7]]) == [0x76543210, 0xfedcba98].
+    /// Guards the layout assumption shared by the CUDA kernel and CPU path.
+    #[test]
+    fn w4_pack_layout_matches_compressed_tensors() {
+        let row0: Vec<i8> = (-8..0).collect();
+        let row1: Vec<i8> = (0..8).collect();
+        let q: Vec<i8> = row0.iter().chain(row1.iter()).cloned().collect();
+        let packed = w4_pack(&q, 2, 8);
+        assert_eq!(packed, vec![0x7654_3210, 0xfedc_ba98]);
+    }
+
+    /// W4 Linear forward (CPU dequant path) must match the dense f32
+    /// reference computed from explicitly dequantized weights.
+    #[test]
+    fn w4_linear_forward_matches_dense_reference() {
+        let (in_dim, out_dim, group) = (64usize, 16usize, 32usize);
+        // Deterministic pseudo-random int4 weights and per-group scales.
+        let q: Vec<i8> = (0..in_dim * out_dim)
+            .map(|i| ((i * 2654435761usize) >> 7) as i8 % 8)
+            .map(|v| v.clamp(-8, 7))
+            .collect();
+        let scales: Vec<f32> = (0..out_dim * in_dim / group)
+            .map(|i| {
+                // Round through BF16 so CPU reference == BF16-stored scale.
+                let s = 0.005 + 0.001 * (i % 13) as f32;
+                f32::from_bits((f32_to_bf16(s) as u32) << 16)
+            })
+            .collect();
+        let x: Vec<f32> = (0..in_dim).map(|i| ((i as f32) * 0.37).sin()).collect();
+
+        // Dense reference.
+        let mut want = vec![0.0f32; out_dim];
+        for o in 0..out_dim {
+            let mut acc = 0.0f32;
+            for c in 0..in_dim {
+                let s = scales[o * (in_dim / group) + c / group];
+                acc += q[o * in_dim + c] as f32 * s * x[c];
+            }
+            want[o] = acc;
+        }
+
+        let packed = w4_pack(&q, out_dim, in_dim);
+        let scales_bf16: Vec<u16> = scales.iter().map(|&s| f32_to_bf16(s)).collect();
+        let lin = Linear::from_w4(packed, scales_bf16, in_dim, out_dim, group);
+        let mut got = vec![0.0f32; out_dim];
+        lin.forward(&x, &mut got);
+
+        for o in 0..out_dim {
+            assert!((got[o] - want[o]).abs() < 1e-4,
+                "row {o}: got {} want {}", got[o], want[o]);
+        }
+    }
+
+    /// `new_uninit` must not allocate weight storage (placeholder Linears).
+    #[test]
+    fn new_uninit_has_no_weight_storage() {
+        let m = OlmoModel::new_uninit(ModelConfig::tiny());
+        assert!(m.layers[0].attn.wq.weight.is_empty());
+        assert!(m.layers[0].ffn.w_gate.weight.is_empty());
+        assert!(m.lm_head.weight.is_empty());
+        assert!(m.embed.weight.is_empty());
+    }
 
     #[test]
     fn rmsnorm_unit_weight() {
@@ -4161,6 +4998,7 @@ mod tests {
     fn generate_streaming_events_reports_prefill_then_tokens() {
         let cfg = ModelConfig::tiny();
         let mut model = OlmoModel::new(cfg);
+        model.set_prefill_chunk_tokens(1); // legacy per-token event cadence
         let prompt = [0u32, 1, 2, 3];
 
         let mut prefills: Vec<(usize, usize)> = Vec::new();
@@ -4194,10 +5032,274 @@ mod tests {
     fn generate_streaming_events_abort_during_prefill() {
         let cfg = ModelConfig::tiny();
         let mut model = OlmoModel::new(cfg);
+        model.set_prefill_chunk_tokens(1); // legacy per-token event cadence
         let out = model.generate_streaming_events(
             &[0u32, 1, 2, 3], 4, &SamplingConfig::default(),
             |ev| !matches!(ev, GenEvent::Prefill { done: 2, .. }));
         assert!(out.is_empty(), "aborting in prefill must generate nothing");
+    }
+
+    /// #22 batched prefill: with chunk size N, `Prefill` progress events are
+    /// emitted once per chunk with `done` = cumulative tokens processed.
+    #[test]
+    fn generate_streaming_events_chunked_prefill_events() {
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+        model.set_prefill_chunk_tokens(3);
+        let prompt = [0u32, 1, 2, 3, 4, 5, 6]; // 7 tokens → chunks of 3/3/1
+        let mut prefills: Vec<(usize, usize)> = Vec::new();
+        let out = model.generate_streaming_events(
+            &prompt, 2, &SamplingConfig { temperature: 0.0, ..Default::default() },
+            |ev| {
+                if let GenEvent::Prefill { done, total } = ev {
+                    prefills.push((done, total));
+                }
+                true
+            });
+        assert_eq!(prefills, vec![(3, 7), (6, 7), (7, 7)]);
+        assert!(!out.is_empty());
+    }
+
+    /// #22 batched prefill: chunked prefill must produce EXACTLY the same
+    /// generation as per-token prefill (identical KV-cache state and logits).
+    /// Today the chunk body IS the per-token loop, so this is trivially true;
+    /// this test is the parity gate for the upcoming chunked-GEMM body.
+    #[test]
+    fn chunked_prefill_matches_per_token_prefill() {
+        let prompt = [0u32, 1, 2, 3, 4];
+        let cfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+
+        let mut per_token = OlmoModel::new(ModelConfig::tiny());
+        per_token.set_prefill_chunk_tokens(1);
+        let out_per_token = per_token.generate_with_sampling(&prompt, 3, &cfg);
+
+        let mut chunked = OlmoModel::new(ModelConfig::tiny());
+        chunked.set_prefill_chunk_tokens(4); // 5 tokens → chunks of 4/1
+        let out_chunked = chunked.generate_with_sampling(&prompt, 3, &cfg);
+
+        assert_eq!(out_per_token, out_chunked,
+            "chunked prefill diverged from per-token prefill");
+    }
+
+    /// #22 batched prefill: `Linear::forward_batch` (single GEMM for n>1)
+    /// must match the per-token `forward` path. Tolerance covers the GEMM
+    /// (TF32) vs GEMV low-bit drift; on CPU-only builds both paths are
+    /// identical dot products.
+    #[test]
+    fn linear_forward_batch_matches_per_token() {
+        let (in_dim, out_dim, m) = (64usize, 48usize, 5usize);
+        let lin = Linear::new(in_dim, out_dim, 7);
+        let x = pseudo_randn(m * in_dim, 42);
+        let mut y_batch = vec![0.0f32; m * out_dim];
+        lin.forward_batch(&x, m, &mut y_batch);
+        let mut y_ref = vec![0.0f32; m * out_dim];
+        for s in 0..m {
+            lin.forward(&x[s*in_dim..(s+1)*in_dim],
+                        &mut y_ref[s*out_dim..(s+1)*out_dim]);
+        }
+        let max_err = y_batch.iter().zip(y_ref.iter())
+            .map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_err < 1e-3,
+            "forward_batch diverged from per-token forward: max_err={max_err:.2e}");
+    }
+
+    /// #22 batched prefill parity on an OLMo-3-style tiny model:
+    /// post-norm + QK-norm + one sliding-window layer, with a chunk LARGER
+    /// than the SWA window (masking must still be exact) — covers the
+    /// branches `ModelConfig::tiny()` (pre-norm, no QK-norm, no SWA) misses.
+    #[test]
+    fn chunked_prefill_parity_postnorm_qknorm_swa() {
+        fn olmo_style_tiny() -> OlmoModel {
+            let mut model = OlmoModel::new(ModelConfig::tiny());
+            let d = 64; // n_heads * head_dim
+            let kv = 32; // n_kv_heads * head_dim
+            for (i, layer) in model.layers.iter_mut().enumerate() {
+                layer.post_norm = true;
+                layer.attn.q_norm = pseudo_randn(d, 900 + i as u64)
+                    .into_iter().map(|v| 1.0 + 0.05 * v).collect();
+                layer.attn.k_norm = pseudo_randn(kv, 950 + i as u64)
+                    .into_iter().map(|v| 1.0 + 0.05 * v).collect();
+            }
+            // Layer 1 sliding-window (uses rope_local + SWA masking).
+            model.layers[1].attn.window_size = Some(3);
+            model
+        }
+        let prompt = [0u32, 1, 2, 3, 4, 5, 6, 7]; // 8 tokens > window 3
+        let cfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+
+        let mut per_token = olmo_style_tiny();
+        per_token.set_prefill_chunk_tokens(1);
+        let out_per_token = per_token.generate_with_sampling(&prompt, 3, &cfg);
+
+        let mut chunked = olmo_style_tiny();
+        chunked.set_prefill_chunk_tokens(5); // chunk 5 > window 3; chunks 5/3
+        let out_chunked = chunked.generate_with_sampling(&prompt, 3, &cfg);
+
+        assert_eq!(out_per_token, out_chunked,
+            "chunked prefill diverged on post-norm/QK-norm/SWA model");
+    }
+
+    /// #22 batched prefill parity with FULL GPU resources initialized:
+    /// per-token prefill takes `forward_token_gpu_full` (GPU RoPE/QK-norm/
+    /// decode-attention), chunked prefill takes batched GEMMs + the GPU
+    /// decode-attention fast path in `Attention::forward_chunk`. Gates the
+    /// KV lock-step backfill + chunk decode-attention wiring. Self-skips
+    /// without CUDA (both paths collapse to the CPU fallbacks covered by
+    /// the other parity tests).
+    #[test]
+    fn chunked_prefill_parity_gpu_resources() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let prompt = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let cfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+
+        let mut per_token = OlmoModel::new(ModelConfig::tiny());
+        per_token.init_gpu_resources();
+        per_token.set_prefill_chunk_tokens(1);
+        let out_per_token = per_token.generate_with_sampling(&prompt, 3, &cfg);
+
+        let mut chunked = OlmoModel::new(ModelConfig::tiny());
+        chunked.init_gpu_resources();
+        chunked.set_prefill_chunk_tokens(6); // 8 tokens → chunks of 6/2
+        let out_chunked = chunked.generate_with_sampling(&prompt, 3, &cfg);
+
+        assert_eq!(out_per_token, out_chunked,
+            "chunked prefill diverged from per-token with GPU resources");
+    }
+
+    /// #22 Step 2: quantize an f32 Linear into W4 (compressed-tensors
+    /// pack-quantized layout) — test-only helper for the W4 parity gates.
+    /// Symmetric per-group scale = max|w| / 7, rounded to BF16 (same
+    /// reconstruction the kernels use, so the quantization is exact-by-
+    /// construction on both paths).
+    fn w4_quantize_linear(lin: &Linear, group: usize) -> Linear {
+        let (in_dim, out_dim) = (lin.in_dim, lin.out_dim);
+        assert_eq!(in_dim % group, 0);
+        let mut packed = vec![0u32; out_dim * in_dim / 8];
+        let mut scales = vec![0u16; out_dim * in_dim / group];
+        for r in 0..out_dim {
+            for g0 in (0..in_dim).step_by(group) {
+                let w = &lin.weight[r * in_dim + g0 .. r * in_dim + g0 + group];
+                let maxabs = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let s = if maxabs > 0.0 { maxabs / 7.0 } else { 1.0 };
+                let s_bits = (s.to_bits() >> 16) as u16; // f32 → BF16 (truncate)
+                let s_eff = f32::from_bits((s_bits as u32) << 16);
+                scales[r * (in_dim / group) + g0 / group] = s_bits;
+                for (j, &v) in w.iter().enumerate() {
+                    let q = (v / s_eff).round().clamp(-8.0, 7.0) as i32;
+                    let col = g0 + j;
+                    packed[r * (in_dim / 8) + col / 8] |=
+                        (((q + 8) as u32) & 0xF) << (4 * (col % 8));
+                }
+            }
+        }
+        Linear::from_w4(packed, scales, in_dim, out_dim, group)
+    }
+
+    /// Quantize every attention/FFN Linear of a model to W4 (group = 32).
+    /// Embedding / LM head stay f32, matching real W4 deployments.
+    fn w4_quantize_model(model: &mut OlmoModel) {
+        for layer in model.layers.iter_mut() {
+            let a = &mut layer.attn;
+            a.wq = w4_quantize_linear(&a.wq, 32);
+            a.wk = w4_quantize_linear(&a.wk, 32);
+            a.wv = w4_quantize_linear(&a.wv, 32);
+            a.wo = w4_quantize_linear(&a.wo, 32);
+            let f = &mut layer.ffn;
+            f.w_gate = w4_quantize_linear(&f.w_gate, 32);
+            f.w_up   = w4_quantize_linear(&f.w_up, 32);
+            f.w_down = w4_quantize_linear(&f.w_down, 32);
+        }
+    }
+
+    /// #22 Step 2 parity gate: W4-quantized weights must produce EXACTLY the
+    /// same greedy generation from chunked prefill (dequant-to-scratch +
+    /// GEMM in atlas-tensor) as from per-token prefill (W4 GEMV kernel).
+    /// Runs both without and with full GPU resources (KV cache / RoPE
+    /// tables); on CPU-only builds both paths collapse to the same per-token
+    /// CPU W4 fallback, so the test is trivially green there.
+    #[test]
+    fn chunked_prefill_parity_w4() {
+        fn w4_tiny() -> OlmoModel {
+            let mut model = OlmoModel::new(ModelConfig::tiny());
+            w4_quantize_model(&mut model);
+            model
+        }
+        let prompt = [0u32, 1, 2, 3, 4, 5, 6, 7];
+        let cfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+        for gpu_resources in [false, true] {
+            let mut per_token = w4_tiny();
+            if gpu_resources { per_token.init_gpu_resources(); }
+            per_token.set_prefill_chunk_tokens(1);
+            let out_per_token = per_token.generate_with_sampling(&prompt, 3, &cfg);
+
+            let mut chunked = w4_tiny();
+            if gpu_resources { chunked.init_gpu_resources(); }
+            chunked.set_prefill_chunk_tokens(6); // 8 tokens → chunks of 6/2
+            let out_chunked = chunked.generate_with_sampling(&prompt, 3, &cfg);
+
+            assert_eq!(out_per_token, out_chunked,
+                "W4 chunked prefill diverged (gpu_resources={gpu_resources})");
+        }
+    }
+
+    /// #22: rough prefill timing, chunked vs per-token, on a mid-size
+    /// synthetic model (~130M params ≈ 0.5 GB VRAM — safe beside a resident
+    /// server). Not a real benchmark (random weights, short prompt), just
+    /// the weight-restreaming signal. Run explicitly:
+    ///   cargo test -p atlas-model bench_chunked_prefill -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_chunked_prefill_speedup() {
+        // Size overrides so the weight-streaming regime can be probed
+        // without recompiling (small models are launch/alloc-overhead-bound
+        // and show no chunking win by construction):
+        //   ATLAS_BENCH_D / ATLAS_BENCH_LAYERS / ATLAS_BENCH_FFN /
+        //   ATLAS_BENCH_PROMPT / ATLAS_BENCH_CHUNK
+        let env = |k: &str, dflt: usize| std::env::var(k).ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(dflt);
+        let d      = env("ATLAS_BENCH_D", 1024);
+        let layers = env("ATLAS_BENCH_LAYERS", 8);
+        let ffn    = env("ATLAS_BENCH_FFN", 4 * d);
+        let p_len  = env("ATLAS_BENCH_PROMPT", 512);
+        let chunk  = env("ATLAS_BENCH_CHUNK", 256);
+        let cfg = ModelConfig {
+            vocab_size: 4096, d_model: d, n_layers: layers, n_heads: d / 64,
+            n_kv_heads: (d / 64 / 4).max(1), ffn_hidden: ffn,
+            max_seq_len: (p_len + 8).max(1024),
+            rope_theta: 10_000.0, rms_norm_eps: 1e-5,
+            layer_types: Vec::new(), sliding_window: None,
+            rope_scaling: RopeScaling::None, eos_token_id: None,
+        };
+        let approx_gb = (layers * (4*d*d + 3*d*ffn) + 2*4096*d) as f64 * 4.0 / 1e9;
+        eprintln!("  bench model: d={d} layers={layers} ffn={ffn} ≈ {approx_gb:.1} GB f32, prompt={p_len}, chunk={chunk}");
+        let mut model = OlmoModel::new(cfg);
+        // ATLAS_BENCH_W4=1: quantize attention/FFN linears to W4 (group=32)
+        // to probe the #22 Step 2 dequant-to-scratch batch path.
+        if std::env::var("ATLAS_BENCH_W4").map_or(false, |v| v == "1") {
+            eprintln!("  quantizing linears to W4 (group=32)…");
+            w4_quantize_model(&mut model);
+        }
+        model.init_gpu_resources(); // real deployments have GPU KV + RoPE tables
+        let prompt: Vec<u32> = (0..p_len as u32).map(|i| i % 4096).collect();
+        let scfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+        let mut time_prefill = |model: &mut OlmoModel, chunk: usize| {
+            model.reset();
+            model.set_prefill_chunk_tokens(chunk);
+            let t0 = std::time::Instant::now();
+            let out = model.generate_with_sampling(&prompt, 1, &scfg);
+            (t0.elapsed(), out)
+        };
+        let (warm, _) = time_prefill(&mut model, 1); // warm-up (GPU init)
+        let (t_per_token, out1) = time_prefill(&mut model, 1);
+        let (t_chunked, out256) = time_prefill(&mut model, chunk);
+        eprintln!(
+            "  prefill {p_len} tokens: per-token={:?} chunked({chunk})={:?} \
+             speedup={:.1}x (warmup={:?})",
+            t_per_token, t_chunked,
+            t_per_token.as_secs_f64() / t_chunked.as_secs_f64().max(1e-9),
+            warm,
+        );
+        assert_eq!(out1, out256, "greedy divergence between prefill paths");
     }
 
     // ── GPU Inference Tests ──────────────────────────────────────────────────

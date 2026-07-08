@@ -142,13 +142,26 @@ impl Tokenizer {
         let mut merge_rank = HashMap::with_capacity(merges_arr.len());
 
         for (rank, entry) in merges_arr.iter().enumerate() {
-            let s = entry.as_str()
-                .ok_or_else(|| AtlasError::Parse("merge entry must be string".into()))?;
-            // Format: "tokenA tokenB" (space-separated)
-            let mid = s.find(' ')
-                .ok_or_else(|| AtlasError::Parse(format!("invalid merge: '{s}'")))?;
-            let left  = s[..mid].to_string();
-            let right = s[mid+1..].to_string();
+            // Two on-disk formats exist:
+            //   - legacy (tokenizers < 0.20 serialization): "tokenA tokenB"
+            //   - current (e.g. OLMo-3-32B checkpoints): ["tokenA", "tokenB"]
+            let (left, right) = if let Some(s) = entry.as_str() {
+                let mid = s.find(' ')
+                    .ok_or_else(|| AtlasError::Parse(format!("invalid merge: '{s}'")))?;
+                (s[..mid].to_string(), s[mid+1..].to_string())
+            } else if let Some(pair) = entry.as_array() {
+                if pair.len() != 2 {
+                    return Err(AtlasError::Parse(format!(
+                        "merge entry array must have 2 elements, got {}", pair.len())));
+                }
+                let l = pair[0].as_str()
+                    .ok_or_else(|| AtlasError::Parse("merge pair element must be string".into()))?;
+                let r = pair[1].as_str()
+                    .ok_or_else(|| AtlasError::Parse("merge pair element must be string".into()))?;
+                (l.to_string(), r.to_string())
+            } else {
+                return Err(AtlasError::Parse("merge entry must be string or [left, right] pair".into()));
+            };
             merge_rank.insert((left.clone(), right.clone()), rank);
             merges.push((left, right));
         }
@@ -701,6 +714,19 @@ fn try_whitespace(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both merges serializations must parse identically:
+    /// legacy `"A B"` strings and current `["A", "B"]` pairs
+    /// (OLMo-3-32B checkpoints ship the pair format).
+    #[test]
+    fn merges_string_and_pair_formats_parse_identically() {
+        let mk = |merges_json: &str| format!(
+            r#"{{"model":{{"vocab":{{"a":0,"b":1,"ab":2}},"merges":{merges_json}}}}}"#);
+        let t_str  = Tokenizer::from_json_str(&mk(r#"["a b"]"#)).expect("string merges");
+        let t_pair = Tokenizer::from_json_str(&mk(r#"[["a","b"]]"#)).expect("pair merges");
+        assert_eq!(t_str.merges, t_pair.merges);
+        assert_eq!(t_str.merges, vec![("a".to_string(), "b".to_string())]);
+    }
 
     /// Build a minimal tokenizer with explicit vocab and merges for testing.
     fn tiny_tokenizer() -> Tokenizer {
