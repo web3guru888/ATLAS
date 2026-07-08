@@ -282,6 +282,123 @@ pub fn handle(
     }
 }
 
+// ── Cancellation: disconnect probe + request deadline (#25) ──────────────────
+
+/// How often generation loops probe the client socket for disconnect.
+/// The probe is one non-blocking `peek` syscall — cheap, but there is no
+/// reason to run it on every token at 50+ tok/s.
+const DISCONNECT_PROBE_EVERY: Duration = Duration::from_millis(500);
+
+/// Best-effort check whether the client peer has closed the connection.
+///
+/// Non-blocking 1-byte `peek` (never consumes request bytes):
+/// - `Ok(0)`       → orderly shutdown (FIN received) → disconnected
+/// - `Ok(_)`       → unread bytes buffered → still connected
+/// - `WouldBlock`  → no data, connection open → still connected
+/// - other errors  → reset (RST) / broken socket → disconnected
+///
+/// Limitation: unread pipelined bytes mask a later FIN until they are read;
+/// in this server the request is fully consumed before inference starts, so
+/// the receive buffer is empty during generation and FIN is seen promptly.
+/// Behind the Cloudflare tunnel the peer is the local `cloudflared`, which
+/// closes the proxied origin connection when the eyeball side goes away
+/// (e.g. the CF 524 at 100 s), so this probe covers the tunnel case too.
+pub fn client_disconnected(stream: &TcpStream) -> bool {
+    let mut buf = [0u8; 1];
+    if stream.set_nonblocking(true).is_err() {
+        return false; // can't probe — assume alive
+    }
+    let r = stream.peek(&mut buf);
+    let _ = stream.set_nonblocking(false);
+    match r {
+        Ok(0) => true,
+        Ok(_) => false,
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(_) => true,
+    }
+}
+
+/// Why an in-flight generation was cancelled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CancelReason {
+    /// The client hung up (FIN/RST observed on the socket).
+    Disconnected,
+    /// The optional server-side wall-clock deadline expired.
+    DeadlineExceeded,
+}
+
+/// Parse the optional per-request wall-clock deadline from
+/// `ATLAS_REQUEST_DEADLINE_SECS`. Unset, `0`, or unparsable = no deadline.
+pub(crate) fn request_deadline() -> Option<Duration> {
+    parse_request_deadline(std::env::var("ATLAS_REQUEST_DEADLINE_SECS").ok().as_deref())
+}
+
+pub(crate) fn parse_request_deadline(v: Option<&str>) -> Option<Duration> {
+    let secs: u64 = v?.trim().parse().ok()?;
+    if secs == 0 { None } else { Some(Duration::from_secs(secs)) }
+}
+
+/// Tracks disconnect + deadline state for one in-flight generation.
+///
+/// Owns a `try_clone`d handle to the client socket so callers keep their
+/// `&mut TcpStream` for writes. `set_nonblocking` toggles the shared file
+/// description, but the probe is synchronous inside [`should_abort`] and
+/// restores blocking mode before returning, so interleaved writes are safe
+/// (generation callbacks are single-threaded).
+///
+/// [`should_abort`]: CancelWatch::should_abort
+pub(crate) struct CancelWatch {
+    probe: Option<TcpStream>,
+    deadline: Option<Duration>,
+    started: Instant,
+    last_probe: Instant,
+    pub cancelled: Option<CancelReason>,
+}
+
+impl CancelWatch {
+    /// Watch `client` with the deadline from `ATLAS_REQUEST_DEADLINE_SECS`.
+    pub fn new(client: &TcpStream) -> Self {
+        Self::with_deadline(client, request_deadline())
+    }
+
+    pub fn with_deadline(client: &TcpStream, deadline: Option<Duration>) -> Self {
+        let now = Instant::now();
+        Self {
+            probe: client.try_clone().ok(),
+            deadline,
+            started: now,
+            // Backdate so the FIRST should_abort() call probes the socket —
+            // catches clients that died while the job sat in the queue.
+            last_probe: now.checked_sub(DISCONNECT_PROBE_EVERY).unwrap_or(now),
+            cancelled: None,
+        }
+    }
+
+    /// Returns `true` when generation should abort. Deadline check is pure
+    /// arithmetic; the socket probe runs at most every [`DISCONNECT_PROBE_EVERY`].
+    pub fn should_abort(&mut self) -> bool {
+        if self.cancelled.is_some() {
+            return true;
+        }
+        if let Some(d) = self.deadline {
+            if self.started.elapsed() >= d {
+                self.cancelled = Some(CancelReason::DeadlineExceeded);
+                return true;
+            }
+        }
+        if self.last_probe.elapsed() >= DISCONNECT_PROBE_EVERY {
+            self.last_probe = Instant::now();
+            if let Some(ref probe) = self.probe {
+                if client_disconnected(probe) {
+                    self.cancelled = Some(CancelReason::Disconnected);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 // ── Inference ─────────────────────────────────────────────────────────────────
 
 /// Dispatch a pre-routed (and, when auth is enabled, pre-authenticated)
@@ -356,13 +473,21 @@ pub fn handle_inference(
 }
 
 /// Run model inference for `prompt` with full sampling controls.
-/// Returns `(generated_text, prompt_token_count, completion_token_count)`.
+///
+/// `client` is probed between generation steps so the single inference
+/// worker aborts promptly when the client disconnects (#25 — e.g. Cloudflare
+/// 524 on a long non-streaming request) or the optional
+/// `ATLAS_REQUEST_DEADLINE_SECS` wall-clock deadline expires, instead of
+/// generating to completion for a dead socket while real traffic queues.
+///
+/// Returns `(generated_text, prompt_token_count, completion_token_count, cancelled)`.
 fn run_inference(
     state: &Arc<Mutex<InferState>>,
     prompt: &str,
     max_tokens: usize,
     config: &SamplingConfig,
-) -> (String, usize, usize) {
+    client: &TcpStream,
+) -> (String, usize, usize, Option<CancelReason>) {
     let mut st = state.lock().unwrap();
 
     // Encode prompt
@@ -380,14 +505,27 @@ fn run_inference(
     let max_tokens = if prompt_count >= ctx_cap { 0 }
                      else { max_tokens.min(ctx_cap - prompt_count) };
 
-    // Generate — InferEngine::generate handles reset() internally and
-    // returns (tokens, pheromone_deposits); deposits are discarded here
-    // unless a StigmergicHook is configured on the engine.
-    let new_tokens: Vec<u32> = if let Some(ref mut engine) = st.model {
-        engine.generate(&prompt_tokens, max_tokens, config).0
-    } else {
-        vec![] // echo / test mode
-    };
+    // Generate via the streaming-events path so we can abort between steps
+    // (prefill progress events AND per-token events reach the callback).
+    // Deposits are discarded here unless a StigmergicHook is configured.
+    // Note: with a hook attached the engine generates in bulk, so abort
+    // granularity degrades to post-hoc — the API server attaches no hook.
+    let mut watch = CancelWatch::new(client);
+    let mut new_tokens: Vec<u32> = Vec::new();
+    if let Some(ref mut engine) = st.model {
+        engine.generate_streaming_events(&prompt_tokens, max_tokens, config, |ev, _deposit| {
+            if let GenEvent::Token(t) = ev {
+                new_tokens.push(t);
+            }
+            !watch.should_abort()
+        });
+    }
+    if let Some(reason) = watch.cancelled {
+        eprintln!(
+            "atlas-api: aborted non-streaming generation ({reason:?}) after {} token(s) — slot freed",
+            new_tokens.len()
+        );
+    }
     let completion_count = new_tokens.len();
 
     // Decode
@@ -398,7 +536,7 @@ fn run_inference(
         String::from_utf8_lossy(&bytes).to_string()
     };
 
-    (output, prompt_count, completion_count)
+    (output, prompt_count, completion_count, watch.cancelled)
 }
 
 fn handle_chat_nonstream(
@@ -420,8 +558,11 @@ fn handle_chat_nonstream(
         presence_penalty: req.presence_penalty,
         suppress_initial_tokens: olmo3.suppress_initial_tokens,
     };
-    let (content, prompt_tokens, completion_tokens) =
-        run_inference(state, prompt, req.max_tokens, &config);
+    let (content, prompt_tokens, completion_tokens, cancelled) =
+        run_inference(state, prompt, req.max_tokens, &config, stream);
+    if cancelled == Some(CancelReason::Disconnected) {
+        return; // client is gone — nothing to write, slot already freed
+    }
 
     // The prompt primes `<think>`, so the completion BEGINS inside a think
     // block. Split it: scratchpad → `message.reasoning` (OpenRouter
@@ -433,7 +574,8 @@ fn handle_chat_nonstream(
     };
 
     let model_id = state.lock().unwrap().model_id.clone();
-    let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
+    // Deadline-cancelled requests return the partial completion as "length".
+    let finish   = if cancelled.is_some() || completion_tokens >= req.max_tokens { "length" } else { "stop" };
     let resp = ChatCompletionResponse {
         id: id.to_string(), created: unix_ts(),
         model: model_id, content, reasoning,
@@ -685,6 +827,13 @@ fn handle_chat_stream(
     const KEEPALIVE_EVERY: Duration = Duration::from_secs(10);
     let mut last_write = Instant::now();
 
+    // Disconnect probe + optional deadline (#25). Token writes already catch
+    // disconnects via write errors, but small SSE chunks can keep landing in
+    // the kernel send buffer for a while after the peer is gone — the peek
+    // probe sees the FIN immediately. During prefill (keep-alives only every
+    // 10 s) the probe is the primary detector.
+    let mut watch = CancelWatch::new(stream);
+
     // Think block suppression: track <think> blocks and hide them from the
     // client. Small models often generate <think> despite system prompts;
     // we silently consume think tokens and only stream visible content.
@@ -702,6 +851,13 @@ fn handle_chat_stream(
         max_tokens,
         &config,
         |ev, _deposit| {
+            // Abort promptly on client disconnect / server deadline (#25).
+            if watch.should_abort() {
+                if watch.cancelled == Some(CancelReason::Disconnected) {
+                    write_ok = false; // skip the final chunk — nobody is listening
+                }
+                return false;
+            }
             let tok_id = match ev {
                 GenEvent::Prefill { .. } => {
                     if last_write.elapsed() >= KEEPALIVE_EVERY {
@@ -787,10 +943,17 @@ fn handle_chat_stream(
         },
     );
 
+    if let Some(reason) = watch.cancelled {
+        eprintln!(
+            "atlas-api: aborted streaming generation ({reason:?}) after {token_count} token(s) — slot freed"
+        );
+    }
+
     // Write final finish-reason chunk (with usage — required by OpenRouter
-    // for streaming responses) + [DONE] sentinel
+    // for streaming responses) + [DONE] sentinel. A deadline-cancelled stream
+    // still terminates cleanly for the (connected) client as "length".
     if write_ok {
-        let finish: &'static str = if token_count >= max_tokens { "length" } else { "stop" };
+        let finish: &'static str = if watch.cancelled.is_some() || token_count >= max_tokens { "length" } else { "stop" };
         let final_chunk = StreamChunk {
             id: id_owned.clone(),
             model: model_id.clone(),
@@ -834,10 +997,13 @@ fn handle_completion(
         presence_penalty: req.presence_penalty,
         suppress_initial_tokens: olmo3.suppress_initial_tokens,
     };
-    let (text, prompt_tokens, completion_tokens) =
-        run_inference(state, &req.prompt, req.max_tokens, &config);
+    let (text, prompt_tokens, completion_tokens, cancelled) =
+        run_inference(state, &req.prompt, req.max_tokens, &config, stream);
+    if cancelled == Some(CancelReason::Disconnected) {
+        return; // client is gone — nothing to write, slot already freed
+    }
     let model_id = state.lock().unwrap().model_id.clone();
-    let finish   = if completion_tokens >= req.max_tokens { "length" } else { "stop" };
+    let finish   = if cancelled.is_some() || completion_tokens >= req.max_tokens { "length" } else { "stop" };
     let resp = CompletionResponse {
         id: id.to_string(), created: unix_ts(),
         model: model_id, text,
@@ -908,6 +1074,92 @@ pub fn split_chunks(text: &str, chunk_bytes: usize) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cancellation (#25) ───────────────────────────────────────────────
+
+    /// Loopback socket pair: (server-side accepted stream, client stream).
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        (server_side, client)
+    }
+
+    /// Poll `f` every 50 ms for up to 2 s (FIN delivery is asynchronous).
+    fn eventually(mut f: impl FnMut() -> bool) -> bool {
+        for _ in 0..40 {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn client_disconnected_alive_peer() {
+        let (server_side, _client) = socket_pair();
+        assert!(!client_disconnected(&server_side));
+    }
+
+    #[test]
+    fn client_disconnected_pending_data_not_consumed() {
+        use std::io::Read;
+        let (mut server_side, mut client) = socket_pair();
+        client.write_all(b"x").unwrap();
+        // Wait until the byte is buffered server-side, then probe: buffered
+        // data means "still connected", and the probe must not consume it.
+        assert!(eventually(|| {
+            let mut buf = [0u8; 1];
+            matches!(server_side.peek(&mut buf), Ok(1))
+        }));
+        assert!(!client_disconnected(&server_side));
+        let mut buf = [0u8; 1];
+        server_side.read_exact(&mut buf).unwrap(); // byte still there
+        assert_eq!(&buf, b"x");
+    }
+
+    #[test]
+    fn client_disconnected_detects_fin() {
+        let (server_side, client) = socket_pair();
+        assert!(!client_disconnected(&server_side));
+        drop(client);
+        assert!(eventually(|| client_disconnected(&server_side)));
+    }
+
+    #[test]
+    fn cancel_watch_detects_disconnect() {
+        let (server_side, client) = socket_pair();
+        let mut watch = CancelWatch::with_deadline(&server_side, None);
+        assert!(!watch.should_abort());
+        drop(client);
+        // First probe already spent; the throttle means detection takes up to
+        // DISCONNECT_PROBE_EVERY after the FIN arrives.
+        assert!(eventually(|| watch.should_abort()));
+        assert_eq!(watch.cancelled, Some(CancelReason::Disconnected));
+    }
+
+    #[test]
+    fn cancel_watch_deadline_expires() {
+        let (server_side, _client) = socket_pair();
+        let mut watch = CancelWatch::with_deadline(&server_side, Some(Duration::ZERO));
+        assert!(watch.should_abort());
+        assert_eq!(watch.cancelled, Some(CancelReason::DeadlineExceeded));
+        // Sticky once cancelled.
+        assert!(watch.should_abort());
+    }
+
+    #[test]
+    fn parse_request_deadline_values() {
+        assert_eq!(parse_request_deadline(None), None);
+        assert_eq!(parse_request_deadline(Some("0")), None);
+        assert_eq!(parse_request_deadline(Some("")), None);
+        assert_eq!(parse_request_deadline(Some("nope")), None);
+        assert_eq!(parse_request_deadline(Some("-5")), None);
+        assert_eq!(parse_request_deadline(Some("120")), Some(Duration::from_secs(120)));
+        assert_eq!(parse_request_deadline(Some(" 45 ")), Some(Duration::from_secs(45)));
+    }
 
     #[test]
     fn parse_get_request() {
@@ -990,11 +1242,13 @@ mod tests {
             chat_template: ChatTemplate::ChatML,
         }));
         let config = SamplingConfig { temperature: 0.0, ..SamplingConfig::default() };
-        let (text, prompt_count, completion_count) =
-            run_inference(&state, "hello world", 10, &config);
+        let (server_side, _client) = socket_pair();
+        let (text, prompt_count, completion_count, cancelled) =
+            run_inference(&state, "hello world", 10, &config, &server_side);
         assert_eq!(text, "");              // no model → empty
         assert_eq!(completion_count, 0);
         assert_eq!(prompt_count, 11);      // byte-encode: "hello world" = 11 bytes
+        assert_eq!(cancelled, None);       // connected client, no deadline
     }
 
     #[test]

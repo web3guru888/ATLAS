@@ -46,7 +46,7 @@ use atlas_model::{ModelConfig, OlmoModel, load_model_from_safetensors, load_mode
 use atlas_tokenize::Tokenizer;
 
 use crate::handler::{
-    bearer_ok, handle_inference, http_html_response, http_json_response,
+    bearer_ok, client_disconnected, handle_inference, http_html_response, http_json_response,
     http_options_response, http_too_many_requests_response, http_unauthorized_response,
     parse_http_request, InferState,
 };
@@ -167,6 +167,17 @@ impl ApiServer {
 
         // Main thread: the single inference worker. GPU work stays here.
         for mut job in rx {
+            // #25: a job may have queued behind a long generation; if its
+            // client already hung up (e.g. Cloudflare 524 at 100 s), skip it
+            // instead of burning GPU time generating for a dead socket.
+            if client_disconnected(&job.stream) {
+                eprintln!(
+                    "atlas-api: dropping queued {} request — client disconnected before start",
+                    job.path
+                );
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                continue;
+            }
             handle_inference(&mut job.stream, &job.path, &job.body, &state);
             inflight.fetch_sub(1, Ordering::SeqCst);
         }
