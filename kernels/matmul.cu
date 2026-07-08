@@ -492,6 +492,33 @@ __global__ void gemv_w4_kernel(
     if (threadIdx.x == 0) y[row] = acc;
 }
 
+/* ─── W4 → F32 dequantize (batch-GEMM prefill path, #22 Step 2) ───────── */
+/* Expands a packed int4 weight matrix into a dense f32 [M×K] scratch so the */
+/* existing cuBLAS GEMM can consume it for batched (N>1) activations.        */
+/* Same layout contract as gemv_w4_kernel: little-endian nibbles, stored     */
+/* nibble = q + 8 (q ∈ [-8,7]), per-group BF16 scale along K.                */
+/* One thread per packed word (8 weights). Requires K % 8 == 0, G % 8 == 0.  */
+__global__ void dequant_w4_f32_kernel(
+    const uint32_t* __restrict__ packed,
+    const uint16_t* __restrict__ scales,
+    float*          __restrict__ out,
+    int M, int K, int G
+) {
+    const int words = K >> 3;                     /* K/8 packed words per row */
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long long)M * words) return;
+    int row  = (int)(idx / words);
+    int col0 = (int)(idx % words) << 3;
+    uint32_t bits = packed[idx];
+    float s = bf16u_to_f32(__ldg(scales + (ptrdiff_t)row * (K / G) + col0 / G));
+    float* o = out + (ptrdiff_t)row * K + col0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int q = (int)((bits >> (4 * i)) & 0xFu) - 8;
+        o[i] = s * (float)q;
+    }
+}
+
 /* ─── VRAM→VRAM memcpy helper ────────────────────────────────────────────── */
 /* For KV cache writes that stay in VRAM */
 __global__ void copy_kernel(const float* src, float* dst, int n) {
@@ -809,6 +836,21 @@ void atlas_gemv_w4_f32(
     gemv_w4_kernel<<<grid, block>>>(packed, scales, x, y, M, K, G);
     atlas_note_launch_err("atlas_gemv_w4_f32");
     /* Async: downstream kernels on stream-0 wait automatically. */
+}
+
+/* W4 → F32 dequantize into a VRAM scratch buffer (#22 Step 2 batch path).
+ * out[M×K] f32 = dequant(packed[M×K/8], scales[M×K/G]).
+ * Layout documented at gemv_w4_kernel. Async on stream-0: the consuming
+ * GEMM launched afterwards waits automatically. */
+void atlas_dequant_w4_f32(
+    const uint32_t* packed, const uint16_t* scales, float* out,
+    int M, int K, int G
+) {
+    long long total = (long long)M * (K >> 3);
+    int threads = 256;
+    long long blocks = (total + threads - 1) / threads;
+    dequant_w4_f32_kernel<<<(unsigned int)blocks, threads>>>(packed, scales, out, M, K, G);
+    atlas_note_launch_err("atlas_dequant_w4_f32");
 }
 
 /* ── QK RMSNorm (in-place, whole-vector) ─────────────────────────────────── */

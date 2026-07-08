@@ -644,13 +644,14 @@ impl Linear {
     /// copies, negligible next to the GEMM itself.
     ///
     /// Falls back to the per-token path when the batch GEMM is unavailable:
-    /// no CUDA, W4 weights (GEMV-only until #22 Step 2 lands in
-    /// atlas-tensor), or a failed kernel launch. The fallback is exactly the
-    /// pre-#22 behaviour, including its CPU fallbacks — never silently wrong.
+    /// no CUDA, or a failed kernel launch / scratch allocation. (W4 batch is
+    /// handled inside atlas-tensor since #22 Step 2: dequant-to-scratch +
+    /// GEMM.) The fallback is exactly the pre-#22 behaviour, including its
+    /// CPU fallbacks — never silently wrong.
     fn forward_batch(&self, x: &[f32], seq_len: usize, y: &mut [f32]) {
         assert_eq!(x.len(), seq_len * self.in_dim);
         assert_eq!(y.len(), seq_len * self.out_dim);
-        if seq_len > 1 && self.gpu_mat.is_on_gpu() && !self.gpu_mat.is_w4() {
+        if seq_len > 1 && self.gpu_mat.is_on_gpu() {
             // Transpose X: [seq × in] token-major → [in × seq] for sgemm.
             let mut xt = vec![0.0f32; x.len()];
             for s in 0..seq_len {
@@ -952,11 +953,7 @@ impl Attention {
         let mut k = vec![0.0f32; m * kv];
         let mut v = vec![0.0f32; m * kv];
         let mut qkv_done = false;
-        if m > 1 && atlas_tensor::cuda_available()
-            && !self.wq.gpu_mat.is_w4()
-            && !self.wk.gpu_mat.is_w4()
-            && !self.wv.gpu_mat.is_w4()
-        {
+        if m > 1 && atlas_tensor::cuda_available() {
             let d_in = self.wq.in_dim;
             // Transpose in: [m × d_in] token-major → [d_in × m], once.
             let mut xt = vec![0.0f32; m * d_in];
@@ -990,7 +987,7 @@ impl Attention {
             }
         }
         if !qkv_done {
-            // Token-major fallback (exact; W4 / no-CUDA / kernel failure).
+            // Token-major fallback (exact; no-CUDA / kernel failure).
             self.wq.forward_batch(x, m, &mut q);
             self.wk.forward_batch(x, m, &mut k);
             self.wv.forward_batch(x, m, &mut v);
@@ -1387,17 +1384,13 @@ impl FeedForward {
     /// 18 MB/layer of intermediate PCIe + 2M scalar silu() calls + the
     /// cache-hostile [ffn × m] transposes dominated everything.
     ///
-    /// Fallback (W4 weights, no CUDA, failed upload/kernel): token-major
+    /// Fallback (no CUDA, failed upload/kernel): token-major
     /// `forward_batch` per projection + CPU silu — exact pre-existing
     /// behaviour.
     fn forward_chunk(&self, x: &[f32], m: usize) -> Vec<f32> {
         let d_in  = self.w_gate.in_dim;
         let d_out = self.w_down.out_dim;
-        if m > 1 && atlas_tensor::cuda_available()
-            && !self.w_gate.gpu_mat.is_w4()
-            && !self.w_up.gpu_mat.is_w4()
-            && !self.w_down.gpu_mat.is_w4()
-        {
+        if m > 1 && atlas_tensor::cuda_available() {
             // Transpose in: [m × d_in] token-major → [d_in × m] feature-major.
             let mut xt = vec![0.0f32; x.len()];
             for s in 0..m {
@@ -1425,7 +1418,7 @@ impl FeedForward {
                 }
             }
         }
-        // Token-major fallback (exact; covers W4 / no-CUDA / kernel failure).
+        // Token-major fallback (exact; covers no-CUDA / kernel failure).
         let h = self.w_gate.out_dim;
         let mut gate = vec![0.0f32; m * h];
         let mut up   = vec![0.0f32; m * h];
@@ -5173,6 +5166,82 @@ mod tests {
             "chunked prefill diverged from per-token with GPU resources");
     }
 
+    /// #22 Step 2: quantize an f32 Linear into W4 (compressed-tensors
+    /// pack-quantized layout) — test-only helper for the W4 parity gates.
+    /// Symmetric per-group scale = max|w| / 7, rounded to BF16 (same
+    /// reconstruction the kernels use, so the quantization is exact-by-
+    /// construction on both paths).
+    fn w4_quantize_linear(lin: &Linear, group: usize) -> Linear {
+        let (in_dim, out_dim) = (lin.in_dim, lin.out_dim);
+        assert_eq!(in_dim % group, 0);
+        let mut packed = vec![0u32; out_dim * in_dim / 8];
+        let mut scales = vec![0u16; out_dim * in_dim / group];
+        for r in 0..out_dim {
+            for g0 in (0..in_dim).step_by(group) {
+                let w = &lin.weight[r * in_dim + g0 .. r * in_dim + g0 + group];
+                let maxabs = w.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                let s = if maxabs > 0.0 { maxabs / 7.0 } else { 1.0 };
+                let s_bits = (s.to_bits() >> 16) as u16; // f32 → BF16 (truncate)
+                let s_eff = f32::from_bits((s_bits as u32) << 16);
+                scales[r * (in_dim / group) + g0 / group] = s_bits;
+                for (j, &v) in w.iter().enumerate() {
+                    let q = (v / s_eff).round().clamp(-8.0, 7.0) as i32;
+                    let col = g0 + j;
+                    packed[r * (in_dim / 8) + col / 8] |=
+                        (((q + 8) as u32) & 0xF) << (4 * (col % 8));
+                }
+            }
+        }
+        Linear::from_w4(packed, scales, in_dim, out_dim, group)
+    }
+
+    /// Quantize every attention/FFN Linear of a model to W4 (group = 32).
+    /// Embedding / LM head stay f32, matching real W4 deployments.
+    fn w4_quantize_model(model: &mut OlmoModel) {
+        for layer in model.layers.iter_mut() {
+            let a = &mut layer.attn;
+            a.wq = w4_quantize_linear(&a.wq, 32);
+            a.wk = w4_quantize_linear(&a.wk, 32);
+            a.wv = w4_quantize_linear(&a.wv, 32);
+            a.wo = w4_quantize_linear(&a.wo, 32);
+            let f = &mut layer.ffn;
+            f.w_gate = w4_quantize_linear(&f.w_gate, 32);
+            f.w_up   = w4_quantize_linear(&f.w_up, 32);
+            f.w_down = w4_quantize_linear(&f.w_down, 32);
+        }
+    }
+
+    /// #22 Step 2 parity gate: W4-quantized weights must produce EXACTLY the
+    /// same greedy generation from chunked prefill (dequant-to-scratch +
+    /// GEMM in atlas-tensor) as from per-token prefill (W4 GEMV kernel).
+    /// Runs both without and with full GPU resources (KV cache / RoPE
+    /// tables); on CPU-only builds both paths collapse to the same per-token
+    /// CPU W4 fallback, so the test is trivially green there.
+    #[test]
+    fn chunked_prefill_parity_w4() {
+        fn w4_tiny() -> OlmoModel {
+            let mut model = OlmoModel::new(ModelConfig::tiny());
+            w4_quantize_model(&mut model);
+            model
+        }
+        let prompt = [0u32, 1, 2, 3, 4, 5, 6, 7];
+        let cfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+        for gpu_resources in [false, true] {
+            let mut per_token = w4_tiny();
+            if gpu_resources { per_token.init_gpu_resources(); }
+            per_token.set_prefill_chunk_tokens(1);
+            let out_per_token = per_token.generate_with_sampling(&prompt, 3, &cfg);
+
+            let mut chunked = w4_tiny();
+            if gpu_resources { chunked.init_gpu_resources(); }
+            chunked.set_prefill_chunk_tokens(6); // 8 tokens → chunks of 6/2
+            let out_chunked = chunked.generate_with_sampling(&prompt, 3, &cfg);
+
+            assert_eq!(out_per_token, out_chunked,
+                "W4 chunked prefill diverged (gpu_resources={gpu_resources})");
+        }
+    }
+
     /// #22: rough prefill timing, chunked vs per-token, on a mid-size
     /// synthetic model (~130M params ≈ 0.5 GB VRAM — safe beside a resident
     /// server). Not a real benchmark (random weights, short prompt), just
@@ -5204,6 +5273,12 @@ mod tests {
         let approx_gb = (layers * (4*d*d + 3*d*ffn) + 2*4096*d) as f64 * 4.0 / 1e9;
         eprintln!("  bench model: d={d} layers={layers} ffn={ffn} ≈ {approx_gb:.1} GB f32, prompt={p_len}, chunk={chunk}");
         let mut model = OlmoModel::new(cfg);
+        // ATLAS_BENCH_W4=1: quantize attention/FFN linears to W4 (group=32)
+        // to probe the #22 Step 2 dequant-to-scratch batch path.
+        if std::env::var("ATLAS_BENCH_W4").map_or(false, |v| v == "1") {
+            eprintln!("  quantizing linears to W4 (group=32)…");
+            w4_quantize_model(&mut model);
+        }
         model.init_gpu_resources(); // real deployments have GPU KV + RoPE tables
         let prompt: Vec<u32> = (0..p_len as u32).map(|i| i % 4096).collect();
         let scfg = SamplingConfig { temperature: 0.0, ..Default::default() };

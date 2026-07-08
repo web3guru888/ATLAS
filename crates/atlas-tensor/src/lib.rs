@@ -55,6 +55,12 @@ mod ffi {
             x: *const f32, y: *mut f32,
             m: c_int, k: c_int, g: c_int,
         );
+        /// W4 → F32 dequantize into a VRAM scratch buffer (#22 Step 2).
+        /// packed[M, K/8] uint32, scales[M, K/G] BF16 bits → out[M, K] F32.
+        pub fn atlas_dequant_w4_f32(
+            packed: *const u32, scales: *const u16, out: *mut f32,
+            m: c_int, k: c_int, g: c_int,
+        );
         /// Explicitly drain all pending GPU work (cudaDeviceSynchronize).
         /// Rarely needed — use only when CPU must read GPU output without going
         /// through GpuVec::download() (which syncs implicitly via cudaMemcpy D2H).
@@ -521,8 +527,6 @@ impl GpuMatrix {
         debug_assert_eq!(out.len(), m * n);
         #[cfg(atlas_cuda)]
         if let Some(ref a_buf) = self.buf {
-            // W4 kernel is GEMV-only: batch (n>1) callers must use another path.
-            if a_buf.is_w4() && n != 1 { return false; }
             if let Some(b_buf) = gpu::GpuBuf::upload(rhs) {
                 if let Some(c_buf) = gpu::GpuBuf::alloc(m * n) {
                     // Isolate this launch so the post-launch check below is
@@ -543,10 +547,25 @@ impl GpuMatrix {
                             );
                         },
                         gpu::GpuBufKind::W4 { packed, scales, group } => unsafe {
-                            ffi::atlas_gemv_w4_f32(
-                                packed.ptr, scales.ptr, b_buf.ptr, c_buf.ptr,
-                                m as i32, k as i32, *group as i32,
-                            );
+                            if n == 1 {
+                                ffi::atlas_gemv_w4_f32(
+                                    packed.ptr, scales.ptr, b_buf.ptr, c_buf.ptr,
+                                    m as i32, k as i32, *group as i32,
+                                );
+                            } else {
+                                // #22 Step 2: dequant → f32 scratch → GEMM.
+                                let Some(guard) = w4_scratch_at_least(m * k)
+                                    else { return false; };
+                                let scratch = guard.as_ref().unwrap();
+                                ffi::atlas_dequant_w4_f32(
+                                    packed.ptr, scales.ptr, scratch.ptr,
+                                    m as i32, k as i32, *group as i32,
+                                );
+                                ffi::atlas_matmul_f32(
+                                    scratch.ptr, b_buf.ptr, c_buf.ptr,
+                                    m as i32, n as i32, k as i32,
+                                );
+                            }
                         },
                     }
                     let result = c_buf.download();
@@ -576,8 +595,6 @@ impl GpuMatrix {
         let m = self.rows;
         #[cfg(atlas_cuda)]
         if let (Some(ref a_buf), Some(ref x_buf)) = (&self.buf, &x.buf) {
-            // W4 kernel is GEMV-only: batch (n>1) callers must use another path.
-            if a_buf.is_w4() && n != 1 { return None; }
             let out_buf = gpu::GpuBuf::alloc(m * n)?;
             match a_buf {
                 gpu::GpuBufKind::F32(f32_buf) => unsafe {
@@ -593,10 +610,24 @@ impl GpuMatrix {
                     );
                 },
                 gpu::GpuBufKind::W4 { packed, scales, group } => unsafe {
-                    ffi::atlas_gemv_w4_f32(
-                        packed.ptr, scales.ptr, x_buf.ptr, out_buf.ptr,
-                        m as i32, self.cols as i32, *group as i32,
-                    );
+                    if n == 1 {
+                        ffi::atlas_gemv_w4_f32(
+                            packed.ptr, scales.ptr, x_buf.ptr, out_buf.ptr,
+                            m as i32, self.cols as i32, *group as i32,
+                        );
+                    } else {
+                        // #22 Step 2: dequant → f32 scratch → GEMM.
+                        let guard = w4_scratch_at_least(m * self.cols)?;
+                        let scratch = guard.as_ref().unwrap();
+                        ffi::atlas_dequant_w4_f32(
+                            packed.ptr, scales.ptr, scratch.ptr,
+                            m as i32, self.cols as i32, *group as i32,
+                        );
+                        ffi::atlas_matmul_f32(
+                            scratch.ptr, x_buf.ptr, out_buf.ptr,
+                            m as i32, n as i32, self.cols as i32,
+                        );
+                    }
                 },
             }
             return Some(GpuVec {
@@ -607,6 +638,42 @@ impl GpuMatrix {
         }
         None
     }
+}
+
+/// Reusable VRAM scratch for the W4 batch-GEMM path (#22 Step 2).
+///
+/// W4 weights are stored packed (int4). For batched activations (n > 1) the
+/// GEMV kernel would re-stream the packed weights once per token, so instead
+/// the whole Linear is dequantized into this f32 scratch once per call and
+/// the existing cuBLAS GEMM consumes it (weight traffic ≈ 8.6 B/element per
+/// chunk vs 0.56 B × n for GEMV — break-even n ≈ 15, ~17× less at n = 256).
+///
+/// Grow-only and process-global: the largest 32B Linear is 27,648 × 5,120
+/// f32 ≈ 566 MB, allocated once and reused for every layer / chunk.
+/// Reuse is safe without extra synchronization: all launches go to stream-0,
+/// so the next dequant cannot overtake a previous GEMM that reads the
+/// scratch. The Mutex only serializes CPU-side access to the allocation.
+#[cfg(atlas_cuda)]
+static W4_GEMM_SCRATCH: std::sync::Mutex<Option<gpu::GpuBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Lock the W4 dequant scratch, growing it to ≥ `len` f32 elements.
+/// Returns `None` if VRAM allocation fails (caller falls back to CPU).
+#[cfg(atlas_cuda)]
+fn w4_scratch_at_least(
+    len: usize,
+) -> Option<std::sync::MutexGuard<'static, Option<gpu::GpuBuf>>> {
+    let mut guard = match W4_GEMM_SCRATCH.lock() {
+        Ok(g) => g,
+        // The scratch holds no cross-call invariants — a panic elsewhere
+        // cannot corrupt it, so a poisoned lock is safe to take over.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.as_ref().map_or(true, |b| b.len < len) {
+        *guard = None; // free the old buffer before allocating the bigger one
+        *guard = Some(gpu::GpuBuf::alloc(len)?);
+    }
+    Some(guard)
 }
 
 impl std::fmt::Debug for GpuMatrix {
@@ -1401,6 +1468,49 @@ impl Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #22 Step 2: W4 batched sgemm (dequant-to-scratch + GEMM) must match
+    /// the per-column W4 GEMV kernel. The GEMV path is HF-parity verified,
+    /// so agreement here is the correctness gate for the new dequant kernel
+    /// and the scratch plumbing. Tolerance covers cuBLAS TF32 vs f32 GEMV
+    /// low-bit drift (same contract as the f32 batch path).
+    #[test]
+    fn w4_sgemm_batch_matches_gemv_columns() {
+        if !cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let (m, k, g, n) = (32usize, 64usize, 32usize, 5usize);
+        // Deterministic synthetic W4: nibbles cycle through [-8, 6],
+        // per-group BF16 scales vary per row/group.
+        let words = k / 8;
+        let packed: Vec<u32> = (0..m * words).map(|i| {
+            let mut w = 0u32;
+            for j in 0..8 {
+                let nib = ((i * 7 + j * 3) % 15) as u32; // stored nibble 0..14
+                w |= nib << (4 * j);
+            }
+            w
+        }).collect();
+        let scales: Vec<u16> = (0..m * (k / g)).map(|i| {
+            let s = 0.01f32 + 0.003f32 * (i as f32);
+            (s.to_bits() >> 16) as u16 // f32 → BF16 bits (truncate)
+        }).collect();
+        let mat = GpuMatrix::upload_w4(&packed, &scales, m, k, g);
+        assert!(mat.is_w4(), "test requires the W4 GPU path");
+        // Activations in sgemm layout: [k × n], column j = token j.
+        let x: Vec<f32> = (0..k * n).map(|i| ((i % 13) as f32 - 6.0) * 0.1).collect();
+        let mut y_batch = vec![0.0f32; m * n];
+        assert!(mat.sgemm(&x, k, n, &mut y_batch),
+            "W4 batch sgemm must succeed on GPU (no fallback)");
+        for col in 0..n {
+            let xcol: Vec<f32> = (0..k).map(|r| x[r * n + col]).collect();
+            let mut ycol = vec![0.0f32; m];
+            assert!(mat.sgemm(&xcol, k, 1, &mut ycol), "W4 GEMV reference failed");
+            for row in 0..m {
+                let (a, b) = (y_batch[row * n + col], ycol[row]);
+                assert!((a - b).abs() <= 1e-3 * b.abs().max(1.0),
+                    "W4 batch/GEMV mismatch at ({row},{col}): {a} vs {b}");
+            }
+        }
+    }
 
     /// dup() must be an exact copy and must not alias the source buffer.
     /// Runs by default; exercises the device path when CUDA is present and
