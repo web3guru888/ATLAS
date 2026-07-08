@@ -558,7 +558,6 @@ fn run_inference(
         let reserve = answer_reserve_tokens();
         if reserve > 0 {
             if let (Some(engine), Some(tok)) = (st.model.as_mut(), st.tokenizer.as_ref()) {
-                const THINK_CLOSE: &str = "\n</think>\n\n";
                 let forced = tok.encode(THINK_CLOSE);
                 let mut extra: Vec<u32> = Vec::new();
                 engine.continue_streaming_events(&forced, reserve, config, |ev, _deposit| {
@@ -585,6 +584,15 @@ fn run_inference(
 
     (output, prompt_count, completion_count, watch.cancelled, hit_length)
 }
+
+/// Forced continuation injected when the think budget runs out: a short
+/// in-think wrap-up cue followed by the block close. The cue matters — the
+/// model was cut mid-thought, and without it the visible channel tends to
+/// continue deliberating ("Wait, but…") instead of answering. Same principle
+/// as s1-style budget forcing ("Final Answer:" injection), phrased in the
+/// model's own think voice.
+const THINK_CLOSE: &str =
+    "\nMy thinking budget is up — I must answer now with my best conclusion.\n</think>\n\n";
 
 /// Answer-reserve size for Think models (tokens). `ATLAS_ANSWER_RESERVE`
 /// env override; default 512; `0` disables the reserve entirely.
@@ -1016,7 +1024,6 @@ fn handle_chat_stream(
         let reserve = answer_reserve_tokens();
         if reserve > 0 {
             if let Some(ref tok) = tokenizer {
-                const THINK_CLOSE: &str = "\n</think>\n\n";
                 let forced = tok.encode(THINK_CLOSE);
                 let mut reserve_count: usize = 0;
                 model.continue_streaming_events(
