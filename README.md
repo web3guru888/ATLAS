@@ -11,7 +11,7 @@
 [![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Zero Dependencies](https://img.shields.io/badge/external%20crates-0-brightgreen.svg)](#pure-rust--zero-dependencies)
 [![Release](https://img.shields.io/badge/release-v4.2.0-success.svg)](#status)
-[![Tests](https://img.shields.io/badge/tests-631%2F631%20passing-brightgreen.svg)](#status)
+[![Tests](https://img.shields.io/badge/tests-644%2F644%20passing-brightgreen.svg)](#status)
 [![CI](https://img.shields.io/badge/CI-green-brightgreen.svg)](#status)
 [![Crates](https://img.shields.io/badge/crates-22-blueviolet.svg)](#crate-status)
 [![MCP Tools](https://img.shields.io/badge/MCP%20tools-28-blueviolet.svg)](#atlas-mcp)
@@ -45,7 +45,7 @@ It fuses four architectural innovations:
   3. **QK-norm scope** — `Olmo3RMSNorm(n_heads*head_dim)` normalizes the **full concatenated Q/K projection** (one RMS statistic across all heads), not per-head. Per-head normalization rescaled head magnitudes and crushed long-range retrieval: the model could not read its own prompt beyond ~128 tokens.
 - 📈 **Verified**: needle-retrieval passes 68→1,784 tokens (was FAIL at 156+), output byte-identical to HF reference; MMLU diverse-100 22%→**54%** (direct-answer protocol); new 300-position CPU/GPU logit-parity test (exact match)
 - 🚦 **CI green** (first time since April): MSRV 1.75→1.80, lockfile v4; **631/631 tests**
-	- 🧠 **32B AWQ inference on a single A100-40GB** — OLMo-3-32B-Think at W4A32: **GSM8K-25 100%, MMLU-40 82%, Code-5 5/5**, 14.6 tok/s decode, 27.2 GB VRAM. Custom `gemv_w4_kernel` + streaming shard loader + `OlmoModel::new_uninit`. Purely additive — 7B BF16 path untouched and re-verified. See [model card](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-32B-Think-v4). *(The 32B W4 serving code lives on branch [`feat/w4-32b`](https://github.com/web3guru888/ATLAS/tree/feat/w4-32b) — running in production on the A100; merge to `main` pending.)*
+	- 🧠 **32B AWQ inference on a single A100-40GB** — OLMo-3-32B-Think at W4A32: **GSM8K-25 100%, MMLU-40 82%, Code-5 5/5**, 14.6 tok/s decode, 27.2 GB VRAM. Custom `gemv_w4_kernel` + streaming shard loader + `OlmoModel::new_uninit`. Purely additive — 7B BF16 path untouched and re-verified. See [model card](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-32B-Think-v4). *(The 32B W4 serving code is **merged to `main`** and running in production on the A100.)*
 	- 🔗 **HF Space LIVE** at [huggingface.co/spaces/openhubresearch/ATLAS](https://huggingface.co/spaces/openhubresearch/ATLAS) — serving 32B reasoning model through ATLAS stack on dedicated A100 silicon
 - 🌐 **OpenRouter provider endpoints**: `GET /openrouter/models` (full provider schema), `GET /privacy`, SSE `: keep-alive` every 10s during prefill/think, early-429 concurrency discipline, bearer-key auth — live behind a Cloudflare tunnel on dedicated A100 silicon
 - ⚡ **GPU training path**: SFT optimizer step on GPU (fixed `step_gpu` clip-norm + weight-decay parity, Issue #20); `GpuVec::dup` D2D copies (H2D traffic −59%)
@@ -289,17 +289,18 @@ All requests accept sampling controls with **sensible OLMo-3 defaults**:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `temperature` | 0.0 | Sampling temperature (0.0 = greedy) |
-| `repetition_penalty` | 1.15 | Keskar 2019 penalty on recent tokens |
+| `repetition_penalty` | 1.0 | Keskar 2019 penalty on recent tokens (AI2 reference: off) |
 | `repetition_window` | 256 | Tokens to look back for repetition penalty |
 | `top_p` | 0.95 | Nucleus sampling threshold |
 | `top_k` | 50 | Top-K filtering (0 = off) |
 | `min_p` | 0.05 | Min-P filtering threshold |
 | `frequency_penalty` | 0.0 | Proportional to token count |
 | `presence_penalty` | 0.0 | Flat penalty for any seen token |
+| `max_tokens` | 2048 | Generation budget — Think models spend 500–2,000+ tokens reasoning inside `<think>` before the visible answer |
 
-> **Think budget**: `<think>` blocks are force-closed after 200 tokens to prevent small models from endlessly rambling. Streaming injects `</think>` via SSE; non-streaming post-processes the output.
+> **Think handling**: the chat endpoint primes the official OLMo-3-Think template (`<|im_start|>assistant\n<think>`); the chain-of-thought is returned as `message.reasoning` (streaming: `delta.reasoning`) and the visible answer as `message.content`. **Answer reserve**: if `max_tokens` runs out while still inside `<think>`, the server force-closes the block and continues from the intact KV cache for up to `ATLAS_ANSWER_RESERVE` (default 512, `0` disables) answer tokens — clients always get a visible answer.
 
-**Features**: SSE streaming, CORS headers, think budget, echo mode for testing, 47 tests, 0 external dependencies.
+**Features**: SSE streaming, CORS headers, think-block reasoning/content split + answer reserve, client-disconnect abort (#25), echo mode for testing, 81 tests, 0 external dependencies.
 
 ---
 
@@ -452,9 +453,9 @@ cargo build --release -p atlas-cli
 
 ## Status — v4.2.0
 
-**631/631 tests passing** · **22 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **61.7 tok/s OLMo-3-7B-Think (BF16)** · **14.6 tok/s OLMo-3-32B-Think (W4A32)**
+**644/644 tests passing** · **22 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **61.7 tok/s OLMo-3-7B-Think (BF16)** · **14.6 tok/s OLMo-3-32B-Think (W4A32)**
 
-> 🏔 **v4.2.0 is the current release.** 32B AWQ W4 inference on a single A100-40GB: `gemv_w4_kernel` + streaming shard loader fits within 27.2 GB VRAM — **now merged to `main` and serving in production** on the A100-40GB. Three silent inference-quality bugs fixed by differential testing against HuggingFace transformers. OpenRouter provider endpoints + bearer-key auth live behind Cloudflare tunnel. HF Space serving the 32B reasoning model. **Batched prefill ([#22](https://github.com/web3guru888/ATLAS/issues/22)) is MERGED (`main` @ `f96e3f7`) and DEPLOYED on the live 32B service (2026-07-08):** time-to-first-token at ~1.25K-token prompts dropped **121.8s → 23.4s (~5× live)**, greedy output bit-identical (parity gate passed). One GEMM per layer over all prompt positions replaces T sequential GEMV steps. Disconnect-abort fix ([#25](https://github.com/web3guru888/ATLAS/issues/25)) is ready on `fix/disconnect-abort` (deploy pending an announced restart window).
+> 🏔 **v4.2.0 is the current release.** 32B AWQ W4 inference on a single A100-40GB: `gemv_w4_kernel` + streaming shard loader fits within 27.2 GB VRAM — **now merged to `main` and serving in production** on the A100-40GB. Three silent inference-quality bugs fixed by differential testing against HuggingFace transformers. OpenRouter provider endpoints + bearer-key auth live behind Cloudflare tunnel. HF Space serving the 32B reasoning model. **Batched prefill ([#22](https://github.com/web3guru888/ATLAS/issues/22)) is MERGED (`main` @ `f96e3f7`) and DEPLOYED on the live 32B service (2026-07-08):** time-to-first-token at ~1.25K-token prompts dropped **121.8s → 23.4s (~5× live)**, greedy output bit-identical (parity gate passed). One GEMM per layer over all prompt positions replaces T sequential GEMV steps. Disconnect-abort fix ([#25](https://github.com/web3guru888/ATLAS/issues/25)) is **merged to `main` and deployed** (client-disconnect probe + optional `ATLAS_REQUEST_DEADLINE_SECS` wall-clock deadline). **Think-budget answer reserve** (2026-07-08, branch [`fix/think-budget-answer-reserve`](https://github.com/web3guru888/ATLAS/tree/fix/think-budget-answer-reserve), deployed on the live endpoint): when a Think model exhausts `max_tokens` inside its `<think>` block, the server force-closes the block and continues from the intact KV cache for up to `ATLAS_ANSWER_RESERVE` (default 512) answer tokens — a visible answer is always emitted (zero-answer rate 2/5 → 0/5 on the integration-test battery; byte-identical output when the reserve doesn't fire). Chat default `max_tokens` is now 2048.
 
 ### What Works
 
@@ -462,7 +463,7 @@ cargo build --release -p atlas-cli
 - ✅ **Memory is real** — 5-type pheromone system (exploitation/exploration/success/traversal/recency), MMAS ceiling, A\* semantic pathfinding (α·C_sem + β·C_phe + γ·C_str), Active Inference agents; `atlas palace --hot` shows pheromone trails
 - ✅ **Training is real** — SFT with GradTape + AdamW + LoRA (rank=8) + gradient accumulation + safetensors checkpoint; DeepSupervisionTrainer (N_sup=4..16, loss trace, latent carry)
 - ✅ **GPU inference is real** — SmolLM2-135M at 37.7 tok/s on A100-SXM4-40GB; OLMo-3-7B-Think at **61.7 tok/s** (BF16 GPU, W16A32, 14 GB); OLMo-3-32B-Think at **14.6 tok/s** (W4A32 AWQ, 27.2 GB, single A100-40GB, v4.2.0); full GPU attention path, zero intra-layer PCIe, cuBLAS TF32 tensor cores; SWA + YaRN RoPE; post-norm + QK-norm architecture
-- ✅ **API is real** — `atlas api serve` exposes `/v1/chat/completions` + `/v1/completions` + `/v1/models`; SSE streaming; CORS; OLMo-3 sampling defaults; think budget; 47 tests
+- ✅ **API is real** — `atlas api serve` exposes `/v1/chat/completions` + `/v1/completions` + `/v1/models`; SSE streaming; CORS; OLMo-3 sampling defaults; think-aware reasoning/content split + answer reserve; 81 tests
 - ✅ **Provenance is real** — Schnorr proofs + Groth16 stub (HMAC-SHA256, BLS12-381-compatible interface) + ProvenanceChain; `atlas prove` generates verifiable proofs
 - ✅ **Safety is real** — Horn-clause constitution (8 principles, 4 domains, Young 2026 NP-hardness validated); 5-state FSM (`BOOT→NOMINAL→DEGRADED→SAFE_MODE→EMERGENCY_STOP`); CircuitBreaker; append-only audit log
 - ✅ **Bridge is real** — `AtlasBridge` with ZK-attested deposit/withdraw, Sepolia chain_id=11155111, Groth16 proof per transaction
@@ -509,7 +510,7 @@ cargo build --release -p atlas-cli
 | atlas-model | 2 | **27** | ✅ OLMo 3 / Llama 3, RoPE, GQA, SwiGLU, SWA, YaRN RoPE, config.json auto-patch; GPU-resident forward pass; **v4.0.7: post-norm + QK-norm**; **v4.0.8: `olmo3()` preset**; **v4.0.9: model auto-detect from weights dir** |
 | atlas-palace | 3 | **79** | ✅ A\* search, 5-type pheromones, Active Inference, MMAS, PalaceBackend trait, session_id, PalaceConfig; v4.0.3: `CanonicalPheromoneUpdate` uses `exp(−x)` decay (always positive, smooth, hardware-safe) |
 | atlas-mcp | 3 | **32** | ✅ 28 MCP tools, JSON-RPC 2.0, live palace dispatch; McpConnectionPool (max 5, 5-min idle eviction) |
-| atlas-api | 3 | **47** | ✅ OpenAI-compatible HTTP: /v1/chat/completions, /v1/completions, /v1/models; SSE streaming; CORS; OLMo-3 sampling defaults; think budget; **v4.0.9: think suppression (logit masking), max_tokens 512, filler cleanup** |
+| atlas-api | 3 | **81** | ✅ OpenAI-compatible HTTP: /v1/chat/completions, /v1/completions, /v1/models; SSE streaming; CORS; OLMo-3 sampling defaults; official `<think>` primer with reasoning/content split; **think-budget answer reserve (`ATLAS_ANSWER_RESERVE`), max_tokens default 2048**; client-disconnect abort + request deadline (#25) |
 | atlas-trm | 4 | 12 | ✅ TRM-CausalValidator depth-6 RNN, Bayesian combining |
 | atlas-http | 5 | 11 | ✅ HTTP/1.1 TcpStream, chunked decoding, curl HTTPS |
 | atlas-bayes | 5 | 13 | ✅ BetaPrior, BayesNetwork, QualityGate, Jaccard novelty |
@@ -521,7 +522,9 @@ cargo build --release -p atlas-cli
 | atlas-bridge | 6 | **8** | ✅ ZK-attested Rings↔ETH interface, Sepolia chain_id=11155111 |
 | atlas-infer | 3 | **20** | ✅ `StigmergicHook` trait (per-layer pheromone deposits); `InferEngine` GPU/CPU dispatch; `PheromoneDeposit` aggregation; `generate_streaming` + `generate` with hooks; hooked GPU forward path (v4.1.0) |
 | atlas-cli | 7 | **30** | ✅ discover / corpus / train / eval / prove / palace / mcp / api / bench / status |
-| **TOTAL** | | **631** | **✅ All passing — v4.2.0** |
+| **TOTAL** | | **644** | **✅ All passing — `main`, full workspace run verified 2026-07-08** |
+
+> Per-crate counts above are the v4.2.0-era breakdown and may lag as tests are added; the TOTAL is the current verified workspace figure (unit + integration + doc tests).
 
 ### Quick Start
 
@@ -647,7 +650,7 @@ ATLAS v4.0 implements the **Champagnat n-Morphic Framework** (Issue #6), grounde
 
 ATLAS models are published to Hugging Face under the [`openhubresearch`](https://huggingface.co/openhubresearch) organization.
 
-**Latest release**: [`openhubresearch/ATLAS-OLMo-3-32B-Think-v4`](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-32B-Think-v4) — OLMo-3-32B-Think served through the ATLAS v4.2.0 stack with AWQ 4-bit inference (**GSM8K-25 100%, MMLU-40 82%, Code-5 5/5**, 14.6 tok/s, 27.2 GB VRAM, single A100-40GB, custom `gemv_w4_kernel`, streaming shard loader, 631/631 tests).
+**Latest release**: [`openhubresearch/ATLAS-OLMo-3-32B-Think-v4`](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-32B-Think-v4) — OLMo-3-32B-Think served through the ATLAS v4.2.0 stack with AWQ 4-bit inference (**GSM8K-25 100%, MMLU-40 82%, Code-5 5/5**, 14.6 tok/s, 27.2 GB VRAM, single A100-40GB, custom `gemv_w4_kernel`, streaming shard loader; 644/644 tests on `main` as of 2026-07-08).
 
 **First release**: [`openhubresearch/ATLAS-OLMo-3-7B-Think-v4`](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-7B-Think-v4) — OLMo-3-7B-Think run through the ATLAS v4.1.0 n-morphic framework with BF16 inference (**61.7 tok/s** A100-SXM4-40GB, W16A32, 600/600 tests, full GPU attention path, StigmergicHook wired, think suppression + anti-repetition defaults).
 
@@ -724,7 +727,7 @@ See [NOTICE](NOTICE) for attribution to incorporated components.
   institution = {OpenHub Research, Thailand},
   url         = {https://github.com/web3guru888/ATLAS},
   note        = {Pure Rust LLM training framework. Zero external crate dependencies.
-                 v4.2.0: 22 crates, 631 tests, Champagnat n-morphic framework,
+                 v4.2.0: 22 crates, 644 tests, Champagnat n-morphic framework,
                  32B AWQ W4 inference on single A100-40GB — GSM8K 100%, MMLU 82%, Code 5/5.
                  HF-reference inference fidelity: 3 silent bugs fixed by differential testing.
                  Full GPU attention path — OLMo-3-7B-Think 61.7 tok/s on A100-SXM4-40GB (BF16, 4× speedup).
