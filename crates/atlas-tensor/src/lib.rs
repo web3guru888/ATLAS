@@ -971,6 +971,84 @@ impl GpuKvCache {
         }
     }
 
+    /// Write K/V for `m` consecutive positions starting at `start` in ONE
+    /// device-to-device copy each (#22 chunked prefill — replaces `m`
+    /// per-position `write` calls, each of which cost two H2D uploads).
+    ///
+    /// `k`/`v`: [m × n_kv_heads × head_dim] position-major, GPU-resident —
+    /// exactly the cache's own layout, so the destination range
+    /// `[start × kv_dim, (start+m) × kv_dim)` is contiguous.
+    ///
+    /// Returns `false` when the copy could not be performed (CPU-only build
+    /// or non-resident buffers) — caller must treat the GPU cache as stale.
+    pub fn write_range(&mut self, start: usize, m: usize, k: &GpuVec, v: &GpuVec) -> bool {
+        let kv_dim = self.n_kv_heads * self.head_dim;
+        debug_assert!(start + m <= self.max_seq);
+        debug_assert_eq!(k.len, m * kv_dim);
+        debug_assert_eq!(v.len, m * kv_dim);
+        #[cfg(atlas_cuda)]
+        if let (Some(kp), Some(vp), Some(nkp), Some(nvp)) = (
+            self.keys.gpu_ptr_mut(), self.values.gpu_ptr_mut(),
+            k.gpu_ptr(), v.gpu_ptr()
+        ) {
+            unsafe {
+                ffi::atlas_vram_copy_f32(nkp, kp.add(start * kv_dim), (m * kv_dim) as i32);
+                ffi::atlas_vram_copy_f32(nvp, vp.add(start * kv_dim), (m * kv_dim) as i32);
+            }
+            return true;
+        }
+        let _ = (start, m, k, v, kv_dim);
+        false
+    }
+
+    /// Chunked-prefill attention (#22): decode attention for `m` consecutive
+    /// query positions `start..start+m` with ONE Q upload and ONE output
+    /// buffer (the per-position kernel is launched `m` times at pointer
+    /// offsets — launches are cheap and async; the removed cost is the 2·m
+    /// alloc+PCIe round-trips of calling `decode_attention` per token).
+    ///
+    /// `q`: [m × n_heads × head_dim] position-major, GPU-resident, RoPE'd.
+    /// K/V for positions `< start + m` must already be in the cache
+    /// (see [`Self::write_range`]) — token `s` attends to `0..=start+s`.
+    ///
+    /// Returns [m × n_heads × head_dim] in VRAM, or None if resources are
+    /// unavailable (caller falls back to the CPU attention path).
+    pub fn decode_attention_prefill(
+        &self,
+        q: &GpuVec,
+        m: usize,
+        n_heads: usize,
+        start: usize,
+        scale: f32,
+        window_size: usize,
+    ) -> Option<GpuVec> {
+        let d = n_heads * self.head_dim;
+        debug_assert_eq!(q.len, m * d);
+        #[cfg(atlas_cuda)]
+        if let (Some(qp), Some(kp), Some(vp)) =
+            (q.gpu_ptr(), self.keys.gpu_ptr(), self.values.gpu_ptr())
+        {
+            if let Some(out_buf) = gpu::GpuBuf::alloc(m * d) {
+                for s in 0..m {
+                    unsafe {
+                        ffi::atlas_decode_attention(
+                            qp.add(s * d), kp, vp, out_buf.ptr.add(s * d),
+                            n_heads as i32, self.n_kv_heads as i32, self.head_dim as i32,
+                            (start + s) as i32, scale, window_size as i32,
+                        );
+                    }
+                }
+                return Some(GpuVec {
+                    buf: Some(out_buf),
+                    cpu: vec![0.0f32; m * d],
+                    len: m * d,
+                });
+            }
+        }
+        let _ = (q, m, n_heads, start, scale, window_size, d);
+        None
+    }
+
     /// Compute grouped-query decode attention. Returns output [n_heads × head_dim].
     ///
     /// `q`: [n_heads × head_dim] query vector (after RoPE).

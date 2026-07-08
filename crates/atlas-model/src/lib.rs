@@ -941,12 +941,60 @@ impl Attention {
         let kv = self.n_kv_heads * self.head_dim;
 
         // ① Batched QKV projections.
+        //
+        //    Fast path mirrors FeedForward::forward_chunk: ONE feature-major
+        //    transpose of x shared by all three projections, three
+        //    GPU-resident sgemm_vec GEMMs from a single upload, then
+        //    transpose-back for the per-token RoPE/QK-norm below. (The
+        //    token-major forward_batch fallback transposes x three times
+        //    and re-uploads it per projection.)
         let mut q = vec![0.0f32; m * d];
         let mut k = vec![0.0f32; m * kv];
         let mut v = vec![0.0f32; m * kv];
-        self.wq.forward_batch(x, m, &mut q);
-        self.wk.forward_batch(x, m, &mut k);
-        self.wv.forward_batch(x, m, &mut v);
+        let mut qkv_done = false;
+        if m > 1 && atlas_tensor::cuda_available()
+            && !self.wq.gpu_mat.is_w4()
+            && !self.wk.gpu_mat.is_w4()
+            && !self.wv.gpu_mat.is_w4()
+        {
+            let d_in = self.wq.in_dim;
+            // Transpose in: [m × d_in] token-major → [d_in × m], once.
+            let mut xt = vec![0.0f32; m * d_in];
+            for s in 0..m {
+                let row = &x[s*d_in .. (s+1)*d_in];
+                for (i, &vx) in row.iter().enumerate() { xt[i*m + s] = vx; }
+            }
+            let x_gpu = atlas_tensor::GpuVec::from_slice(&xt);
+            if x_gpu.is_on_gpu() {
+                let _ = atlas_tensor::take_kernel_error();
+                if let (Some(qg), Some(kg), Some(vg)) = (
+                    self.wq.gpu_mat.sgemm_vec(&x_gpu, m),
+                    self.wk.gpu_mat.sgemm_vec(&x_gpu, m),
+                    self.wv.gpu_mat.sgemm_vec(&x_gpu, m),
+                ) {
+                    let q_fm = qg.download();
+                    let k_fm = kg.download();
+                    let v_fm = vg.download(); // sync points
+                    if atlas_tensor::take_kernel_error() == 0 {
+                        for s in 0..m {
+                            let row = &mut q[s*d .. (s+1)*d];
+                            for (o, vv) in row.iter_mut().enumerate() { *vv = q_fm[o*m + s]; }
+                            let row = &mut k[s*kv .. (s+1)*kv];
+                            for (o, vv) in row.iter_mut().enumerate() { *vv = k_fm[o*m + s]; }
+                            let row = &mut v[s*kv .. (s+1)*kv];
+                            for (o, vv) in row.iter_mut().enumerate() { *vv = v_fm[o*m + s]; }
+                        }
+                        qkv_done = true;
+                    }
+                }
+            }
+        }
+        if !qkv_done {
+            // Token-major fallback (exact; W4 / no-CUDA / kernel failure).
+            self.wq.forward_batch(x, m, &mut q);
+            self.wk.forward_batch(x, m, &mut k);
+            self.wv.forward_batch(x, m, &mut v);
+        }
 
         // ② QK-norm + RoPE + KV-cache write, per token.
         for s in 0..m {
@@ -971,39 +1019,87 @@ impl Attention {
                 self.kv_cache.write_val(pos, h, &v_s[h*self.head_dim..(h+1)*self.head_dim]);
             }
             if pos == self.cpu_synced_upto { self.cpu_synced_upto = pos + 1; }
-            let (k_s, v_s) = (&k[s*kv .. (s+1)*kv], &v[s*kv .. (s+1)*kv]);
-            self.backfill_kv_to_gpu(pos, k_s, v_s);
         }
 
-        // ③ Per-token attention over the KV cache (same math as forward_token).
-        let group = self.n_heads / self.n_kv_heads;
+        // GPU KV lock-step backfill for the WHOLE chunk: `k`/`v` are
+        // position-major [m × kv_dim] — exactly the cache's own layout —
+        // so this is one H2D upload + one contiguous D2D copy each,
+        // replacing 2·m per-token uploads (measured: per-token backfill
+        // allocs alone erased the chunking win on synthetic models).
+        // On failure the cache is marked stale, same as backfill_kv_to_gpu.
+        if self.gpu_kv.is_some() {
+            let k_gpu = atlas_tensor::GpuVec::from_slice(&k);
+            let v_gpu = atlas_tensor::GpuVec::from_slice(&v);
+            let ok = k_gpu.is_on_gpu() && v_gpu.is_on_gpu()
+                && self.gpu_kv.as_mut()
+                    .map_or(false, |kvc| kvc.write_range(start, m, &k_gpu, &v_gpu));
+            if !ok { self.gpu_kv_stale = true; }
+        }
+
+        // ③ Attention over the KV cache.
+        //
+        //    Fast path: GPU decode attention for all m positions with ONE
+        //    Q upload and ONE output download
+        //    (`GpuKvCache::decode_attention_prefill`) — zero weight traffic,
+        //    K/V already resident from the chunk backfill above. Without a
+        //    GPU attention path, chunk attention runs on the CPU and
+        //    dominates prefill at real context lengths (and on 7B/32B —
+        //    whose per-token prefill is full-GPU — it would be a large
+        //    regression).
+        //
+        //    Fallback (exact): the per-token CPU loop below over the
+        //    complete CPU cache — same math + SWA masking as forward_token.
+        //    Triggered by missing/stale GPU KV, failed Q upload, or a
+        //    kernel error surfaced after the (synchronizing) download.
+        let window = self.window_size.unwrap_or(0);
         let mut out = vec![0.0f32; m * d];
-        let mut scores: Vec<f32> = Vec::with_capacity(start + m);
-        for s in 0..m {
-            let pos = start + s;
-            scores.clear();
-            scores.resize(pos + 1, 0.0);
-            let q_s = &q[s*d .. (s+1)*d];
-            let o_s = &mut out[s*d .. (s+1)*d];
-            for h in 0..self.n_heads {
-                let kv_h = h / group;
-                let q_h = &q_s[h*self.head_dim..(h+1)*self.head_dim];
-                for t in 0..=pos {
-                    let masked = self.window_size.map_or(false, |w| pos - t >= w);
-                    if masked {
-                        scores[t] = f32::NEG_INFINITY;
-                    } else {
-                        let k_t = self.kv_cache.key(t, kv_h);
-                        let score: f32 = q_h.iter().zip(k_t.iter()).map(|(&qi, &ki)| qi * ki).sum();
-                        scores[t] = score * self.scale;
+        let mut gpu_attn_done = false;
+        if self.gpu_kv.is_some() && !self.gpu_kv_stale && atlas_tensor::cuda_available() {
+            let _ = atlas_tensor::take_kernel_error();
+            let q_gpu = atlas_tensor::GpuVec::from_slice(&q);
+            if q_gpu.is_on_gpu() {
+                let attn = self.gpu_kv.as_ref().and_then(|kvc| {
+                    kvc.decode_attention_prefill(&q_gpu, m, self.n_heads, start,
+                                                 self.scale, window)
+                });
+                if let Some(o_gpu) = attn {
+                    let o_cpu = o_gpu.download(); // sync point
+                    if atlas_tensor::take_kernel_error() == 0 {
+                        out.copy_from_slice(&o_cpu);
+                        gpu_attn_done = true;
                     }
                 }
-                softmax_inplace(&mut scores[..pos+1]);
-                let o_h = &mut o_s[h*self.head_dim..(h+1)*self.head_dim];
-                for t in 0..=pos {
-                    let v_t = self.kv_cache.val(t, kv_h);
-                    let a = scores[t];
-                    for (oi, &vi) in o_h.iter_mut().zip(v_t.iter()) { *oi += a * vi; }
+            }
+        }
+        if !gpu_attn_done {
+            let group = self.n_heads / self.n_kv_heads;
+            let mut scores: Vec<f32> = Vec::with_capacity(start + m);
+            for s in 0..m {
+                let pos = start + s;
+                scores.clear();
+                scores.resize(pos + 1, 0.0);
+                let q_s = &q[s*d .. (s+1)*d];
+                let o_s = &mut out[s*d .. (s+1)*d];
+                for h in 0..self.n_heads {
+                    let kv_h = h / group;
+                    let q_h = &q_s[h*self.head_dim..(h+1)*self.head_dim];
+                    for t in 0..=pos {
+                        let masked = self.window_size.map_or(false, |w| pos - t >= w);
+                        if masked {
+                            scores[t] = f32::NEG_INFINITY;
+                        } else {
+                            let k_t = self.kv_cache.key(t, kv_h);
+                            let score: f32 = q_h.iter().zip(k_t.iter()).map(|(&qi, &ki)| qi * ki).sum();
+                            scores[t] = score * self.scale;
+                        }
+                    }
+                    softmax_inplace(&mut scores[..pos+1]);
+                    let o_h = &mut o_s[h*self.head_dim..(h+1)*self.head_dim];
+                    for t in 0..=pos {
+                        let v_t = self.kv_cache.val(t, kv_h);
+                        let a = scores[t];
+                        for (oi, &vi) in o_h.iter_mut().zip(v_t.iter()) { *oi += a * vi; }
+                    }
                 }
             }
         }
@@ -1280,7 +1376,56 @@ impl FeedForward {
 
     /// Chunked SwiGLU FFN (#22): gate/up/down each as ONE GEMM over the
     /// m-token chunk. x: [m × d_model] token-major → [m × d_model].
+    ///
+    /// Fast path: the whole pipeline runs GPU-resident in FEATURE-major
+    /// layout — `sgemm_vec` consumes/produces [k × m] matrices, and the
+    /// SwiGLU fuse is elementwise (layout-agnostic), so gate → silu·up →
+    /// down chains in VRAM with ONE activation upload and ONE download,
+    /// and only two [m × d]-sized CPU transposes at the boundaries.
+    /// Profiling (512-tok prefill, 0.8B synthetic): the token-major
+    /// `forward_batch` version spent 2.3 s of a 3.4 s prefill here — the
+    /// 18 MB/layer of intermediate PCIe + 2M scalar silu() calls + the
+    /// cache-hostile [ffn × m] transposes dominated everything.
+    ///
+    /// Fallback (W4 weights, no CUDA, failed upload/kernel): token-major
+    /// `forward_batch` per projection + CPU silu — exact pre-existing
+    /// behaviour.
     fn forward_chunk(&self, x: &[f32], m: usize) -> Vec<f32> {
+        let d_in  = self.w_gate.in_dim;
+        let d_out = self.w_down.out_dim;
+        if m > 1 && atlas_tensor::cuda_available()
+            && !self.w_gate.gpu_mat.is_w4()
+            && !self.w_up.gpu_mat.is_w4()
+            && !self.w_down.gpu_mat.is_w4()
+        {
+            // Transpose in: [m × d_in] token-major → [d_in × m] feature-major.
+            let mut xt = vec![0.0f32; x.len()];
+            for s in 0..m {
+                let row = &x[s*d_in .. (s+1)*d_in];
+                for (i, &v) in row.iter().enumerate() { xt[i*m + s] = v; }
+            }
+            let x_gpu = atlas_tensor::GpuVec::from_slice(&xt);
+            if x_gpu.is_on_gpu() {
+                let _ = atlas_tensor::take_kernel_error();
+                let fused = self.w_gate.gpu_mat.sgemm_vec(&x_gpu, m)
+                    .zip(self.w_up.gpu_mat.sgemm_vec(&x_gpu, m))
+                    .map(|(gate, up)| atlas_tensor::silu_mul_gpu(&gate, &up))
+                    .and_then(|hidden| self.w_down.gpu_mat.sgemm_vec(&hidden, m));
+                if let Some(out_fm_gpu) = fused {
+                    let out_fm = out_fm_gpu.download(); // sync point
+                    if atlas_tensor::take_kernel_error() == 0 {
+                        // Transpose out: [d_out × m] → [m × d_out].
+                        let mut out = vec![0.0f32; m * d_out];
+                        for s in 0..m {
+                            let row = &mut out[s*d_out .. (s+1)*d_out];
+                            for (o, v) in row.iter_mut().enumerate() { *v = out_fm[o*m + s]; }
+                        }
+                        return out;
+                    }
+                }
+            }
+        }
+        // Token-major fallback (exact; covers W4 / no-CUDA / kernel failure).
         let h = self.w_gate.out_dim;
         let mut gate = vec![0.0f32; m * h];
         let mut up   = vec![0.0f32; m * h];
@@ -1290,7 +1435,7 @@ impl FeedForward {
         let hidden: Vec<f32> = gate.iter().zip(up.iter())
             .map(|(&g, &u)| silu(g) * u)
             .collect();
-        let mut out = vec![0.0f32; m * self.w_down.out_dim];
+        let mut out = vec![0.0f32; m * d_out];
         self.w_down.forward_batch(&hidden, m, &mut out);
         out
     }
@@ -4999,6 +5144,87 @@ mod tests {
 
         assert_eq!(out_per_token, out_chunked,
             "chunked prefill diverged on post-norm/QK-norm/SWA model");
+    }
+
+    /// #22 batched prefill parity with FULL GPU resources initialized:
+    /// per-token prefill takes `forward_token_gpu_full` (GPU RoPE/QK-norm/
+    /// decode-attention), chunked prefill takes batched GEMMs + the GPU
+    /// decode-attention fast path in `Attention::forward_chunk`. Gates the
+    /// KV lock-step backfill + chunk decode-attention wiring. Self-skips
+    /// without CUDA (both paths collapse to the CPU fallbacks covered by
+    /// the other parity tests).
+    #[test]
+    fn chunked_prefill_parity_gpu_resources() {
+        if !atlas_tensor::cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let prompt = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let cfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+
+        let mut per_token = OlmoModel::new(ModelConfig::tiny());
+        per_token.init_gpu_resources();
+        per_token.set_prefill_chunk_tokens(1);
+        let out_per_token = per_token.generate_with_sampling(&prompt, 3, &cfg);
+
+        let mut chunked = OlmoModel::new(ModelConfig::tiny());
+        chunked.init_gpu_resources();
+        chunked.set_prefill_chunk_tokens(6); // 8 tokens → chunks of 6/2
+        let out_chunked = chunked.generate_with_sampling(&prompt, 3, &cfg);
+
+        assert_eq!(out_per_token, out_chunked,
+            "chunked prefill diverged from per-token with GPU resources");
+    }
+
+    /// #22: rough prefill timing, chunked vs per-token, on a mid-size
+    /// synthetic model (~130M params ≈ 0.5 GB VRAM — safe beside a resident
+    /// server). Not a real benchmark (random weights, short prompt), just
+    /// the weight-restreaming signal. Run explicitly:
+    ///   cargo test -p atlas-model bench_chunked_prefill -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_chunked_prefill_speedup() {
+        // Size overrides so the weight-streaming regime can be probed
+        // without recompiling (small models are launch/alloc-overhead-bound
+        // and show no chunking win by construction):
+        //   ATLAS_BENCH_D / ATLAS_BENCH_LAYERS / ATLAS_BENCH_FFN /
+        //   ATLAS_BENCH_PROMPT / ATLAS_BENCH_CHUNK
+        let env = |k: &str, dflt: usize| std::env::var(k).ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(dflt);
+        let d      = env("ATLAS_BENCH_D", 1024);
+        let layers = env("ATLAS_BENCH_LAYERS", 8);
+        let ffn    = env("ATLAS_BENCH_FFN", 4 * d);
+        let p_len  = env("ATLAS_BENCH_PROMPT", 512);
+        let chunk  = env("ATLAS_BENCH_CHUNK", 256);
+        let cfg = ModelConfig {
+            vocab_size: 4096, d_model: d, n_layers: layers, n_heads: d / 64,
+            n_kv_heads: (d / 64 / 4).max(1), ffn_hidden: ffn,
+            max_seq_len: (p_len + 8).max(1024),
+            rope_theta: 10_000.0, rms_norm_eps: 1e-5,
+            layer_types: Vec::new(), sliding_window: None,
+            rope_scaling: RopeScaling::None, eos_token_id: None,
+        };
+        let approx_gb = (layers * (4*d*d + 3*d*ffn) + 2*4096*d) as f64 * 4.0 / 1e9;
+        eprintln!("  bench model: d={d} layers={layers} ffn={ffn} ≈ {approx_gb:.1} GB f32, prompt={p_len}, chunk={chunk}");
+        let mut model = OlmoModel::new(cfg);
+        model.init_gpu_resources(); // real deployments have GPU KV + RoPE tables
+        let prompt: Vec<u32> = (0..p_len as u32).map(|i| i % 4096).collect();
+        let scfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+        let mut time_prefill = |model: &mut OlmoModel, chunk: usize| {
+            model.reset();
+            model.set_prefill_chunk_tokens(chunk);
+            let t0 = std::time::Instant::now();
+            let out = model.generate_with_sampling(&prompt, 1, &scfg);
+            (t0.elapsed(), out)
+        };
+        let (warm, _) = time_prefill(&mut model, 1); // warm-up (GPU init)
+        let (t_per_token, out1) = time_prefill(&mut model, 1);
+        let (t_chunked, out256) = time_prefill(&mut model, chunk);
+        eprintln!(
+            "  prefill {p_len} tokens: per-token={:?} chunked({chunk})={:?} \
+             speedup={:.1}x (warmup={:?})",
+            t_per_token, t_chunked,
+            t_per_token.as_secs_f64() / t_chunked.as_secs_f64().max(1e-9),
+            warm,
+        );
+        assert_eq!(out1, out256, "greedy divergence between prefill paths");
     }
 
     // ── GPU Inference Tests ──────────────────────────────────────────────────
