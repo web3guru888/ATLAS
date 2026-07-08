@@ -38,6 +38,7 @@ fn main() {
         "corpus"    => cmd_corpus(&args[2..]),
         "train"     => cmd_train(&args[2..]),
         "eval"      => cmd_eval(&args[2..]),
+        "rsi"       => cmd_rsi(&args[2..]),
         "prove"     => cmd_prove(&args[2..]),
         "palace"    => cmd_palace(&args[2..]),
         "status"    => cmd_status(&args[2..]),
@@ -495,6 +496,64 @@ fn cmd_eval(args: &[String]) -> i32 {
 // ────────────────────────────────────────────────────────────────────────────
 //  prove
 // ────────────────────────────────────────────────────────────────────────────
+
+fn cmd_rsi(args: &[String]) -> i32 {
+    use atlas_corpus::{RsiLoop, RsiConfig, Candidate, SyntheticEvaluator, SyntheticMutator};
+    let generations = opt_usize(args, "--generations", 12);
+    let dim = opt_usize(args, "--dim", 3).max(2);
+    let json_out = flag(args, "--json");
+
+    // The optimum is invisible to the loop; it only parameterises the reference
+    // Evaluator/Mutator plug-ins (a real run swaps in `atlas eval` + prompt edits).
+    let optimum: Vec<f32> = (0..dim).map(|_| 1.0).collect();
+    let evaluator = SyntheticEvaluator { optimum: optimum.clone() };
+    let mutator = SyntheticMutator { optimum, step: 0.4 };
+
+    // Spread seed population far from the optimum so the loop has room to climb.
+    let pop: Vec<Candidate> = (0..6)
+        .map(|i| Candidate {
+            id: format!("seed{i}"),
+            genome: (0..dim)
+                .map(|d| if d == 0 { i as f32 } else if d == 1 { -(i as f32) } else { 0.5 })
+                .collect(),
+            cost: 0.2,
+            pheromone_weight: 0.5,
+            success_rate: 0.0,
+        })
+        .collect();
+
+    // Stronger selection pressure than the library default: keep the best 2,
+    // breed 3 offspring each — weak strategies die, offspring can invade.
+    let survivors = 2usize;
+    let cfg = RsiConfig { survivors, offspring_per_survivor: 3, ..RsiConfig::default() };
+    let mut lp = RsiLoop::new(cfg, evaluator, mutator);
+    let (traj, final_pop) = lp.run(pop, generations);
+
+    println!("=== ATLAS RSI loop ===");
+    println!("  invasion_fitness x eval -> measure->select->mutate->remeasure");
+    println!("  generations={generations}  dim={dim}  survivors={survivors}\n");
+    println!("  gen  pop  mean_fit   max_fit  mean_succ  best_succ  acc  best_id");
+    for g in &traj {
+        println!("  {:>3}  {:>3}  {:>8.4}  {:>8.4}  {:>9.4}  {:>9.4}  {:>3}  {}",
+            g.generation, g.population, g.mean_fitness, g.max_fitness,
+            g.mean_success, g.best_success, g.accepted, g.best_id);
+    }
+    let first = traj.first().map(|g| g.best_success).unwrap_or(0.0);
+    let last = traj.last().map(|g| g.best_success).unwrap_or(0.0);
+    println!("\n  best measured success: {first:.4} -> {last:.4}  (delta {:+.4})", last - first);
+    println!("  final population: {}", final_pop.len());
+    if json_out {
+        print!("{{\"generations\":{},\"best_success_first\":{:.6},\"best_success_last\":{:.6},\"traj\":[",
+            traj.len(), first, last);
+        for (i, g) in traj.iter().enumerate() {
+            if i > 0 { print!(","); }
+            print!("{{\"gen\":{},\"mean_success\":{:.6},\"best_success\":{:.6},\"accepted\":{}}}",
+                g.generation, g.mean_success, g.best_success, g.accepted);
+        }
+        println!("]}}");
+    }
+    0
+}
 
 fn cmd_prove(args: &[String]) -> i32 {
     use atlas_zk::{KnowledgeClaim, SchnorrParams, SchnorrVerifier};

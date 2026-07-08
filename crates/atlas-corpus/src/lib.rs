@@ -33,6 +33,9 @@ pub use deep_supervision::{
 pub mod invasion_fitness;
 pub use invasion_fitness::{InvasionFitnessScorer, InvasionFitnessConfig, FitnessItem, cosine_sim};
 
+pub mod rsi_loop;
+pub use rsi_loop::{RsiLoop, RsiConfig, Candidate, GenerationStats, Evaluator, Mutator, SyntheticEvaluator, SyntheticMutator};
+
 use std::collections::HashMap;
 
 use atlas_astra::{Discovery, Observation};
