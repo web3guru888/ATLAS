@@ -249,7 +249,12 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn tiny_engine() -> InferEngine {
-        InferEngine::new(OlmoModel::new(ModelConfig::tiny()))
+        let mut m = OlmoModel::new(ModelConfig::tiny());
+        // Legacy per-token prefill cadence — the prefill-event test below
+        // asserts one event per prompt token (#22 chunked prefill would
+        // otherwise coalesce them into one event per chunk).
+        m.set_prefill_chunk_tokens(1);
+        InferEngine::new(m)
     }
 
     #[test]

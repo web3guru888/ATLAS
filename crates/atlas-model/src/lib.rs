@@ -1613,6 +1613,22 @@ pub struct OlmoModel {
     /// remaining token is computed on the (always-consistent) CPU path
     /// instead of emitting silent garbage. See `forward_one_gpu`.
     gpu_poisoned: bool,
+    /// Prefill chunk size in tokens (#22 batched prefill). Prompt processing
+    /// iterates the prompt in chunks of this many tokens via
+    /// [`Self::prefill_chunk`]; [`GenEvent::Prefill`] progress is reported
+    /// once per chunk. Default 256 (override with env `ATLAS_PREFILL_CHUNK`);
+    /// set to 1 via [`Self::set_prefill_chunk_tokens`] to restore the legacy
+    /// per-token cadence.
+    prefill_chunk_tokens: usize,
+}
+
+/// Prefill chunk size default: env `ATLAS_PREFILL_CHUNK` (≥ 1) or 256 (#22).
+fn prefill_chunk_tokens_from_env() -> usize {
+    std::env::var("ATLAS_PREFILL_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(256)
 }
 
 impl OlmoModel {
@@ -1677,7 +1693,7 @@ impl OlmoModel {
             Linear::placeholder(cfg.d_model, cfg.vocab_size)
         };
         let eos_token_id = cfg.eos_token_id;
-        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_local, rope_gpu: None, rope_local_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy(), gpu_poisoned: false }
+        Self { config: cfg, embed, layers, norm, lm_head, rope, rope_local, rope_gpu: None, rope_local_gpu: None, norm_gpu: None, pos: 0, eos_token_id, extra_stop_tokens: Vec::new(), rng: Rng::from_entropy(), gpu_poisoned: false, prefill_chunk_tokens: prefill_chunk_tokens_from_env() }
     }
 
     /// Upload precomputed RoPE tables and allocate GPU KV caches.
@@ -1726,6 +1742,34 @@ impl OlmoModel {
         for l in &mut self.layers { l.attn.reset_cache(); }
         // New sequence — give the GPU path another chance.
         self.gpu_poisoned = false;
+    }
+
+    /// Override the prefill chunk size (tokens per [`Self::prefill_chunk`]
+    /// call). Values < 1 are clamped to 1 (per-token cadence).
+    pub fn set_prefill_chunk_tokens(&mut self, n: usize) {
+        self.prefill_chunk_tokens = n.max(1);
+    }
+
+    /// Process a chunk of prompt tokens; returns logits for the LAST token
+    /// in the chunk.
+    ///
+    /// WIP #22 (batched prefill): this is the seam where the chunked-GEMM
+    /// prefill path lands. The current body is the exact per-token loop the
+    /// callers used before (GPU forward with per-token CPU fallback), so all
+    /// semantics — KV-cache state, `pos` advancement, `gpu_poisoned`
+    /// handling — are unchanged. A follow-up commit replaces the body with:
+    /// one QKV/out-proj/FFN GEMM over the whole chunk + per-token attention
+    /// over the KV cache (see issue #22 scoping doc).
+    pub fn prefill_chunk(&mut self, tokens: &[u32]) -> Vec<f32> {
+        let mut last = Vec::new();
+        for &tok in tokens {
+            last = if let Some(gl) = self.forward_one_gpu(tok) {
+                gl
+            } else {
+                self.forward_one(tok)
+            };
+        }
+        last
     }
 
     /// Forward pass for one new token. Returns logits [vocab_size].
@@ -2018,13 +2062,10 @@ impl OlmoModel {
         let mut new_tokens: Vec<u32> = Vec::new();
         let mut last_logits = vec![0.0f32; self.config.vocab_size];
 
-        // Process prompt
-        for &tok in prompt {
-            last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
-                gl
-            } else {
-                self.forward_one(tok)
-            };
+        // Process prompt in chunks (#22 batched prefill).
+        let chunk = self.prefill_chunk_tokens.max(1);
+        for toks in prompt.chunks(chunk) {
+            last_logits = self.prefill_chunk(toks);
         }
 
         // Token history for repetition / frequency / presence penalties
@@ -2304,15 +2345,15 @@ impl OlmoModel {
         let mut new_tokens: Vec<u32> = Vec::new();
         let mut last_logits = vec![0.0f32; self.config.vocab_size];
 
-        // Process prompt, reporting progress after each token.
+        // Process prompt in chunks, reporting progress after each chunk
+        // (#22 batched prefill; chunk size 1 = legacy per-token cadence).
         let total = prompt.len();
-        for (i, &tok) in prompt.iter().enumerate() {
-            last_logits = if let Some(gl) = self.forward_one_gpu(tok) {
-                gl
-            } else {
-                self.forward_one(tok)
-            };
-            if !on_event(GenEvent::Prefill { done: i + 1, total }) {
+        let chunk = self.prefill_chunk_tokens.max(1);
+        let mut done = 0usize;
+        for toks in prompt.chunks(chunk) {
+            last_logits = self.prefill_chunk(toks);
+            done += toks.len();
+            if !on_event(GenEvent::Prefill { done, total }) {
                 return new_tokens; // client gone — abort before decode
             }
         }
@@ -4586,6 +4627,7 @@ mod tests {
     fn generate_streaming_events_reports_prefill_then_tokens() {
         let cfg = ModelConfig::tiny();
         let mut model = OlmoModel::new(cfg);
+        model.set_prefill_chunk_tokens(1); // legacy per-token event cadence
         let prompt = [0u32, 1, 2, 3];
 
         let mut prefills: Vec<(usize, usize)> = Vec::new();
@@ -4619,10 +4661,53 @@ mod tests {
     fn generate_streaming_events_abort_during_prefill() {
         let cfg = ModelConfig::tiny();
         let mut model = OlmoModel::new(cfg);
+        model.set_prefill_chunk_tokens(1); // legacy per-token event cadence
         let out = model.generate_streaming_events(
             &[0u32, 1, 2, 3], 4, &SamplingConfig::default(),
             |ev| !matches!(ev, GenEvent::Prefill { done: 2, .. }));
         assert!(out.is_empty(), "aborting in prefill must generate nothing");
+    }
+
+    /// #22 batched prefill: with chunk size N, `Prefill` progress events are
+    /// emitted once per chunk with `done` = cumulative tokens processed.
+    #[test]
+    fn generate_streaming_events_chunked_prefill_events() {
+        let cfg = ModelConfig::tiny();
+        let mut model = OlmoModel::new(cfg);
+        model.set_prefill_chunk_tokens(3);
+        let prompt = [0u32, 1, 2, 3, 4, 5, 6]; // 7 tokens → chunks of 3/3/1
+        let mut prefills: Vec<(usize, usize)> = Vec::new();
+        let out = model.generate_streaming_events(
+            &prompt, 2, &SamplingConfig { temperature: 0.0, ..Default::default() },
+            |ev| {
+                if let GenEvent::Prefill { done, total } = ev {
+                    prefills.push((done, total));
+                }
+                true
+            });
+        assert_eq!(prefills, vec![(3, 7), (6, 7), (7, 7)]);
+        assert!(!out.is_empty());
+    }
+
+    /// #22 batched prefill: chunked prefill must produce EXACTLY the same
+    /// generation as per-token prefill (identical KV-cache state and logits).
+    /// Today the chunk body IS the per-token loop, so this is trivially true;
+    /// this test is the parity gate for the upcoming chunked-GEMM body.
+    #[test]
+    fn chunked_prefill_matches_per_token_prefill() {
+        let prompt = [0u32, 1, 2, 3, 4];
+        let cfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+
+        let mut per_token = OlmoModel::new(ModelConfig::tiny());
+        per_token.set_prefill_chunk_tokens(1);
+        let out_per_token = per_token.generate_with_sampling(&prompt, 3, &cfg);
+
+        let mut chunked = OlmoModel::new(ModelConfig::tiny());
+        chunked.set_prefill_chunk_tokens(4); // 5 tokens → chunks of 4/1
+        let out_chunked = chunked.generate_with_sampling(&prompt, 3, &cfg);
+
+        assert_eq!(out_per_token, out_chunked,
+            "chunked prefill diverged from per-token prefill");
     }
 
     // ── GPU Inference Tests ──────────────────────────────────────────────────
