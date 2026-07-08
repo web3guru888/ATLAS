@@ -57,6 +57,7 @@
 pub mod engine;
 pub mod hook;
 pub mod streaming;
+pub mod spec_decode;
 
 pub use engine::InferEngine;
 pub use hook::StigmergicHook;
