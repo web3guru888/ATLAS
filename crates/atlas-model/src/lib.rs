@@ -633,9 +633,44 @@ impl Linear {
         self.gpu_mat.sgemm_vec(x, 1)
     }
 
-    /// Batch forward: X[seq_len × in_dim] → Y[seq_len × out_dim].
-    /// Each token is dispatched via GPU SGEMM if available.
+    /// Batch forward: X[seq_len × in_dim] (token-major) → Y[seq_len × out_dim].
+    ///
+    /// #22 batched prefill: for `seq_len > 1` this issues ONE GEMM over the
+    /// whole chunk instead of `seq_len` GEMVs — the weight matrix streams
+    /// through the GPU once per chunk instead of once per token, which is
+    /// the entire prefill win. `GpuMatrix::sgemm` expects the activations as
+    /// `[in_dim × seq_len]` row-major (each *column* one token), so X is
+    /// transposed on the way in and Y back on the way out — O(seq·dim) CPU
+    /// copies, negligible next to the GEMM itself.
+    ///
+    /// Falls back to the per-token path when the batch GEMM is unavailable:
+    /// no CUDA, W4 weights (GEMV-only until #22 Step 2 lands in
+    /// atlas-tensor), or a failed kernel launch. The fallback is exactly the
+    /// pre-#22 behaviour, including its CPU fallbacks — never silently wrong.
     fn forward_batch(&self, x: &[f32], seq_len: usize, y: &mut [f32]) {
+        assert_eq!(x.len(), seq_len * self.in_dim);
+        assert_eq!(y.len(), seq_len * self.out_dim);
+        if seq_len > 1 && self.gpu_mat.is_on_gpu() && !self.gpu_mat.is_w4() {
+            // Transpose X: [seq × in] token-major → [in × seq] for sgemm.
+            let mut xt = vec![0.0f32; x.len()];
+            for s in 0..seq_len {
+                let row = &x[s * self.in_dim .. (s+1) * self.in_dim];
+                for (i, &v) in row.iter().enumerate() {
+                    xt[i * seq_len + s] = v;
+                }
+            }
+            let mut yt = vec![0.0f32; y.len()];
+            if self.gpu_mat.sgemm(&xt, self.in_dim, seq_len, &mut yt) {
+                // Transpose Y back: [out × seq] → [seq × out] token-major.
+                for s in 0..seq_len {
+                    let row = &mut y[s * self.out_dim .. (s+1) * self.out_dim];
+                    for (o, v) in row.iter_mut().enumerate() {
+                        *v = yt[o * seq_len + s];
+                    }
+                }
+                return;
+            }
+        }
         for s in 0..seq_len {
             self.forward(
                 &x[s * self.in_dim .. (s+1) * self.in_dim],
@@ -878,6 +913,104 @@ impl Attention {
         // Output projection
         let mut result = vec![0.0f32; d];
         self.wo.forward(&out, &mut result);
+        result
+    }
+
+    /// Chunked-prefill attention (#22). `x`: [m × d_model] token-major for
+    /// positions `start..start+m` → returns [m × d_model].
+    ///
+    /// Structure (scoping doc §2 Step 1):
+    /// ① Q/K/V projections as ONE GEMM each over the m-token chunk
+    ///    (`Linear::forward_batch`) — this removes the m× re-streaming of
+    ///    the projection weights that made prefill run at decode speed.
+    /// ② Per token: QK-norm (full-projection RMS, identical to
+    ///    `forward_token`), RoPE at the absolute position, KV-cache write
+    ///    (CPU cache + GPU lock-step backfill, same as the CPU path).
+    /// ③ Attention per token over the KV cache — bit-identical math and
+    ///    sliding-window masking to `forward_token`. Causality holds for ANY
+    ///    chunk size: all chunk K/V are written in ② before any attention
+    ///    runs, and token `s` only reads cache[0..=start+s]; SWA masking uses
+    ///    absolute distances, so no chunk ≤ window clamp is required.
+    /// ④ Output projection as one GEMM.
+    fn forward_chunk(&mut self, x: &[f32], start: usize, m: usize, rope: &RopeCache) -> Vec<f32> {
+        // Attention below reads the CPU cache — make sure it holds any
+        // history the full-GPU decode path wrote only to VRAM.
+        self.sync_cpu_cache_from_gpu(start);
+
+        let d  = self.n_heads * self.head_dim;
+        let kv = self.n_kv_heads * self.head_dim;
+
+        // ① Batched QKV projections.
+        let mut q = vec![0.0f32; m * d];
+        let mut k = vec![0.0f32; m * kv];
+        let mut v = vec![0.0f32; m * kv];
+        self.wq.forward_batch(x, m, &mut q);
+        self.wk.forward_batch(x, m, &mut k);
+        self.wv.forward_batch(x, m, &mut v);
+
+        // ② QK-norm + RoPE + KV-cache write, per token.
+        for s in 0..m {
+            let pos = start + s;
+            let q_s = &mut q[s*d .. (s+1)*d];
+            if !self.q_norm.is_empty() {
+                rmsnorm_inplace(q_s, &self.q_norm, 1e-6);
+            }
+            let k_s = &mut k[s*kv .. (s+1)*kv];
+            if !self.k_norm.is_empty() {
+                rmsnorm_inplace(k_s, &self.k_norm, 1e-6);
+            }
+            for h in 0..self.n_heads {
+                rope.apply(&mut q_s[h*self.head_dim..(h+1)*self.head_dim], pos);
+            }
+            for h in 0..self.n_kv_heads {
+                rope.apply(&mut k_s[h*self.head_dim..(h+1)*self.head_dim], pos);
+            }
+            let v_s = &v[s*kv .. (s+1)*kv];
+            for h in 0..self.n_kv_heads {
+                self.kv_cache.write_key(pos, h, &k_s[h*self.head_dim..(h+1)*self.head_dim]);
+                self.kv_cache.write_val(pos, h, &v_s[h*self.head_dim..(h+1)*self.head_dim]);
+            }
+            if pos == self.cpu_synced_upto { self.cpu_synced_upto = pos + 1; }
+            let (k_s, v_s) = (&k[s*kv .. (s+1)*kv], &v[s*kv .. (s+1)*kv]);
+            self.backfill_kv_to_gpu(pos, k_s, v_s);
+        }
+
+        // ③ Per-token attention over the KV cache (same math as forward_token).
+        let group = self.n_heads / self.n_kv_heads;
+        let mut out = vec![0.0f32; m * d];
+        let mut scores: Vec<f32> = Vec::with_capacity(start + m);
+        for s in 0..m {
+            let pos = start + s;
+            scores.clear();
+            scores.resize(pos + 1, 0.0);
+            let q_s = &q[s*d .. (s+1)*d];
+            let o_s = &mut out[s*d .. (s+1)*d];
+            for h in 0..self.n_heads {
+                let kv_h = h / group;
+                let q_h = &q_s[h*self.head_dim..(h+1)*self.head_dim];
+                for t in 0..=pos {
+                    let masked = self.window_size.map_or(false, |w| pos - t >= w);
+                    if masked {
+                        scores[t] = f32::NEG_INFINITY;
+                    } else {
+                        let k_t = self.kv_cache.key(t, kv_h);
+                        let score: f32 = q_h.iter().zip(k_t.iter()).map(|(&qi, &ki)| qi * ki).sum();
+                        scores[t] = score * self.scale;
+                    }
+                }
+                softmax_inplace(&mut scores[..pos+1]);
+                let o_h = &mut o_s[h*self.head_dim..(h+1)*self.head_dim];
+                for t in 0..=pos {
+                    let v_t = self.kv_cache.val(t, kv_h);
+                    let a = scores[t];
+                    for (oi, &vi) in o_h.iter_mut().zip(v_t.iter()) { *oi += a * vi; }
+                }
+            }
+        }
+
+        // ④ Batched output projection.
+        let mut result = vec![0.0f32; m * d];
+        self.wo.forward_batch(&out, m, &mut result);
         result
     }
 
@@ -1144,6 +1277,23 @@ impl FeedForward {
         self.w_down.forward(&hidden, &mut out);
         out
     }
+
+    /// Chunked SwiGLU FFN (#22): gate/up/down each as ONE GEMM over the
+    /// m-token chunk. x: [m × d_model] token-major → [m × d_model].
+    fn forward_chunk(&self, x: &[f32], m: usize) -> Vec<f32> {
+        let h = self.w_gate.out_dim;
+        let mut gate = vec![0.0f32; m * h];
+        let mut up   = vec![0.0f32; m * h];
+        self.w_gate.forward_batch(x, m, &mut gate);
+        self.w_up.forward_batch(x, m, &mut up);
+        // SwiGLU fuse (elementwise — token layout irrelevant)
+        let hidden: Vec<f32> = gate.iter().zip(up.iter())
+            .map(|(&g, &u)| silu(g) * u)
+            .collect();
+        let mut out = vec![0.0f32; m * self.w_down.out_dim];
+        self.w_down.forward_batch(&hidden, m, &mut out);
+        out
+    }
 }
 
 // ── Transformer Block ─────────────────────────────────────────────────────
@@ -1228,6 +1378,48 @@ impl TransformerBlock {
             let mut x_norm2 = x.clone();
             rmsnorm_inplace(&mut x_norm2, &self.ffn_norm, self.eps);
             let ffn_out = self.ffn.forward(&x_norm2);
+            for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) { *xi += fi; }
+        }
+    }
+
+    /// Chunked-prefill transformer block (#22): attention QKV/out-proj and
+    /// FFN gate/up/down run as one GEMM each over the m-token chunk; norms
+    /// and residual adds run per token on the CPU (O(m·d) — negligible).
+    /// Norm/residual ordering is identical to `forward_token_cpu` for both
+    /// the OLMo-2/3 post-norm and Llama pre-norm variants.
+    ///
+    /// x: [m × d_model] token-major for positions `start..start+m`,
+    /// modified in place.
+    fn forward_chunk(&mut self, x: &mut [f32], start: usize, m: usize, rope: &RopeCache) {
+        let d = self.d_model;
+        if self.post_norm {
+            // OLMo-2/3 post-norm: norm the sub-layer OUTPUT, then residual add.
+            let mut attn_out = self.attn.forward_chunk(x, start, m, rope);
+            for s in 0..m {
+                let row = &mut attn_out[s*d..(s+1)*d];
+                rmsnorm_inplace(row, &self.attn_norm, self.eps);
+                for (xi, &ni) in x[s*d..(s+1)*d].iter_mut().zip(row.iter()) { *xi += ni; }
+            }
+            let mut ffn_out = self.ffn.forward_chunk(x, m);
+            for s in 0..m {
+                let row = &mut ffn_out[s*d..(s+1)*d];
+                rmsnorm_inplace(row, &self.ffn_norm, self.eps);
+                for (xi, &ni) in x[s*d..(s+1)*d].iter_mut().zip(row.iter()) { *xi += ni; }
+            }
+        } else {
+            // Llama pre-norm: norm before attention and FFN.
+            let mut x_norm = x.to_vec();
+            for s in 0..m {
+                rmsnorm_inplace(&mut x_norm[s*d..(s+1)*d], &self.attn_norm, self.eps);
+            }
+            let attn_out = self.attn.forward_chunk(&x_norm, start, m, rope);
+            for (xi, &ai) in x.iter_mut().zip(attn_out.iter()) { *xi += ai; }
+
+            let mut x_norm2 = x.to_vec();
+            for s in 0..m {
+                rmsnorm_inplace(&mut x_norm2[s*d..(s+1)*d], &self.ffn_norm, self.eps);
+            }
+            let ffn_out = self.ffn.forward_chunk(&x_norm2, m);
             for (xi, &fi) in x.iter_mut().zip(ffn_out.iter()) { *xi += fi; }
         }
     }
@@ -1753,23 +1945,64 @@ impl OlmoModel {
     /// Process a chunk of prompt tokens; returns logits for the LAST token
     /// in the chunk.
     ///
-    /// WIP #22 (batched prefill): this is the seam where the chunked-GEMM
-    /// prefill path lands. The current body is the exact per-token loop the
-    /// callers used before (GPU forward with per-token CPU fallback), so all
-    /// semantics — KV-cache state, `pos` advancement, `gpu_poisoned`
-    /// handling — are unchanged. A follow-up commit replaces the body with:
-    /// one QKV/out-proj/FFN GEMM over the whole chunk + per-token attention
-    /// over the KV cache (see issue #22 scoping doc).
+    /// #22 batched prefill: for chunks of ≥ 2 tokens this runs the
+    /// chunked-GEMM path — per layer, QKV / out-proj / FFN each execute as
+    /// ONE GEMM over the whole chunk ([`TransformerBlock::forward_chunk`]),
+    /// so the model weights stream through the GPU once per chunk instead of
+    /// once per token. Attention itself stays per-token over the KV cache
+    /// (exact causality + SWA masking for any chunk size). The LM head runs
+    /// only for the final chunk token — the legacy loop computed and
+    /// discarded a full-vocab projection for every prompt token.
+    ///
+    /// Chunk size 1 keeps the exact legacy per-token contract (full-GPU
+    /// decode path with per-token CPU fallback and `gpu_poisoned` handling).
+    /// The chunked path needs no poison/rollback machinery: every GEMM
+    /// falls back per token (and ultimately to CPU) inside
+    /// [`Linear::forward_batch`], the CPU KV cache is written directly, and
+    /// GPU KV backfill failures degrade via the existing `gpu_kv_stale`
+    /// flag — never silently wrong.
+    ///
+    /// W4 weights (32B) still take the per-token GEMV inside
+    /// `forward_batch` until the atlas-tensor batch path lands (#22 Step 2)
+    /// — same speed as before, not slower; BF16/F32 models get the full
+    /// GEMM win immediately.
     pub fn prefill_chunk(&mut self, tokens: &[u32]) -> Vec<f32> {
-        let mut last = Vec::new();
-        for &tok in tokens {
-            last = if let Some(gl) = self.forward_one_gpu(tok) {
+        let m = tokens.len();
+        if m == 0 { return Vec::new(); }
+        if m == 1 {
+            // Legacy per-token contract — bit-exact pre-#22 behaviour.
+            return if let Some(gl) = self.forward_one_gpu(tokens[0]) {
                 gl
             } else {
-                self.forward_one(tok)
+                self.forward_one(tokens[0])
             };
         }
-        last
+
+        let start = self.pos;
+        let d = self.config.d_model;
+
+        // Embed the whole chunk: [m × d_model] token-major.
+        let mut x = self.embed.forward(tokens);
+
+        // Per-layer chunked forward. Same borrow-split pattern as
+        // `forward_one_hooked`: rope caches don't overlap layer data.
+        let rope_full:  *const RopeCache = &self.rope;
+        let rope_local: *const RopeCache = &self.rope_local;
+        for layer in self.layers.iter_mut() {
+            // Sliding-window layers use unscaled RoPE; full layers use YaRN.
+            let rope = unsafe {
+                if layer.attn.window_size.is_some() { &*rope_local } else { &*rope_full }
+            };
+            layer.forward_chunk(&mut x, start, m, rope);
+        }
+        self.pos = start + m;
+
+        // Final norm + LM head for the LAST token only.
+        let mut last = x[(m-1)*d .. m*d].to_vec();
+        rmsnorm_inplace(&mut last, &self.norm, self.config.rms_norm_eps);
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.lm_head.forward(&last, &mut logits);
+        logits
     }
 
     /// Forward pass for one new token. Returns logits [vocab_size].
@@ -4708,6 +4941,64 @@ mod tests {
 
         assert_eq!(out_per_token, out_chunked,
             "chunked prefill diverged from per-token prefill");
+    }
+
+    /// #22 batched prefill: `Linear::forward_batch` (single GEMM for n>1)
+    /// must match the per-token `forward` path. Tolerance covers the GEMM
+    /// (TF32) vs GEMV low-bit drift; on CPU-only builds both paths are
+    /// identical dot products.
+    #[test]
+    fn linear_forward_batch_matches_per_token() {
+        let (in_dim, out_dim, m) = (64usize, 48usize, 5usize);
+        let lin = Linear::new(in_dim, out_dim, 7);
+        let x = pseudo_randn(m * in_dim, 42);
+        let mut y_batch = vec![0.0f32; m * out_dim];
+        lin.forward_batch(&x, m, &mut y_batch);
+        let mut y_ref = vec![0.0f32; m * out_dim];
+        for s in 0..m {
+            lin.forward(&x[s*in_dim..(s+1)*in_dim],
+                        &mut y_ref[s*out_dim..(s+1)*out_dim]);
+        }
+        let max_err = y_batch.iter().zip(y_ref.iter())
+            .map(|(&a, &b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_err < 1e-3,
+            "forward_batch diverged from per-token forward: max_err={max_err:.2e}");
+    }
+
+    /// #22 batched prefill parity on an OLMo-3-style tiny model:
+    /// post-norm + QK-norm + one sliding-window layer, with a chunk LARGER
+    /// than the SWA window (masking must still be exact) — covers the
+    /// branches `ModelConfig::tiny()` (pre-norm, no QK-norm, no SWA) misses.
+    #[test]
+    fn chunked_prefill_parity_postnorm_qknorm_swa() {
+        fn olmo_style_tiny() -> OlmoModel {
+            let mut model = OlmoModel::new(ModelConfig::tiny());
+            let d = 64; // n_heads * head_dim
+            let kv = 32; // n_kv_heads * head_dim
+            for (i, layer) in model.layers.iter_mut().enumerate() {
+                layer.post_norm = true;
+                layer.attn.q_norm = pseudo_randn(d, 900 + i as u64)
+                    .into_iter().map(|v| 1.0 + 0.05 * v).collect();
+                layer.attn.k_norm = pseudo_randn(kv, 950 + i as u64)
+                    .into_iter().map(|v| 1.0 + 0.05 * v).collect();
+            }
+            // Layer 1 sliding-window (uses rope_local + SWA masking).
+            model.layers[1].attn.window_size = Some(3);
+            model
+        }
+        let prompt = [0u32, 1, 2, 3, 4, 5, 6, 7]; // 8 tokens > window 3
+        let cfg = SamplingConfig { temperature: 0.0, ..Default::default() };
+
+        let mut per_token = olmo_style_tiny();
+        per_token.set_prefill_chunk_tokens(1);
+        let out_per_token = per_token.generate_with_sampling(&prompt, 3, &cfg);
+
+        let mut chunked = olmo_style_tiny();
+        chunked.set_prefill_chunk_tokens(5); // chunk 5 > window 3; chunks 5/3
+        let out_chunked = chunked.generate_with_sampling(&prompt, 3, &cfg);
+
+        assert_eq!(out_per_token, out_chunked,
+            "chunked prefill diverged on post-norm/QK-norm/SWA model");
     }
 
     // ── GPU Inference Tests ──────────────────────────────────────────────────
