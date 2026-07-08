@@ -240,6 +240,37 @@ impl InferEngine {
             }
         }
     }
+
+    /// Continue generation from the CURRENT KV state without resetting:
+    /// force-feed `forced` tokens, then decode up to `max_new` more.
+    ///
+    /// Used by the API layer's think-budget answer reserve: when a Think
+    /// model exhausts `max_tokens` inside its `<think>` block, the handler
+    /// injects a `</think>` close and lets the model produce the visible
+    /// answer from the intact KV cache — no re-prefill.
+    ///
+    /// No-hook path only (the API server attaches no hook); with a hook
+    /// configured this is a no-op returning 0.
+    pub fn continue_streaming_events<F>(
+        &mut self,
+        forced: &[u32],
+        max_new: usize,
+        cfg: &SamplingConfig,
+        mut on_event: F,
+    ) -> usize
+    where
+        F: FnMut(GenEvent, Option<PheromoneDeposit>) -> bool,
+    {
+        if self.hook.is_some() {
+            return 0;
+        }
+        let mut count = 0usize;
+        self.model.continue_streaming_events(forced, max_new, cfg, |ev| {
+            if matches!(ev, GenEvent::Token(_)) { count += 1; }
+            on_event(ev, None)
+        });
+        count
+    }
 }
 
 #[cfg(test)]
@@ -274,6 +305,41 @@ mod tests {
             });
         assert_eq!(prefills, 3, "one prefill event per prompt token");
         assert_eq!(n, toks, "returned count must match token events");
+    }
+
+    /// Answer-reserve continuation (think-budget recovery): after a capped
+    /// generate, `continue_streaming_events` must resume greedily and emit
+    /// exactly the tokens the uninterrupted run would have produced.
+    #[test]
+    fn no_hook_continue_streaming_events_resumes_exactly() {
+        let greedy = SamplingConfig { temperature: 0.0, ..Default::default() };
+        let prompt = [0u32, 1, 2];
+
+        // Reference: uninterrupted 8-token generation.
+        let mut e1 = tiny_engine();
+        let mut full: Vec<u32> = Vec::new();
+        e1.generate_streaming_events(&prompt, 8, &greedy, |ev, _| {
+            if let GenEvent::Token(t) = ev { full.push(t); }
+            true
+        });
+        assert!(full.len() >= 4);
+
+        // Split: cap at 3, force-feed the 4th reference token, continue.
+        let mut e2 = tiny_engine();
+        let mut head: Vec<u32> = Vec::new();
+        e2.generate_streaming_events(&prompt, 3, &greedy, |ev, _| {
+            if let GenEvent::Token(t) = ev { head.push(t); }
+            true
+        });
+        assert_eq!(head[..], full[..3]);
+        let mut tail: Vec<u32> = Vec::new();
+        let n = e2.continue_streaming_events(&[full[3]], full.len() - 4, &greedy, |ev, dep| {
+            assert!(dep.is_none(), "no hook → no deposits");
+            if let GenEvent::Token(t) = ev { tail.push(t); }
+            true
+        });
+        assert_eq!(n, tail.len());
+        assert_eq!(tail[..], full[4..], "continuation must be exact (greedy)");
     }
 
     #[test]

@@ -104,7 +104,9 @@ pub struct ChatCompletionRequest {
     pub model: String,
     /// Conversation messages.
     pub messages: Vec<ChatMessage>,
-    /// Max tokens to generate (default 256).
+    /// Max tokens to generate (default 2048 — Think models need budget for
+    /// the reasoning block AND the visible answer; see also the handler's
+    /// `ATLAS_ANSWER_RESERVE` think-budget recovery).
     pub max_tokens: usize,
     /// Sampling temperature (0.0 = greedy).
     pub temperature: f32,
@@ -139,9 +141,11 @@ impl ChatCompletionRequest {
             .and_then(|a| a.as_array())
             .map(|arr| arr.iter().filter_map(ChatMessage::from_json).collect())
             .unwrap_or_default();
+        // Default 2048: Think models emit a (long) reasoning block before the
+        // visible answer — 512 truncated mid-think for nontrivial questions.
         let max_tokens = v.get("max_tokens")
             .and_then(|x| x.as_usize())
-            .unwrap_or(512);
+            .unwrap_or(2048);
         let temperature = v.get("temperature")
             .and_then(|x| x.as_f64())
             .unwrap_or(0.0) as f32;
@@ -659,7 +663,8 @@ mod tests {
         // Defaults now come from SamplingConfig::olmo3() to prevent repetition loops
         let req = ChatCompletionRequest::parse(r#"{"messages":[]}"#).unwrap();
         let olmo3 = atlas_model::SamplingConfig::olmo3();
-        assert_eq!(req.max_tokens, 512);
+        // 2048 default: Think models need reasoning + answer headroom.
+        assert_eq!(req.max_tokens, 2048);
         assert_eq!(req.temperature, 0.0);
         assert!(!req.stream);
         assert!((req.top_p - olmo3.top_p).abs() < 0.01);

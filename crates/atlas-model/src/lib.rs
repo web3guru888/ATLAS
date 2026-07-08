@@ -2713,7 +2713,6 @@ impl OlmoModel {
         self.reset();
         self.rng = Rng::from_entropy();
 
-        let mut new_tokens: Vec<u32> = Vec::new();
         let mut last_logits = vec![0.0f32; self.config.vocab_size];
 
         // Process prompt in chunks, reporting progress after each chunk
@@ -2725,17 +2724,83 @@ impl OlmoModel {
             last_logits = self.prefill_chunk(toks);
             done += toks.len();
             if !on_event(GenEvent::Prefill { done, total }) {
-                return new_tokens; // client gone — abort before decode
+                return Vec::new(); // client gone — abort before decode
             }
         }
 
+        // Prompt fully prefilled — decode from here.
+        self.decode_stream_loop(last_logits, max_new, config, true, &mut on_event)
+    }
+
+    /// Continue generation from the CURRENT model state (no KV reset):
+    /// force-feed `forced` tokens (e.g. a `</think>\n\n` close injected by
+    /// the API layer's answer-reserve recovery), then decode up to `max_new`
+    /// further tokens with the same sampling pipeline.
+    ///
+    /// Unlike [`Self::generate_streaming_events`] this does NOT reset the KV
+    /// cache, position counter, or RNG — the continuation is exact: logits
+    /// are identical to what the model would have produced had `forced` been
+    /// sampled during the original call. Returns only the newly sampled
+    /// tokens (`forced` is not echoed back).
+    ///
+    /// Returns an empty Vec if `forced` is empty or if forced + 1 generated
+    /// token would overflow the remaining KV/RoPE capacity.
+    pub fn continue_streaming_events<F>(
+        &mut self,
+        forced: &[u32],
+        max_new: usize,
+        config: &SamplingConfig,
+        mut on_event: F,
+    ) -> Vec<u32>
+    where
+        F: FnMut(GenEvent) -> bool,
+    {
+        // Capacity guard: forced + generated must fit the remaining
+        // KV/RoPE room (same overflow rule as the API layer's ctx clamp).
+        let room = self.config.max_seq_len.saturating_sub(self.pos);
+        if forced.is_empty() || room <= forced.len() {
+            return Vec::new();
+        }
+        let max_new = max_new.min(room - forced.len());
+
+        let mut last_logits = vec![0.0f32; self.config.vocab_size];
+        for &t in forced {
+            last_logits = if let Some(gl) = self.forward_one_gpu(t) {
+                gl
+            } else {
+                self.forward_one(t)
+            };
+        }
+        // No first-token suppression: the continuation is mid-sequence.
+        self.decode_stream_loop(last_logits, max_new, config, false, &mut on_event)
+    }
+
+    /// Shared decode loop for [`Self::generate_streaming_events`] and
+    /// [`Self::continue_streaming_events`]: sample from `last_logits`, emit
+    /// [`GenEvent::Token`] per accepted token, forward it, repeat.
+    ///
+    /// `suppress_first` applies `config.suppress_initial_tokens` to the very
+    /// first sampled token (fresh-generation semantics); continuations pass
+    /// `false` because they are mid-sequence.
+    fn decode_stream_loop<F>(
+        &mut self,
+        mut last_logits: Vec<f32>,
+        max_new: usize,
+        config: &SamplingConfig,
+        suppress_first: bool,
+        on_event: &mut F,
+    ) -> Vec<u32>
+    where
+        F: FnMut(GenEvent) -> bool,
+    {
+        let mut new_tokens: Vec<u32> = Vec::new();
         let mut token_history: Vec<u32> = Vec::new();
 
         for _step in 0..max_new {
             let next = if config.temperature <= 0.0 || config.temperature < 1e-6 {
                 let mut logits = last_logits.clone();
                 // Initial token suppression (prevent <think> on first token)
-                if _step == 0 {
+                if _step == 0 && suppress_first {
                     for &tid in &config.suppress_initial_tokens {
                         if (tid as usize) < logits.len() {
                             logits[tid as usize] = f32::NEG_INFINITY;
@@ -2752,7 +2817,7 @@ impl OlmoModel {
             } else {
                 let mut logits = last_logits.clone();
                 // Initial token suppression (prevent <think> on first token)
-                if _step == 0 {
+                if _step == 0 && suppress_first {
                     for &tid in &config.suppress_initial_tokens {
                         if (tid as usize) < logits.len() {
                             logits[tid as usize] = f32::NEG_INFINITY;
@@ -5026,6 +5091,56 @@ mod tests {
         // Token events match the returned tokens.
         assert_eq!(tokens, out);
         assert!(!out.is_empty());
+    }
+
+    /// Answer-reserve continuation: `continue_streaming_events` after a
+    /// budget-capped `generate_streaming_events` must be EXACT — token-for-
+    /// token identical (greedy) to a single uninterrupted generation where
+    /// the forced tokens happen to be sampled at the split point.
+    #[test]
+    fn continue_streaming_events_matches_uninterrupted_generation() {
+        let cfg = ModelConfig::tiny();
+        let greedy = SamplingConfig { temperature: 0.0, ..Default::default() };
+        let prompt = [0u32, 1, 2, 3];
+
+        // Reference: one uninterrupted 8-token greedy generation.
+        let mut m1 = OlmoModel::new(cfg.clone());
+        let full = m1.generate_streaming_events(&prompt, 8, &greedy, |_| true);
+        assert!(full.len() >= 4, "tiny model must generate enough tokens");
+
+        // Split run: generate 3, then force-feed tokens 3..k and continue.
+        let mut m2 = OlmoModel::new(cfg);
+        let head = m2.generate_streaming_events(&prompt, 3, &greedy, |_| true);
+        assert_eq!(head[..], full[..3], "head must match reference prefix");
+        // Force the next reference token as if the API layer injected it.
+        let forced = [full[3]];
+        let mut streamed: Vec<u32> = Vec::new();
+        let tail = m2.continue_streaming_events(&forced, full.len() - 4, &greedy, |ev| {
+            if let GenEvent::Token(t) = ev { streamed.push(t); }
+            true
+        });
+        assert_eq!(tail, streamed, "callback tokens must match return value");
+        assert_eq!(tail[..], full[4..], "continuation must be exact (greedy)");
+    }
+
+    /// Continuation refuses to run past the KV/RoPE capacity and returns
+    /// empty for empty forced input.
+    #[test]
+    fn continue_streaming_events_guards() {
+        let cfg = ModelConfig::tiny();
+        let greedy = SamplingConfig { temperature: 0.0, ..Default::default() };
+        let mut model = OlmoModel::new(cfg.clone());
+        let _ = model.generate_streaming_events(&[0u32, 1], 2, &greedy, |_| true);
+
+        // Empty forced input → no-op.
+        assert!(model.continue_streaming_events(&[], 8, &greedy, |_| true).is_empty());
+
+        // Fill to capacity → continuation refuses (no OOB positions).
+        let room = cfg.max_seq_len - model.pos; // tests are a child module — private field OK
+        let filler: Vec<u32> = vec![1; room];
+        model.prefill_chunk(&filler[..room.min(filler.len())]);
+        assert!(model.continue_streaming_events(&[1, 2], 4, &greedy, |_| true).is_empty(),
+                "must refuse when forced tokens don't fit remaining capacity");
     }
 
     #[test]

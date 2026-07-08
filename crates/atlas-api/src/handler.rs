@@ -480,15 +480,27 @@ pub fn handle_inference(
 /// `ATLAS_REQUEST_DEADLINE_SECS` wall-clock deadline expires, instead of
 /// generating to completion for a dead socket while real traffic queues.
 ///
-/// Returns `(generated_text, prompt_token_count, completion_token_count, cancelled)`.
+/// Returns `(generated_text, prompt_token_count, completion_token_count,
+/// cancelled, hit_length)`.
+///
+/// `think_reserve = true` enables the Think-model answer reserve: if the
+/// token budget is exhausted while still inside the `<think>` block (no
+/// `</think>` was emitted), the think block is force-closed and generation
+/// CONTINUES from the intact KV cache for up to
+/// `ATLAS_ANSWER_RESERVE` (default 512) extra tokens so the visible answer
+/// is never lost to the reasoning budget. `hit_length` is true only if the
+/// FINAL segment of generation was cut by a budget (i.e. the answer itself
+/// may be truncated), so callers can report `finish_reason` correctly.
 fn run_inference(
     state: &Arc<Mutex<InferState>>,
     prompt: &str,
     max_tokens: usize,
     config: &SamplingConfig,
     client: &TcpStream,
-) -> (String, usize, usize, Option<CancelReason>) {
+    think_reserve: bool,
+) -> (String, usize, usize, Option<CancelReason>, bool) {
     let mut st = state.lock().unwrap();
+    let st = &mut *st;
 
     // Encode prompt
     let prompt_tokens: Vec<u32> = if let Some(ref tok) = st.tokenizer {
@@ -526,17 +538,61 @@ fn run_inference(
             new_tokens.len()
         );
     }
-    let completion_count = new_tokens.len();
+    let mut completion_count = new_tokens.len();
+    let mut hit_length = max_tokens > 0 && completion_count >= max_tokens;
 
     // Decode
-    let output = if let Some(ref tok) = st.tokenizer {
+    let mut output = if let Some(ref tok) = st.tokenizer {
         tok.decode(&new_tokens)
     } else {
         let bytes: Vec<u8> = new_tokens.iter().map(|&t| (t % 256) as u8).collect();
         String::from_utf8_lossy(&bytes).to_string()
     };
 
-    (output, prompt_count, completion_count, watch.cancelled)
+    // Think-budget answer reserve: the budget ran out while the model was
+    // still thinking — force-close the think block and let it answer from
+    // the intact KV cache (cheap: no re-prefill). See module docs.
+    if think_reserve && hit_length && watch.cancelled.is_none()
+        && !output.contains("</think>")
+    {
+        let reserve = answer_reserve_tokens();
+        if reserve > 0 {
+            if let (Some(engine), Some(tok)) = (st.model.as_mut(), st.tokenizer.as_ref()) {
+                const THINK_CLOSE: &str = "\n</think>\n\n";
+                let forced = tok.encode(THINK_CLOSE);
+                let mut extra: Vec<u32> = Vec::new();
+                engine.continue_streaming_events(&forced, reserve, config, |ev, _deposit| {
+                    if let GenEvent::Token(t) = ev {
+                        extra.push(t);
+                    }
+                    !watch.should_abort()
+                });
+                if !extra.is_empty() {
+                    output.push_str(THINK_CLOSE);
+                    output.push_str(&tok.decode(&extra));
+                    completion_count += forced.len() + extra.len();
+                    // The answer segment finished naturally (EOS) unless the
+                    // reserve itself was exhausted.
+                    hit_length = extra.len() >= reserve;
+                    eprintln!(
+                        "atlas-api: think budget exhausted — answer reserve recovered {} token(s)",
+                        extra.len()
+                    );
+                }
+            }
+        }
+    }
+
+    (output, prompt_count, completion_count, watch.cancelled, hit_length)
+}
+
+/// Answer-reserve size for Think models (tokens). `ATLAS_ANSWER_RESERVE`
+/// env override; default 512; `0` disables the reserve entirely.
+fn answer_reserve_tokens() -> usize {
+    std::env::var("ATLAS_ANSWER_RESERVE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(512)
 }
 
 fn handle_chat_nonstream(
@@ -558,8 +614,8 @@ fn handle_chat_nonstream(
         presence_penalty: req.presence_penalty,
         suppress_initial_tokens: olmo3.suppress_initial_tokens,
     };
-    let (content, prompt_tokens, completion_tokens, cancelled) =
-        run_inference(state, prompt, req.max_tokens, &config, stream);
+    let (content, prompt_tokens, completion_tokens, cancelled, hit_length) =
+        run_inference(state, prompt, req.max_tokens, &config, stream, true);
     if cancelled == Some(CancelReason::Disconnected) {
         return; // client is gone — nothing to write, slot already freed
     }
@@ -575,7 +631,7 @@ fn handle_chat_nonstream(
 
     let model_id = state.lock().unwrap().model_id.clone();
     // Deadline-cancelled requests return the partial completion as "length".
-    let finish   = if cancelled.is_some() || completion_tokens >= req.max_tokens { "length" } else { "stop" };
+    let finish   = if cancelled.is_some() || hit_length { "length" } else { "stop" };
     let resp = ChatCompletionResponse {
         id: id.to_string(), created: unix_ts(),
         model: model_id, content, reasoning,
@@ -949,11 +1005,69 @@ fn handle_chat_stream(
         );
     }
 
+    // Think-budget answer reserve (streaming): the token budget ran out while
+    // the model was still inside its <think> block — the client saw only
+    // reasoning deltas and would get NO visible answer. Force-close the think
+    // block and continue decoding from the intact KV cache (no re-prefill)
+    // for up to ATLAS_ANSWER_RESERVE extra tokens, streamed as normal
+    // content deltas.
+    let mut hit_length = max_tokens > 0 && token_count >= max_tokens;
+    if in_think_block && hit_length && watch.cancelled.is_none() && write_ok {
+        let reserve = answer_reserve_tokens();
+        if reserve > 0 {
+            if let Some(ref tok) = tokenizer {
+                const THINK_CLOSE: &str = "\n</think>\n\n";
+                let forced = tok.encode(THINK_CLOSE);
+                let mut reserve_count: usize = 0;
+                model.continue_streaming_events(
+                    &forced,
+                    reserve,
+                    &config,
+                    |ev, _deposit| {
+                        if watch.should_abort() {
+                            if watch.cancelled == Some(CancelReason::Disconnected) {
+                                write_ok = false;
+                            }
+                            return false;
+                        }
+                        let tok_id = match ev {
+                            GenEvent::Prefill { .. } => return true,
+                            GenEvent::Token(t) => t,
+                        };
+                        reserve_count += 1;
+                        token_count += 1;
+                        let text = tok.decode(&[tok_id]);
+                        let chunk = StreamChunk {
+                            id: id_owned.clone(),
+                            model: model_id.clone(),
+                            delta: text, is_reasoning: false,
+                            done: false,
+                            finish_reason: None,
+                            usage: None,
+                        };
+                        match write_sse_chunk(stream, &chunk.to_sse()) {
+                            Ok(()) => { last_write = Instant::now(); true }
+                            Err(_) => { write_ok = false; false }
+                        }
+                    },
+                );
+                if reserve_count > 0 {
+                    // Answer recovered: only "length" if the reserve itself
+                    // was also exhausted.
+                    hit_length = reserve_count >= reserve;
+                    eprintln!(
+                        "atlas-api: think budget exhausted — answer reserve recovered {reserve_count} token(s) (streaming)"
+                    );
+                }
+            }
+        }
+    }
+
     // Write final finish-reason chunk (with usage — required by OpenRouter
     // for streaming responses) + [DONE] sentinel. A deadline-cancelled stream
     // still terminates cleanly for the (connected) client as "length".
     if write_ok {
-        let finish: &'static str = if watch.cancelled.is_some() || token_count >= max_tokens { "length" } else { "stop" };
+        let finish: &'static str = if watch.cancelled.is_some() || hit_length { "length" } else { "stop" };
         let final_chunk = StreamChunk {
             id: id_owned.clone(),
             model: model_id.clone(),
@@ -997,13 +1111,15 @@ fn handle_completion(
         presence_penalty: req.presence_penalty,
         suppress_initial_tokens: olmo3.suppress_initial_tokens,
     };
-    let (text, prompt_tokens, completion_tokens, cancelled) =
-        run_inference(state, &req.prompt, req.max_tokens, &config, stream);
+    // Raw /v1/completions is template-free: no think-reserve (callers manage
+    // their own prompt format, e.g. think-prefill probing).
+    let (text, prompt_tokens, completion_tokens, cancelled, hit_length) =
+        run_inference(state, &req.prompt, req.max_tokens, &config, stream, false);
     if cancelled == Some(CancelReason::Disconnected) {
         return; // client is gone — nothing to write, slot already freed
     }
     let model_id = state.lock().unwrap().model_id.clone();
-    let finish   = if cancelled.is_some() || completion_tokens >= req.max_tokens { "length" } else { "stop" };
+    let finish   = if cancelled.is_some() || hit_length { "length" } else { "stop" };
     let resp = CompletionResponse {
         id: id.to_string(), created: unix_ts(),
         model: model_id, text,
@@ -1243,12 +1359,19 @@ mod tests {
         }));
         let config = SamplingConfig { temperature: 0.0, ..SamplingConfig::default() };
         let (server_side, _client) = socket_pair();
-        let (text, prompt_count, completion_count, cancelled) =
-            run_inference(&state, "hello world", 10, &config, &server_side);
+        let (text, prompt_count, completion_count, cancelled, hit_length) =
+            run_inference(&state, "hello world", 10, &config, &server_side, true);
         assert_eq!(text, "");              // no model → empty
         assert_eq!(completion_count, 0);
         assert_eq!(prompt_count, 11);      // byte-encode: "hello world" = 11 bytes
         assert_eq!(cancelled, None);       // connected client, no deadline
+        assert!(!hit_length);              // 0 tokens generated ≠ budget hit
+    }
+
+    #[test]
+    fn answer_reserve_default_is_512() {
+        // Env var not set under test → default.
+        assert_eq!(answer_reserve_tokens(), 512);
     }
 
     #[test]
