@@ -454,7 +454,7 @@ cargo build --release -p atlas-cli
 
 **631/631 tests passing** · **22 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **61.7 tok/s OLMo-3-7B-Think (BF16)** · **14.6 tok/s OLMo-3-32B-Think (W4A32)**
 
-> 🏔 **v4.2.0 is the current release.** 32B AWQ W4 inference on a single A100-40GB: `gemv_w4_kernel` + streaming shard loader fits within 27.2 GB VRAM — serving in production from branch [`feat/w4-32b`](https://github.com/web3guru888/ATLAS/tree/feat/w4-32b) (merge to `main` pending). Three silent inference-quality bugs fixed by differential testing against HuggingFace transformers. OpenRouter provider endpoints + bearer-key auth live behind Cloudflare tunnel. HF Space serving the 32B reasoning model. 631/631 tests on `main`. Batched prefill ([#22](https://github.com/web3guru888/ATLAS/issues/22)) is in active development on `feat/batched-prefill-wire`; disconnect-abort fix ([#25](https://github.com/web3guru888/ATLAS/issues/25)) ready on `fix/disconnect-abort`.
+> 🏔 **v4.2.0 is the current release.** 32B AWQ W4 inference on a single A100-40GB: `gemv_w4_kernel` + streaming shard loader fits within 27.2 GB VRAM — **now merged to `main` and serving in production** on the A100-40GB. Three silent inference-quality bugs fixed by differential testing against HuggingFace transformers. OpenRouter provider endpoints + bearer-key auth live behind Cloudflare tunnel. HF Space serving the 32B reasoning model. **Batched prefill ([#22](https://github.com/web3guru888/ATLAS/issues/22)) is MERGED (`main` @ `f96e3f7`) and DEPLOYED on the live 32B service (2026-07-08):** time-to-first-token at ~1.25K-token prompts dropped **121.8s → 23.4s (~5× live)**, greedy output bit-identical (parity gate passed). One GEMM per layer over all prompt positions replaces T sequential GEMV steps. Disconnect-abort fix ([#25](https://github.com/web3guru888/ATLAS/issues/25)) is ready on `fix/disconnect-abort` (deploy pending an announced restart window).
 
 ### What Works
 
@@ -611,6 +611,7 @@ cargo test --workspace --exclude atlas-tensor -- --ignored --nocapture
 - **61.7 tok/s** — GPU inference throughput (OLMo-3-7B-Think, BF16 W16A32, A100-SXM4-40GB, v4.1.0; was 15.4 tok/s = **4× speedup** via cuBLAS TF32 + full GPU attention path + async alloc)
 - **14.6 tok/s** — GPU inference throughput (OLMo-3-32B-Think, W4A32 AWQ, A100-SXM4-40GB, v4.2.0; custom `gemv_w4_kernel`, streaming shard loader — full 32B reasoning model on a single 40GB GPU)
 - **27.2 GB** — VRAM footprint for 32B W4 at 16K context (19.6 GB weights, 13.8 GB headroom)
+- **121.8s → 23.4s (~5×)** — 32B W4 time-to-first-token at ~1.25K-token prompts after batched prefill ([#22](https://github.com/web3guru888/ATLAS/issues/22)) merged + deployed (2026-07-08); greedy output bit-identical
 - **100% GSM8K · 82% MMLU · 5/5 Code** — 32B W4 quality on standard benchmarks (v4.2.0)
 - **2.4×** — GPU speedup over CPU inference (SmolLM2-1.7B: 12.6 vs 5.2 tok/s)
 - **507 MiB** — VRAM for pre-pinned SmolLM2-135M weights
