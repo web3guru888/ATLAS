@@ -21,7 +21,7 @@
 ---
 
 > **An open source contribution from [OpenHub Research](https://openhubresearch.org/) (Thailand)**  
-> Website: [atlasagi.org](https://atlasagi.org) · [Observatory](https://huggingface.co/spaces/openhubresearch/ATLAS) · Author: Robin Dey · Institution: https://openhubresearch.org/
+> Website: [atlasagi.org](https://atlasagi.org) · [Observatory](https://huggingface.co/spaces/openhubresearch/ATLAS) · [Live demo](https://demo.thebeastagi.com) · Author: Robin Dey · Institution: https://openhubresearch.org/
 
 ---
 
@@ -45,7 +45,7 @@ It fuses four architectural innovations:
   3. **QK-norm scope** — `Olmo3RMSNorm(n_heads*head_dim)` normalizes the **full concatenated Q/K projection** (one RMS statistic across all heads), not per-head. Per-head normalization rescaled head magnitudes and crushed long-range retrieval: the model could not read its own prompt beyond ~128 tokens.
 - 📈 **Verified**: needle-retrieval passes 68→1,784 tokens (was FAIL at 156+), output byte-identical to HF reference; MMLU diverse-100 22%→**54%** (direct-answer protocol); new 300-position CPU/GPU logit-parity test (exact match)
 - 🚦 **CI green** (first time since April): MSRV 1.75→1.80, lockfile v4; **631/631 tests**
-	- 🧠 **32B AWQ inference on a single A100-40GB** — OLMo-3-32B-Think at W4A32: **GSM8K-25 100%, MMLU-40 82%, Code-5 5/5**, 14.6 tok/s decode, 27.2 GB VRAM. Custom `gemv_w4_kernel` + streaming shard loader + `OlmoModel::new_uninit`. Purely additive — 7B BF16 path untouched and re-verified. See [model card](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-32B-Think-v4).
+	- 🧠 **32B AWQ inference on a single A100-40GB** — OLMo-3-32B-Think at W4A32: **GSM8K-25 100%, MMLU-40 82%, Code-5 5/5**, 14.6 tok/s decode, 27.2 GB VRAM. Custom `gemv_w4_kernel` + streaming shard loader + `OlmoModel::new_uninit`. Purely additive — 7B BF16 path untouched and re-verified. See [model card](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-32B-Think-v4). *(The 32B W4 serving code lives on branch [`feat/w4-32b`](https://github.com/web3guru888/ATLAS/tree/feat/w4-32b) — running in production on the A100; merge to `main` pending.)*
 	- 🔗 **HF Space LIVE** at [huggingface.co/spaces/openhubresearch/ATLAS](https://huggingface.co/spaces/openhubresearch/ATLAS) — serving 32B reasoning model through ATLAS stack on dedicated A100 silicon
 - 🌐 **OpenRouter provider endpoints**: `GET /openrouter/models` (full provider schema), `GET /privacy`, SSE `: keep-alive` every 10s during prefill/think, early-429 concurrency discipline, bearer-key auth — live behind a Cloudflare tunnel on dedicated A100 silicon
 - ⚡ **GPU training path**: SFT optimizer step on GPU (fixed `step_gpu` clip-norm + weight-decay parity, Issue #20); `GpuVec::dup` D2D copies (H2D traffic −59%)
@@ -454,7 +454,7 @@ cargo build --release -p atlas-cli
 
 **631/631 tests passing** · **22 crates** · **Zero external crate dependencies** · **CUDA sm_80 on A100-SXM4-40GB** · **61.7 tok/s OLMo-3-7B-Think (BF16)** · **14.6 tok/s OLMo-3-32B-Think (W4A32)**
 
-> 🏔 **v4.2.0 is the current release.** 32B AWQ W4 inference on a single A100-40GB: `gemv_w4_kernel` + streaming shard loader fits within 27.2 GB VRAM. Three silent inference-quality bugs fixed by differential testing against HuggingFace transformers. OpenRouter provider endpoints + bearer-key auth live behind Cloudflare tunnel. HF Space serving 32B reasoning model. 631/631 tests. Closes #22 (batched prefill scoped, implementation TBD).
+> 🏔 **v4.2.0 is the current release.** 32B AWQ W4 inference on a single A100-40GB: `gemv_w4_kernel` + streaming shard loader fits within 27.2 GB VRAM — serving in production from branch [`feat/w4-32b`](https://github.com/web3guru888/ATLAS/tree/feat/w4-32b) (merge to `main` pending). Three silent inference-quality bugs fixed by differential testing against HuggingFace transformers. OpenRouter provider endpoints + bearer-key auth live behind Cloudflare tunnel. HF Space serving the 32B reasoning model. 631/631 tests on `main`. Batched prefill ([#22](https://github.com/web3guru888/ATLAS/issues/22)) is in active development on `feat/batched-prefill-wire`; disconnect-abort fix ([#25](https://github.com/web3guru888/ATLAS/issues/25)) ready on `fix/disconnect-abort`.
 
 ### What Works
 
@@ -686,7 +686,19 @@ The **[ATLAS Observatory](https://huggingface.co/spaces/openhubresearch/ATLAS)**
 
 **Tech stack**: 13,659 lines · Three.js + 3d-force-graph · OLMo-3-32B-Think (AWQ 4-bit, 27.2 GB VRAM) · Palace REST API · GPU-accelerated on A100-SXM4-40GB.
 
-🔭 **Try it**: [huggingface.co/spaces/openhubresearch/ATLAS](https://huggingface.co/spaces/openhubresearch/ATLAS) · Website: [atlasagi.org](https://atlasagi.org)
+🔭 **Try it**: [huggingface.co/spaces/openhubresearch/ATLAS](https://huggingface.co/spaces/openhubresearch/ATLAS) · [demo.thebeastagi.com](https://demo.thebeastagi.com) · Website: [atlasagi.org](https://atlasagi.org)
+
+---
+
+## Operated by The Beast 🤖
+
+ATLAS was built by Robin Dey; day-to-day production operations on the A100 — serving, benchmarking, quantization experiments, and the performance sprints tracked in the issues — are run by **The Beast**, OpenHub Research's autonomous AI agent fleet.
+
+- 🏆 **DoraHacks**: [dorahacks.io/hacker/thebeastagi](https://dorahacks.io/hacker/thebeastagi)
+- 🐦 **X**: [@thebeastagi](https://x.com/thebeastagi)
+- 🔭 **Live demo**: [demo.thebeastagi.com](https://demo.thebeastagi.com) — chat with OLMo-3-32B-Think served by ATLAS on a single A100-40GB
+- 🤗 **Hugging Face**: [openhubresearch](https://huggingface.co/openhubresearch) · [ATLAS Observatory Space](https://huggingface.co/spaces/openhubresearch/ATLAS) · [32B model card](https://huggingface.co/openhubresearch/ATLAS-OLMo-3-32B-Think-v4)
+- 🌐 **API**: `https://atlas.thebeastagi.com/v1` — OpenAI-compatible, bearer-key auth
 
 ---
 
