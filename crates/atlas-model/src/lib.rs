@@ -1205,8 +1205,8 @@ impl Attention {
         if self.cpu_synced_upto >= upto { return; }
         if let Some(gpu_kv) = &self.gpu_kv {
             let kv_dim = self.n_kv_heads * self.head_dim;
-            let keys = gpu_kv.keys.download();
-            let vals = gpu_kv.values.download();
+            let keys = gpu_kv.download_keys();
+            let vals = gpu_kv.download_values();
             for t in self.cpu_synced_upto..upto {
                 for h in 0..self.n_kv_heads {
                     let s = t * kv_dim + h * self.head_dim;
@@ -1238,7 +1238,18 @@ impl Attention {
     /// Initialize GPU KV cache and QK-norm GPU weights. Call once after weights are loaded.
     fn init_gpu_kv(&mut self, max_seq: usize) {
         if atlas_tensor::cuda_available() {
-            self.gpu_kv = atlas_tensor::GpuKvCache::new(max_seq, self.n_kv_heads, self.head_dim);
+            // Issue #24: opt-in BF16 KV cache (env ATLAS_KV_BF16=1) halves KV VRAM,
+            // enabling long (32K) context on the A100-40GB. Falls back to the F32
+            // cache if BF16 allocation fails. F32 remains the default.
+            let bf16_kv = std::env::var("ATLAS_KV_BF16")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            self.gpu_kv = if bf16_kv {
+                atlas_tensor::GpuKvCache::new_bf16(max_seq, self.n_kv_heads, self.head_dim)
+                    .or_else(|| atlas_tensor::GpuKvCache::new(max_seq, self.n_kv_heads, self.head_dim))
+            } else {
+                atlas_tensor::GpuKvCache::new(max_seq, self.n_kv_heads, self.head_dim)
+            };
             if !self.q_norm.is_empty() {
                 self.q_norm_gpu = Some(atlas_tensor::GpuVec::from_slice(&self.q_norm));
             }
@@ -4606,7 +4617,7 @@ mod tests {
         eprintln!("  rope_gpu={} rope_local_gpu={} gpu_kv0={} kv_on_gpu={}",
             m_gpu.rope_gpu.is_some(), m_gpu.rope_local_gpu.is_some(),
             m_gpu.layers[0].attn.gpu_kv.is_some(),
-            m_gpu.layers[0].attn.gpu_kv.as_ref().map_or(false, |kv| kv.keys.is_on_gpu()));
+            m_gpu.layers[0].attn.gpu_kv.as_ref().map_or(false, |kv| kv.is_on_gpu()));
 
         m_cpu.reset();
         m_gpu.reset();
