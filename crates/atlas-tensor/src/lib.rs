@@ -100,6 +100,22 @@ mod ffi {
             n_heads: c_int, n_kv_heads: c_int, head_dim: c_int,
             pos: c_int, scale: f32, window_size: c_int,
         );
+        /// BF16 KV cache write (#24): F32 K/V in, BF16 (u16) stored.
+        pub fn atlas_kv_cache_write_bf16(
+            k_cache: *mut u16, v_cache: *mut u16,
+            new_k: *const f32, new_v: *const f32,
+            pos: c_int, n_kv_heads: c_int, head_dim: c_int,
+        );
+        /// Convert-copy `n` F32 values into a BF16 destination (#24 chunked write_range).
+        pub fn atlas_kv_range_to_bf16(src: *const f32, dst: *mut u16, n: c_int);
+        /// Grouped-query decode attention against a BF16 KV cache (#24).
+        pub fn atlas_decode_attention_bf16(
+            q: *const f32,
+            k_cache: *const u16, v_cache: *const u16,
+            out: *mut f32,
+            n_heads: c_int, n_kv_heads: c_int, head_dim: c_int,
+            pos: c_int, scale: f32, window_size: c_int,
+        );
         /// GPU argmax: finds the index of the maximum element in x[0..n].
         /// Both x and out_idx must be device pointers.
         /// GPU argmax: writes index as f32 to out_f32 (index < 2^24 is exact).
@@ -324,6 +340,16 @@ mod gpu {
             };
             if err != 0 { return None; }
             Some(buf)
+        }
+        /// Download BF16 device buffer to a host `Vec<u16>` (bit patterns).
+        pub fn download(&self) -> Vec<u16> {
+            let mut out = vec![0u16; self.len];
+            let err = unsafe {
+                cudaMemcpy(out.as_mut_ptr() as *mut c_void, self.ptr as *const c_void,
+                           self.len * 2, CUDA_MEMCPY_D2H)
+            };
+            if err != 0 { crate::note_rust_gpu_error(err); }
+            out
         }
     }
     impl Drop for GpuBufBf16 {
@@ -1003,39 +1029,122 @@ impl GpuRopeTables {
 ///
 /// All cache reads/writes stay in VRAM — zero PCIe transfers for attention.
 pub struct GpuKvCache {
-    /// keys:   [max_seq × n_kv_heads × head_dim] f32 in VRAM
+    /// keys:   [max_seq × n_kv_heads × head_dim] f32 in VRAM (F32 mode).
+    /// Empty placeholder when the cache is BF16 (see `keys_bf16`).
     pub keys:   GpuVec,
-    /// values: [max_seq × n_kv_heads × head_dim] f32 in VRAM
+    /// values: [max_seq × n_kv_heads × head_dim] f32 in VRAM (F32 mode).
     pub values: GpuVec,
     pub max_seq:    usize,
     pub n_kv_heads: usize,
     pub head_dim:   usize,
+    /// BF16 KV storage (#24): when `Some`, K/V live here as u16 (half the VRAM
+    /// of the F32 path) and `keys`/`values` are unused. Enables 32K context on
+    /// the A100-40GB. Selected via `new_bf16` (env `ATLAS_KV_BF16`).
+    #[cfg(atlas_cuda)]
+    keys_bf16:   Option<gpu::GpuBufBf16>,
+    #[cfg(atlas_cuda)]
+    values_bf16: Option<gpu::GpuBufBf16>,
 }
 
 impl GpuKvCache {
-    /// Allocate a zeroed GPU KV cache.
+    /// Allocate a zeroed F32 GPU KV cache (default).
     pub fn new(max_seq: usize, n_kv_heads: usize, head_dim: usize) -> Option<Self> {
         if !cuda_available() { return None; }
         let total = max_seq * n_kv_heads * head_dim;
         let keys   = GpuVec::zeros(total);
         let values = GpuVec::zeros(total);
-        Some(Self { keys, values, max_seq, n_kv_heads, head_dim })
+        Some(Self {
+            keys, values, max_seq, n_kv_heads, head_dim,
+            #[cfg(atlas_cuda)] keys_bf16:   None,
+            #[cfg(atlas_cuda)] values_bf16: None,
+        })
+    }
+
+    /// Allocate a **BF16** GPU KV cache (#24) — half the VRAM of `new`, so a
+    /// 32K context fits alongside BF16/W4 weights on the A100-40GB. K/V are
+    /// computed in F32 and stored BF16; attention up-converts to F32 for the
+    /// dot products (accumulation stays F32 — only storage precision drops).
+    pub fn new_bf16(max_seq: usize, n_kv_heads: usize, head_dim: usize) -> Option<Self> {
+        #[cfg(atlas_cuda)]
+        {
+            if !cuda_available() { return None; }
+            let total = max_seq * n_kv_heads * head_dim;
+            let keys_bf16   = gpu::GpuBufBf16::upload(&vec![0u16; total])?;
+            let values_bf16 = gpu::GpuBufBf16::upload(&vec![0u16; total])?;
+            return Some(Self {
+                keys:   GpuVec::zeros(0),
+                values: GpuVec::zeros(0),
+                max_seq, n_kv_heads, head_dim,
+                keys_bf16:   Some(keys_bf16),
+                values_bf16: Some(values_bf16),
+            });
+        }
+        #[cfg(not(atlas_cuda))]
+        { let _ = (max_seq, n_kv_heads, head_dim); None }
+    }
+
+    /// True when this cache stores K/V in BF16.
+    pub fn is_bf16(&self) -> bool {
+        #[cfg(atlas_cuda)]
+        { return self.keys_bf16.is_some(); }
+        #[cfg(not(atlas_cuda))]
+        { false }
+    }
+
+    /// Whether the KV data is resident in VRAM (either precision).
+    pub fn is_on_gpu(&self) -> bool {
+        #[cfg(atlas_cuda)]
+        { if self.keys_bf16.is_some() { return true; } }
+        self.keys.is_on_gpu()
+    }
+
+    /// Download the key cache to host `Vec<f32>` (up-converts from BF16 if needed).
+    pub fn download_keys(&self) -> Vec<f32> {
+        #[cfg(atlas_cuda)]
+        if let Some(kb) = self.keys_bf16.as_ref() {
+            return kb.download().iter().map(|&u| f32::from_bits((u as u32) << 16)).collect();
+        }
+        self.keys.download()
+    }
+
+    /// Download the value cache to host `Vec<f32>` (up-converts from BF16 if needed).
+    pub fn download_values(&self) -> Vec<f32> {
+        #[cfg(atlas_cuda)]
+        if let Some(vb) = self.values_bf16.as_ref() {
+            return vb.download().iter().map(|&u| f32::from_bits((u as u32) << 16)).collect();
+        }
+        self.values.download()
     }
 
     /// Write new K and V vectors (size [n_kv_heads × head_dim]) at position `pos`.
     pub fn write(&mut self, pos: usize, new_k: &GpuVec, new_v: &GpuVec) {
         #[cfg(atlas_cuda)]
-        if let (Some(kp), Some(vp), Some(nkp), Some(nvp)) = (
-            self.keys.gpu_ptr_mut(), self.values.gpu_ptr_mut(),
-            new_k.gpu_ptr(), new_v.gpu_ptr()
-        ) {
-            unsafe {
-                ffi::atlas_kv_cache_write(
-                    kp, vp, nkp, nvp,
-                    pos as i32, self.n_kv_heads as i32, self.head_dim as i32,
-                );
+        {
+            if let (Some(kb), Some(vb)) = (self.keys_bf16.as_ref(), self.values_bf16.as_ref()) {
+                if let (Some(nkp), Some(nvp)) = (new_k.gpu_ptr(), new_v.gpu_ptr()) {
+                    unsafe {
+                        ffi::atlas_kv_cache_write_bf16(
+                            kb.ptr, vb.ptr, nkp as *const f32, nvp as *const f32,
+                            pos as i32, self.n_kv_heads as i32, self.head_dim as i32,
+                        );
+                    }
+                }
+                return;
+            }
+            if let (Some(kp), Some(vp), Some(nkp), Some(nvp)) = (
+                self.keys.gpu_ptr_mut(), self.values.gpu_ptr_mut(),
+                new_k.gpu_ptr(), new_v.gpu_ptr()
+            ) {
+                unsafe {
+                    ffi::atlas_kv_cache_write(
+                        kp, vp, nkp, nvp,
+                        pos as i32, self.n_kv_heads as i32, self.head_dim as i32,
+                    );
+                }
             }
         }
+        #[cfg(not(atlas_cuda))]
+        { let _ = (pos, new_k, new_v); }
     }
 
     /// Write K/V for `m` consecutive positions starting at `start` in ONE
@@ -1054,15 +1163,27 @@ impl GpuKvCache {
         debug_assert_eq!(k.len, m * kv_dim);
         debug_assert_eq!(v.len, m * kv_dim);
         #[cfg(atlas_cuda)]
-        if let (Some(kp), Some(vp), Some(nkp), Some(nvp)) = (
-            self.keys.gpu_ptr_mut(), self.values.gpu_ptr_mut(),
-            k.gpu_ptr(), v.gpu_ptr()
-        ) {
-            unsafe {
-                ffi::atlas_vram_copy_f32(nkp, kp.add(start * kv_dim), (m * kv_dim) as i32);
-                ffi::atlas_vram_copy_f32(nvp, vp.add(start * kv_dim), (m * kv_dim) as i32);
+        {
+            if let (Some(kb), Some(vb)) = (self.keys_bf16.as_ref(), self.values_bf16.as_ref()) {
+                if let (Some(nkp), Some(nvp)) = (k.gpu_ptr(), v.gpu_ptr()) {
+                    unsafe {
+                        ffi::atlas_kv_range_to_bf16(nkp as *const f32, kb.ptr.add(start * kv_dim), (m * kv_dim) as i32);
+                        ffi::atlas_kv_range_to_bf16(nvp as *const f32, vb.ptr.add(start * kv_dim), (m * kv_dim) as i32);
+                    }
+                    return true;
+                }
+                return false;
             }
-            return true;
+            if let (Some(kp), Some(vp), Some(nkp), Some(nvp)) = (
+                self.keys.gpu_ptr_mut(), self.values.gpu_ptr_mut(),
+                k.gpu_ptr(), v.gpu_ptr()
+            ) {
+                unsafe {
+                    ffi::atlas_vram_copy_f32(nkp, kp.add(start * kv_dim), (m * kv_dim) as i32);
+                    ffi::atlas_vram_copy_f32(nvp, vp.add(start * kv_dim), (m * kv_dim) as i32);
+                }
+                return true;
+            }
         }
         let _ = (start, m, k, v, kv_dim);
         false
@@ -1091,6 +1212,25 @@ impl GpuKvCache {
     ) -> Option<GpuVec> {
         let d = n_heads * self.head_dim;
         debug_assert_eq!(q.len, m * d);
+        #[cfg(atlas_cuda)]
+        if let (Some(kb), Some(vb)) = (self.keys_bf16.as_ref(), self.values_bf16.as_ref()) {
+            if let Some(qp) = q.gpu_ptr() {
+                if let Some(out_buf) = gpu::GpuBuf::alloc(m * d) {
+                    for s in 0..m {
+                        unsafe {
+                            ffi::atlas_decode_attention_bf16(
+                                qp.add(s * d), kb.ptr as *const u16, vb.ptr as *const u16,
+                                out_buf.ptr.add(s * d),
+                                n_heads as i32, self.n_kv_heads as i32, self.head_dim as i32,
+                                (start + s) as i32, scale, window_size as i32,
+                            );
+                        }
+                    }
+                    return Some(GpuVec { buf: Some(out_buf), cpu: vec![0.0f32; m * d], len: m * d });
+                }
+            }
+            return None;
+        }
         #[cfg(atlas_cuda)]
         if let (Some(qp), Some(kp), Some(vp)) =
             (q.gpu_ptr(), self.keys.gpu_ptr(), self.values.gpu_ptr())
@@ -1130,6 +1270,23 @@ impl GpuKvCache {
         scale: f32,
         window_size: usize,
     ) -> Option<GpuVec> {
+        #[cfg(atlas_cuda)]
+        if let (Some(kb), Some(vb)) = (self.keys_bf16.as_ref(), self.values_bf16.as_ref()) {
+            if let Some(qp) = q.gpu_ptr() {
+                let out_len = n_heads * self.head_dim;
+                if let Some(out_buf) = gpu::GpuBuf::alloc(out_len) {
+                    unsafe {
+                        ffi::atlas_decode_attention_bf16(
+                            qp, kb.ptr as *const u16, vb.ptr as *const u16, out_buf.ptr,
+                            n_heads as i32, self.n_kv_heads as i32, self.head_dim as i32,
+                            pos as i32, scale, window_size as i32,
+                        );
+                    }
+                    return Some(GpuVec { buf: Some(out_buf), cpu: vec![0.0f32; out_len], len: out_len });
+                }
+            }
+            return None;
+        }
         #[cfg(atlas_cuda)]
         if let (Some(qp), Some(kp), Some(vp)) = (q.gpu_ptr(), self.keys.gpu_ptr(), self.values.gpu_ptr()) {
             let out_len = n_heads * self.head_dim;
@@ -1468,6 +1625,56 @@ impl Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #24: the BF16 KV cache decode must match the F32 KV cache decode
+    /// within a BF16-aware tolerance. Same K/V written into both caches, same
+    /// query — only the KV *storage* precision differs (attention accumulates
+    /// in F32 in both). This is the correctness gate for the BF16 KV path.
+    #[test]
+    fn bf16_kv_decode_matches_f32_within_tol() {
+        if !cuda_available() { eprintln!("SKIP - no CUDA"); return; }
+        let (max_seq, n_kv_heads, head_dim, n_heads) = (48usize, 2usize, 16usize, 4usize);
+        let kv_dim = n_kv_heads * head_dim;
+        let pos = 40usize;
+
+        let mut f32c  = GpuKvCache::new(max_seq, n_kv_heads, head_dim).expect("f32 cache");
+        let mut bf16c = GpuKvCache::new_bf16(max_seq, n_kv_heads, head_dim).expect("bf16 cache");
+        assert!(!f32c.is_bf16(), "new() must be F32");
+        assert!(bf16c.is_bf16(), "new_bf16() must be BF16");
+        assert!(bf16c.is_on_gpu(), "bf16 cache must be resident");
+
+        for t in 0..=pos {
+            let k: Vec<f32> = (0..kv_dim).map(|i| (((t*7 + i*3) % 29) as f32) * 0.03 - 0.4).collect();
+            let v: Vec<f32> = (0..kv_dim).map(|i| (((t*5 + i*2) % 23) as f32) * 0.05 - 0.5).collect();
+            let kg = GpuVec::from_slice(&k);
+            let vg = GpuVec::from_slice(&v);
+            f32c.write(t, &kg, &vg);
+            bf16c.write(t, &kg, &vg);
+        }
+
+        let q: Vec<f32> = (0..n_heads*head_dim).map(|i| (((i*11) % 17) as f32) * 0.04 - 0.3).collect();
+        let qg = GpuVec::from_slice(&q);
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        let out_f32  = f32c.decode_attention(&qg, n_heads, pos, scale, 0)
+            .expect("f32 decode").download();
+        let out_bf16 = bf16c.decode_attention(&qg, n_heads, pos, scale, 0)
+            .expect("bf16 decode").download();
+        assert_eq!(out_f32.len(), n_heads*head_dim);
+
+        let mut max_abs = 0.0f32;
+        for i in 0..out_f32.len() {
+            let d = (out_f32[i] - out_bf16[i]).abs();
+            max_abs = max_abs.max(d);
+            assert!(d <= 2e-2 * out_f32[i].abs().max(1.0) + 5e-3,
+                "bf16 KV decode drift at {i}: {} vs {} (|d|={})", out_f32[i], out_bf16[i], d);
+        }
+        eprintln!("bf16_kv parity: max_abs_diff = {max_abs:.6}");
+
+        // download_keys up-converts BF16 -> F32 and returns the full cache.
+        let keys = bf16c.download_keys();
+        assert_eq!(keys.len(), max_seq*kv_dim);
+    }
 
     /// #22 Step 2: W4 batched sgemm (dequant-to-scratch + GEMM) must match
     /// the per-column W4 GEMV kernel. The GEMV path is HF-parity verified,

@@ -354,6 +354,20 @@ static __device__ __forceinline__ float bf16u_to_f32(uint16_t h) {
     return __uint_as_float(((uint32_t)h) << 16);
 }
 
+/* F32 -> BF16 (uint16 bit pattern) with round-to-nearest-even, matching the
+ * IEEE bf16 store used by PyTorch/TF. Used by the BF16 KV cache (#24): K/V are
+ * computed in F32 then stored as BF16 to halve KV VRAM, enabling 32K context on
+ * the A100-40GB. NaN is preserved as a quiet bf16 NaN. */
+static __device__ __forceinline__ uint16_t f32_to_bf16u(float f) {
+    uint32_t x = __float_as_uint(f);
+    if ((x & 0x7fffffffu) > 0x7f800000u) {          /* NaN -> quiet bf16 NaN */
+        return (uint16_t)((x >> 16) | 0x0040u);
+    }
+    uint32_t bias = 0x00007fffu + ((x >> 16) & 1u); /* round-to-nearest-even */
+    x += bias;
+    return (uint16_t)(x >> 16);
+}
+
 /* ─── Efficient GEMV kernels for autoregressive inference (N=1) ─────────── */
 /*                                                                            */
 /* The tiled GEMM above is designed for large batch/prefill (N >> 1).        */
@@ -1129,6 +1143,168 @@ void atlas_decode_attention(
         q, k_cache, v_cache, out,
         n_heads, n_kv_heads, head_dim, pos, scale, window_size);
     atlas_note_launch_err("atlas_decode_attention");
+}
+
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * BF16 KV cache (#24) — halves KV VRAM (FP32->BF16 storage) so 32K context
+ * fits alongside the model weights on the A100-40GB. K/V are computed in F32,
+ * stored BF16, and up-converted to F32 in registers for the attention math
+ * (accumulation stays F32 — only *storage* precision drops). Selected at
+ * runtime by GpuKvCache::new_bf16 (env ATLAS_KV_BF16); the F32 path above is
+ * unchanged and remains the default.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+/* Write one position's K,V into the BF16 cache (F32 in -> BF16 stored). */
+__global__ void kv_cache_write_bf16_kernel(
+    uint16_t* __restrict__ k_cache,
+    uint16_t* __restrict__ v_cache,
+    const float* __restrict__ new_k,
+    const float* __restrict__ new_v,
+    int pos, int n_kv_heads, int head_dim
+) {
+    int elem = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_kv_heads * head_dim;
+    if (elem < total) {
+        size_t off = (size_t)pos * total + elem;
+        k_cache[off] = f32_to_bf16u(new_k[elem]);
+        v_cache[off] = f32_to_bf16u(new_v[elem]);
+    }
+}
+
+/* Convert-copy n F32 values -> BF16 destination (used by the #22 chunked
+ * write_range path when the cache is BF16). */
+__global__ void f32_to_bf16_range_kernel(
+    const float* __restrict__ src, uint16_t* __restrict__ dst, int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = f32_to_bf16u(src[i]);
+}
+
+/* Grouped-query decode attention against a BF16 KV cache. Identical math to
+ * decode_attention_kernel; K/V are loaded as BF16 and up-converted to F32. */
+__global__ void decode_attention_bf16_kernel(
+    const float*    __restrict__ q,
+    const uint16_t* __restrict__ k_cache,
+    const uint16_t* __restrict__ v_cache,
+    float*          __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim,
+    int pos, float scale, int window_size
+) {
+    extern __shared__ float smem[];  /* scores [pos+1] */
+
+    int h = blockIdx.x;
+    if (h >= n_heads) return;
+    int group = n_heads / n_kv_heads;
+    int kv_h  = h / group;
+
+    const float*    q_h    = q       + (size_t)h    * head_dim;
+    const uint16_t* k_base = k_cache + (size_t)kv_h * head_dim;
+    const uint16_t* v_base = v_cache + (size_t)kv_h * head_dim;
+    int kv_stride = n_kv_heads * head_dim;
+
+    int seq = pos + 1;
+
+    for (int t = threadIdx.x; t < seq; t += ATTN_THREADS) {
+        if (window_size > 0 && (pos - t) >= window_size) {
+            smem[t] = -1e20f;
+            continue;
+        }
+        const uint16_t* kt = k_base + (size_t)t * kv_stride;
+        float acc = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            acc += q_h[d] * bf16u_to_f32(kt[d]);
+        }
+        smem[t] = acc * scale;
+    }
+    __syncthreads();
+
+    float local_max = -1e20f;
+    for (int t = threadIdx.x; t < seq; t += ATTN_THREADS)
+        local_max = fmaxf(local_max, smem[t]);
+    for (int d = 16; d > 0; d >>= 1)
+        local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFF, local_max, d));
+    __shared__ float block_vals[ATTN_THREADS / 32];
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    if (lane_id == 0) block_vals[warp_id] = local_max;
+    __syncthreads();
+    __shared__ float block_max;
+    if (threadIdx.x == 0) {
+        float gmax = -1e20f;
+        for (int w = 0; w < (ATTN_THREADS/32); w++) gmax = fmaxf(gmax, block_vals[w]);
+        block_max = gmax;
+    }
+    __syncthreads();
+    float gmax = block_max;
+
+    float local_sum = 0.0f;
+    for (int t = threadIdx.x; t < seq; t += ATTN_THREADS) {
+        float e = expf(smem[t] - gmax);
+        smem[t] = e;
+        local_sum += e;
+    }
+    for (int d = 16; d > 0; d >>= 1)
+        local_sum += __shfl_down_sync(0xFFFFFFFF, local_sum, d);
+    __shared__ float block_sums[ATTN_THREADS / 32];
+    if (lane_id == 0) block_sums[warp_id] = local_sum;
+    __syncthreads();
+    __shared__ float block_sum;
+    if (threadIdx.x == 0) {
+        float gs = 0.0f;
+        for (int w = 0; w < (ATTN_THREADS/32); w++) gs += block_sums[w];
+        block_sum = gs;
+    }
+    __syncthreads();
+    float inv_sum = 1.0f / block_sum;
+    for (int t = threadIdx.x; t < seq; t += ATTN_THREADS)
+        smem[t] *= inv_sum;
+    __syncthreads();
+
+    float* out_h = out + (size_t)h * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += ATTN_THREADS) {
+        float val = 0.0f;
+        for (int t = 0; t < seq; t++) {
+            const uint16_t* vt = v_base + (size_t)t * kv_stride;
+            val += smem[t] * bf16u_to_f32(vt[d]);
+        }
+        out_h[d] = val;
+    }
+}
+
+/* Host wrappers for the BF16 KV cache path. */
+void atlas_kv_cache_write_bf16(
+    uint16_t* k_cache, uint16_t* v_cache,
+    const float* new_k, const float* new_v,
+    int pos, int n_kv_heads, int head_dim
+) {
+    int total   = n_kv_heads * head_dim;
+    int threads = 256;
+    int blocks  = (total + threads - 1) / threads;
+    kv_cache_write_bf16_kernel<<<blocks, threads>>>(
+        k_cache, v_cache, new_k, new_v, pos, n_kv_heads, head_dim);
+    atlas_note_launch_err("atlas_kv_cache_write_bf16");
+}
+
+void atlas_kv_range_to_bf16(const float* src, uint16_t* dst, int n) {
+    int threads = 256;
+    int blocks  = (n + threads - 1) / threads;
+    f32_to_bf16_range_kernel<<<blocks, threads>>>(src, dst, n);
+    atlas_note_launch_err("atlas_kv_range_to_bf16");
+}
+
+void atlas_decode_attention_bf16(
+    const float* q,
+    const uint16_t* k_cache, const uint16_t* v_cache,
+    float* out,
+    int n_heads, int n_kv_heads, int head_dim,
+    int pos, float scale, int window_size
+) {
+    int smem_bytes = (pos + 1) * sizeof(float);
+    decode_attention_bf16_kernel<<<n_heads, ATTN_THREADS, smem_bytes>>>(
+        q, k_cache, v_cache, out,
+        n_heads, n_kv_heads, head_dim, pos, scale, window_size);
+    atlas_note_launch_err("atlas_decode_attention_bf16");
 }
 
 
