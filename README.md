@@ -2,6 +2,8 @@
 
 **Active-inference Training with Learned Adaptive Stigmergy**
 
+**Pure Rust AGI framework · 22 crates · 652 tests · 28 MCP tools · OLMo-3 7B/32B GPU inference · OpenAI-compatible API · ZK proofs · zero external Rust dependencies**
+
 > *"Don't train on what humans wrote about the world.  
 > Train on what you actually discover about the world.  
 > Validate what you claim. Own what you build."*
