@@ -963,7 +963,7 @@ pub fn qk_norm_inplace_gpu(x: &mut GpuVec, w: &GpuVec, n_heads: usize, head_dim:
     // CPU fallback: per-head RMSNorm. `x` is host-resident here (otherwise
     // the GPU path above ran), but `w` may live in VRAM — download it.
     let wv = w.download();
-    let n = n_heads * head_dim;
+    let _n = n_heads * head_dim;
     for h in 0..n_heads {
         let s = h * head_dim;
         let xe = &mut x.cpu[s..s + head_dim];

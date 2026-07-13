@@ -1120,7 +1120,7 @@ impl Attention {
         self.sync_cpu_cache_from_gpu(pos);
 
         let d   = self.n_heads * self.head_dim;
-        let kv  = self.n_kv_heads * self.head_dim;
+        let _kv  = self.n_kv_heads * self.head_dim;
 
         // QKV projections (stay in VRAM)
         let q_gpu = self.wq.forward_vec(x)?;
@@ -5293,7 +5293,7 @@ mod tests {
         model.init_gpu_resources(); // real deployments have GPU KV + RoPE tables
         let prompt: Vec<u32> = (0..p_len as u32).map(|i| i % 4096).collect();
         let scfg = SamplingConfig { temperature: 0.0, ..Default::default() };
-        let mut time_prefill = |model: &mut OlmoModel, chunk: usize| {
+        let time_prefill = |model: &mut OlmoModel, chunk: usize| {
             model.reset();
             model.set_prefill_chunk_tokens(chunk);
             let t0 = std::time::Instant::now();

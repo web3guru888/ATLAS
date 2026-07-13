@@ -93,7 +93,7 @@ impl BeliefNode {
     /// Update belief with new evidence.
     /// `likelihood_ratio` > 1 means evidence supports the hypothesis.
     pub fn update(&mut self, likelihood_ratio: f64, evidence_strength: f64) {
-        let old_mean = self.belief.mean();
+        let _old_mean = self.belief.mean();
         // Bayesian update: posterior ∝ likelihood × prior
         let n_weight = evidence_strength * (1.0 + self.n_updates as f64).ln().max(1.0);
         if likelihood_ratio > 1.0 {

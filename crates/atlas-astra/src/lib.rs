@@ -1459,7 +1459,7 @@ mod tests {
     #[test]
     fn discovery_has_provenance_after_cycle() {
         // Use a minimal config that produces deterministic hypotheses from text
-        let mut engine = AstraEngine::new(AstraConfig::default());
+        let engine = AstraEngine::new(AstraConfig::default());
         // Manually inject a text observation with causal language
         let obs = vec![Observation {
             source: "test".to_string(),

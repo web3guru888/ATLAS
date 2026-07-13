@@ -16,8 +16,8 @@
 //!   6. Cosine LR schedule produces expected values
 
 use atlas_tensor::Tensor;
-use atlas_grad::{GradTape, Op};
-use atlas_optim::{AdamW, AdamWConfig, CosineScheduler, ParamState, clip_grad_norm};
+use atlas_grad::GradTape;
+use atlas_optim::{AdamW, AdamWConfig, CosineScheduler, ParamState};
 use atlas_quant::{Int4Tensor, Int8Tensor, INT4_BLOCK_SIZE, LoraAdapter, estimate_vram_gb};
 
 /// Helper: randn-ish from deterministic seed (no rand crate)
@@ -100,7 +100,7 @@ fn stage1_adamw_reduces_loss() {
         let dydw: Vec<f32> = {
             let x = x_data.as_slice();
             let y = y_t.as_slice().unwrap();
-            let (m, k, n) = (3, 2, 2); // W is [3,2], x is [2,3], y is [2,2]
+            let (_m, _k, _n) = (3, 2, 2); // W is [3,2], x is [2,3], y is [2,2]
             // dW[i,j] = (2/n) * sum_b x[b,i] * y[b,j]
             // but W·x: W[3,2] × x[2,3] → out[3,3] — let's simplify
             // Use the actual grad: dL/dW for matmul x@W → y: dW = x^T @ dy

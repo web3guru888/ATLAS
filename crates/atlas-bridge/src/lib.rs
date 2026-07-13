@@ -16,7 +16,6 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
-use atlas_core::{AtlasError, Result};
 use atlas_zk::{groth16_prove, groth16_verify, Groth16Claim};
 
 /// Bridge network configuration.

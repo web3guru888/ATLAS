@@ -240,7 +240,7 @@ impl HttpClient {
         parse_response(&raw)
     }
 
-    fn send_https(&self, req: &Request, pu: &ParsedUrl) -> Result<Response> {
+    fn send_https(&self, req: &Request, _pu: &ParsedUrl) -> Result<Response> {
         // HTTPS: attempt OpenSSL via system curl as fallback (zero-dep within our codebase)
         // For zero-dep HTTPS we invoke the system `curl` binary if available,
         // otherwise fall back to a clear-text proxy if ATLAS_HTTP_PROXY is set.

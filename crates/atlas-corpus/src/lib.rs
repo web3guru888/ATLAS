@@ -637,7 +637,7 @@ impl LiveDiscoveryCorpus {
             let r = (self.lcg_next() as f64 / u64::MAX as f64) * sum;
             let mut acc = 0.0;
             let mut sel = 0;
-            for (idx, (i, w)) in remaining.iter().enumerate() {
+            for (idx, (_i, w)) in remaining.iter().enumerate() {
                 acc += w;
                 if r <= acc { sel = idx; break; }
             }
