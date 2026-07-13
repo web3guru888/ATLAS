@@ -528,6 +528,7 @@ pub fn unix_ts() -> u64 {
 /// | `ATLAS_OR_COUNTRY` | `datacenters[0].country_code` | `"TH"` |
 /// | `ATLAS_OR_CAPACITY_TPM` | `capacity_tpm` | omitted |
 /// | `ATLAS_OR_READY` | `is_ready` (`"false"` stages hidden) | `true` |
+/// | `ATLAS_OR_FEATURES` | `supported_features` (JSON array literal) | `["reasoning"]` |
 pub fn openrouter_models_json(model_id: &str, context_length: usize, max_output_length: usize) -> String {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
 
@@ -538,6 +539,7 @@ pub fn openrouter_models_json(model_id: &str, context_length: usize, max_output_
     let prompt_price     = env("ATLAS_OR_PROMPT_PRICE").unwrap_or_else(|| "0".to_string());
     let completion_price = env("ATLAS_OR_COMPLETION_PRICE").unwrap_or_else(|| "0".to_string());
     let is_ready = env("ATLAS_OR_READY").map(|v| v != "false" && v != "0").unwrap_or(true);
+    let features = env("ATLAS_OR_FEATURES").unwrap_or_else(|| r#"["reasoning"]"#.to_string());
 
     let hf_field = env("ATLAS_OR_HF_ID")
         .map(|hf| format!("\"hugging_face_id\":{},", json_string(&hf)))
@@ -566,7 +568,7 @@ pub fn openrouter_models_json(model_id: &str, context_length: usize, max_output_
             "\"image\":\"0\",\"request\":\"0\",\"input_cache_read\":\"0\"}},",
             "\"supported_sampling_parameters\":[\"temperature\",\"top_p\",\"top_k\",",
             "\"frequency_penalty\",\"presence_penalty\",\"repetition_penalty\",\"seed\",\"max_tokens\"],",
-            "\"supported_features\":[],",
+            "\"supported_features\":{features},",
             "{desc}",
             "{capacity}",
             "\"is_ready\":{ready},",
@@ -584,6 +586,7 @@ pub fn openrouter_models_json(model_id: &str, context_length: usize, max_output_
         cp       = json_string(&completion_price),
         desc     = desc_field,
         capacity = capacity_field,
+        features = features,
         ready    = is_ready,
         cc       = json_string(&ccode),
     )
